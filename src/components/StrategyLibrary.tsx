@@ -1,12 +1,19 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import type { SavedStrategy, StrategyConfig } from "@/lib/types";
 import {
   deleteSavedStrategy,
   listSavedStrategies,
   saveStrategy,
 } from "@/lib/strategy-store";
+import { useAuth } from "@/lib/firebase/auth-context";
+import {
+  deleteCloudStrategy,
+  listCloudStrategies,
+  migrateLocalToCloud,
+  saveCloudStrategy,
+} from "@/lib/firebase/strategies";
 
 export function StrategyLibrary({
   strategy,
@@ -17,28 +24,86 @@ export function StrategyLibrary({
   onLoad: (s: StrategyConfig) => void;
   onRenamed?: (name: string) => void;
 }) {
+  const { user, configured } = useAuth();
   const [saved, setSaved] = useState<SavedStrategy[]>([]);
   const [name, setName] = useState(strategy.name || "");
   const [msg, setMsg] = useState<string | null>(null);
+  const [busy, setBusy] = useState(false);
 
-  function refresh() {
-    setSaved(listSavedStrategies());
-  }
+  const cloud = Boolean(configured && user);
+
+  const refresh = useCallback(async () => {
+    try {
+      if (user) {
+        setSaved(await listCloudStrategies(user.uid));
+      } else {
+        setSaved(listSavedStrategies());
+      }
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : "Failed to load strategies");
+      setSaved(listSavedStrategies());
+    }
+  }, [user]);
 
   useEffect(() => {
-    refresh();
-  }, []);
+    void refresh();
+  }, [refresh]);
+
+  // First cloud login: push browser strategies if cloud is empty
+  useEffect(() => {
+    if (!user) return;
+    let cancelled = false;
+    (async () => {
+      try {
+        const n = await migrateLocalToCloud(user.uid, listSavedStrategies());
+        if (!cancelled && n > 0) {
+          setMsg(`Synced ${n} local strateg${n === 1 ? "y" : "ies"} to cloud`);
+          setTimeout(() => setMsg(null), 3000);
+          await refresh();
+        }
+      } catch {
+        // ignore migration errors
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user, refresh]);
 
   useEffect(() => {
     setName(strategy.name || "");
   }, [strategy.name]);
 
-  function handleSave() {
-    const row = saveStrategy(name || strategy.name, strategy);
-    setMsg(`Saved “${row.name}”`);
-    onRenamed?.(row.name);
-    refresh();
-    setTimeout(() => setMsg(null), 2500);
+  async function handleSave() {
+    setBusy(true);
+    setMsg(null);
+    try {
+      if (user) {
+        const row = await saveCloudStrategy(
+          user.uid,
+          name || strategy.name,
+          strategy
+        );
+        // also keep a local backup
+        saveStrategy(row.name, row.strategy, row.id);
+        setMsg(`Saved “${row.name}” to cloud`);
+        onRenamed?.(row.name);
+      } else {
+        const row = saveStrategy(name || strategy.name, strategy);
+        setMsg(
+          configured
+            ? `Saved “${row.name}” on this device (sign in to sync)`
+            : `Saved “${row.name}” on this device`
+        );
+        onRenamed?.(row.name);
+      }
+      await refresh();
+      setTimeout(() => setMsg(null), 2500);
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setBusy(false);
+    }
   }
 
   function handleLoad(id: string) {
@@ -49,12 +114,22 @@ export function StrategyLibrary({
     setTimeout(() => setMsg(null), 2000);
   }
 
-  function handleDelete(id: string) {
+  async function handleDelete(id: string) {
     const row = saved.find((s) => s.id === id);
     if (!row) return;
     if (!confirm(`Delete strategy “${row.name}”?`)) return;
-    deleteSavedStrategy(id);
-    refresh();
+    setBusy(true);
+    try {
+      if (user) {
+        await deleteCloudStrategy(user.uid, id);
+      }
+      deleteSavedStrategy(id);
+      await refresh();
+    } catch (e) {
+      setMsg(e instanceof Error ? e.message : "Delete failed");
+    } finally {
+      setBusy(false);
+    }
   }
 
   return (
@@ -71,15 +146,20 @@ export function StrategyLibrary({
         />
         <button
           type="button"
-          onClick={handleSave}
-          className="rounded-full bg-black px-5 py-2.5 text-sm font-medium text-white hover:bg-neutral-800"
+          onClick={() => void handleSave()}
+          disabled={busy}
+          className="rounded-full bg-black px-5 py-2.5 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-50"
         >
           Save
         </button>
       </div>
       {msg && <p className="text-xs text-neutral-600">{msg}</p>}
       <p className="text-[11px] text-neutral-400">
-        Saved in this browser (localStorage). Firebase sync can be added later.
+        {cloud
+          ? "Synced to your Firebase account (Firestore)."
+          : configured
+            ? "Saved in this browser. Sign in (header) to sync across devices."
+            : "Saved in this browser (localStorage). See docs/FIREBASE.md to enable cloud."}
       </p>
 
       {saved.length > 0 && (
@@ -115,7 +195,7 @@ export function StrategyLibrary({
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleDelete(s.id)}
+                  onClick={() => void handleDelete(s.id)}
                   className="rounded-full px-2 py-1 text-xs text-neutral-500 hover:text-black"
                 >
                   Delete

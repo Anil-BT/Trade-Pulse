@@ -1,6 +1,6 @@
 /**
- * Named strategies — browser localStorage (works on Vercel; no server disk).
- * Later can swap to Firebase under the same API.
+ * Named strategies — browser localStorage (works offline / without Firebase).
+ * When signed in, StrategyLibrary also uses Firestore (see lib/firebase/strategies.ts).
  */
 import type { SavedStrategy, StrategyConfig } from "./types";
 import { uid } from "./format";

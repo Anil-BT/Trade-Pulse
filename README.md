@@ -34,6 +34,10 @@ cp .env.example .env.local
 
 In production, paste the Upstox token in the UI (or set `UPSTOX_ACCESS_TOKEN` in the Vercel project env).
 
+### Optional Firebase (auth + strategy cloud sync)
+
+See **[docs/FIREBASE.md](docs/FIREBASE.md)**. Copy web config into `.env.local` / Vercel env as `NEXT_PUBLIC_FIREBASE_*`. Without it, strategies stay in browser localStorage.
+
 ## Hosting (Vercel)
 
 Production is deployed at **https://tradepulse-nu.vercel.app** (project `tradepulse`, team `alpha-traders-club`). GitHub repo is connected, so pushes to `main` redeploy automatically.
