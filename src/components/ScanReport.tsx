@@ -1,12 +1,18 @@
 "use client";
 
 import { useMemo, useState } from "react";
-import { formatMoney, formatPct, formatTime } from "@/lib/format";
+import { formatMoney, formatTime } from "@/lib/format";
 import type {
   ScanReport as ScanReportType,
   ScanRow,
   ScanTradeDetail,
+  Trade,
 } from "@/lib/types";
+import {
+  PerformanceCharts,
+  tradeMatchesChartFilter,
+  type ChartBarFilter,
+} from "./PerformanceCharts";
 
 export function ScanReportView({
   report,
@@ -20,13 +26,65 @@ export function ScanReportView({
     "all"
   );
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
+  const [chartFilter, setChartFilter] = useState<ChartBarFilter | null>(null);
 
   const noTradeCount = report.rows.filter((r) => r.status === "no_trades").length;
 
+  /** Flatten all F&O trades for combined charts */
+  const combinedTrades = useMemo(() => {
+    const list: Trade[] = [];
+    for (const r of report.rows) {
+      if (!r.tradeList?.length) continue;
+      for (const t of r.tradeList) {
+        list.push(scanTradeToTrade(t, r.symbol, report.tradeInstrument));
+      }
+    }
+    // Sort by entry time for hold chart order
+    list.sort((a, b) => a.entryTime - b.entryTime);
+    return list;
+  }, [report.rows, report.tradeInstrument]);
+
   const rows = useMemo(() => {
-    if (filter === "all") return report.rows;
-    return report.rows.filter((r) => r.status === filter);
-  }, [report.rows, filter]);
+    let base =
+      filter === "all"
+        ? report.rows
+        : report.rows.filter((r) => r.status === filter);
+
+    if (!chartFilter) return base;
+
+    // Only rows that have trades matching the clicked chart bar
+    return base
+      .map((r) => {
+        if (!r.tradeList?.length) return null;
+        const matched = r.tradeList.filter((t) =>
+          tradeMatchesChartFilter(
+            scanTradeToTrade(t, r.symbol, report.tradeInstrument),
+            chartFilter
+          )
+        );
+        if (!matched.length) return null;
+        const totalPnl = matched.reduce((s, t) => s + t.pnl, 0);
+        const wins = matched.filter((t) => t.pnl > 0).length;
+        return {
+          ...r,
+          tradeList: matched,
+          trades: matched.length,
+          totalPnl,
+          winRate: matched.length ? (wins / matched.length) * 100 : 0,
+        } as ScanRow;
+      })
+      .filter(Boolean) as ScanRow[];
+  }, [report.rows, report.tradeInstrument, filter, chartFilter]);
+
+  // Auto-expand symbols that match when a chart filter is active
+  const effectiveExpanded = useMemo(() => {
+    if (!chartFilter) return expanded;
+    const next: Record<string, boolean> = { ...expanded };
+    for (const r of rows) {
+      if (r.tradeList?.length) next[r.symbol] = true;
+    }
+    return next;
+  }, [chartFilter, rows, expanded]);
 
   function toggle(symbol: string) {
     setExpanded((prev) => ({ ...prev, [symbol]: !prev[symbol] }));
@@ -162,11 +220,20 @@ export function ScanReportView({
         </div>
 
         {/* Summary chips */}
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+          <MiniStat label="Combined P&L" value={formatMoney(s.totalPnl)} />
+          <MiniStat
+            label="Win %"
+            value={
+              s.withTrades
+                ? `${((s.winners / s.withTrades) * 100).toFixed(0)}%`
+                : "-"
+            }
+            sub={`${s.winners}W / ${s.losers}L stocks`}
+          />
           <MiniStat label="With trades" value={String(s.withTrades)} />
           <MiniStat label="No trade" value={String(noTradeCount)} />
           <MiniStat label="Errors" value={String(s.errors)} />
-          <MiniStat label="Combined P&L" value={formatMoney(s.totalPnl)} />
         </div>
 
         {/* Filters */}
@@ -195,7 +262,28 @@ export function ScanReportView({
         </div>
       </div>
 
+      {/* Combined F&O performance charts */}
+      <div
+        id="fno-combined-charts"
+        className="border-b border-neutral-100 px-4 py-5 sm:px-6"
+      >
+        <PerformanceCharts
+          trades={combinedTrades}
+          title="Combined F&O charts"
+          subtitle={`All symbols with trades · ${combinedTrades.length} total trade(s) · 15-min slots on latest day + hold time · click a bar to filter list below`}
+          activeFilter={chartFilter}
+          onFilterChange={setChartFilter}
+        />
+      </div>
+
       {/* Responsive stock list */}
+      <div className="border-b border-neutral-100 px-4 py-2 sm:px-6">
+        <p className="text-xs text-neutral-500">
+          {chartFilter
+            ? `Showing ${rows.length} symbol(s) matching chart selection`
+            : `${rows.length} symbol(s) in list`}
+        </p>
+      </div>
       <ul className="divide-y divide-neutral-100">
         {rows.map((r, i) => (
           <StockBlock
@@ -203,13 +291,15 @@ export function ScanReportView({
             row={r}
             index={i + 1}
             isOptions={report.tradeInstrument === "options_atm"}
-            open={Boolean(expanded[r.symbol])}
+            open={Boolean(effectiveExpanded[r.symbol])}
             onToggle={() => toggle(r.symbol)}
           />
         ))}
         {!rows.length && (
           <li className="px-4 py-10 text-center text-sm text-neutral-500">
-            No stocks in this filter.
+            {chartFilter
+              ? "No stocks match this chart bar. Clear the filter to see all."
+              : "No stocks in this filter."}
           </li>
         )}
       </ul>
@@ -320,18 +410,13 @@ function StockBlock({
                     <th className="px-3 py-2.5 font-medium text-right">
                       {isOptions ? "Prem out" : "Price out"}
                     </th>
+                    <th className="px-3 py-2.5 font-medium text-right">
+                      Capital used
+                    </th>
                     {isOptions && (
-                      <>
-                        <th className="px-3 py-2.5 font-medium text-right">
-                          Spot in
-                        </th>
-                        <th className="px-3 py-2.5 font-medium text-right">
-                          Spot out
-                        </th>
-                        <th className="px-3 py-2.5 font-medium text-right">
-                          Strike
-                        </th>
-                      </>
+                      <th className="px-3 py-2.5 font-medium text-right">
+                        Strike
+                      </th>
                     )}
                     <th className="px-3 py-2.5 font-medium text-right">P&amp;L</th>
                   </tr>
@@ -384,18 +469,13 @@ function TradeRow({
       <td className="px-3 py-2.5 text-right tabular-nums">
         {t.exitPrice.toFixed(2)}
       </td>
+      <td className="px-3 py-2.5 text-right tabular-nums font-medium">
+        {formatMoney(t.capitalUsed ?? t.entryPrice)}
+      </td>
       {isOptions && (
-        <>
-          <td className="px-3 py-2.5 text-right tabular-nums text-neutral-500">
-            {t.underlyingEntry?.toFixed(2) ?? "—"}
-          </td>
-          <td className="px-3 py-2.5 text-right tabular-nums text-neutral-500">
-            {t.underlyingExit?.toFixed(2) ?? "—"}
-          </td>
-          <td className="px-3 py-2.5 text-right tabular-nums">
-            {t.strike ?? "—"}
-          </td>
-        </>
+        <td className="px-3 py-2.5 text-right tabular-nums">
+          {t.strike ?? "-"}
+        </td>
       )}
       <td
         className={`px-3 py-2.5 text-right tabular-nums font-medium ${
@@ -406,6 +486,33 @@ function TradeRow({
       </td>
     </tr>
   );
+}
+
+function scanTradeToTrade(
+  t: ScanTradeDetail,
+  symbol: string,
+  instrument: ScanReportType["tradeInstrument"]
+): Trade {
+  return {
+    entryTime: t.entryTime,
+    exitTime: t.exitTime,
+    entryPrice: t.entryPrice,
+    exitPrice: t.exitPrice,
+    capitalUsed: t.capitalUsed,
+    qty: (t.lots || 1) * (t.lotSize || 1),
+    pnl: t.pnl,
+    pnlPct: t.pnlPct,
+    barsHeld: t.barsHeld,
+    underlyingEntry: t.underlyingEntry,
+    underlyingExit: t.underlyingExit,
+    strike: t.strike,
+    optionSide: t.optionSide,
+    lots: t.lots,
+    lotSize: t.lotSize,
+    label: t.label || symbol,
+    instrument: instrument === "options_atm" ? "options_atm" : "equity",
+    ...({ _symbol: symbol } as object),
+  } as Trade;
 }
 
 function StatusPill({ status }: { status: ScanRow["status"] }) {
@@ -430,7 +537,15 @@ function StatusPill({ status }: { status: ScanRow["status"] }) {
   );
 }
 
-function MiniStat({ label, value }: { label: string; value: string }) {
+function MiniStat({
+  label,
+  value,
+  sub,
+}: {
+  label: string;
+  value: string;
+  sub?: string;
+}) {
   return (
     <div className="rounded-xl border border-neutral-200 px-3 py-2">
       <p className="text-[10px] font-medium tracking-wide text-neutral-500 uppercase">
@@ -439,6 +554,7 @@ function MiniStat({ label, value }: { label: string; value: string }) {
       <p className="mt-0.5 text-base font-semibold tracking-tight tabular-nums">
         {value}
       </p>
+      {sub && <p className="text-[10px] text-neutral-500">{sub}</p>}
     </div>
   );
 }

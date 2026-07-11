@@ -109,6 +109,8 @@ export interface Trade {
   entryPrice: number;
   exitPrice: number;
   qty: number;
+  /** Cash locked at entry (premium×units or equity notional) */
+  capitalUsed: number;
   pnl: number;
   pnlPct: number;
   barsHeld: number;
@@ -143,12 +145,24 @@ export interface BacktestMetrics {
   totalPnlPct: number;
   avgPnl: number;
   avgWin: number;
+  /** Average loss as negative number */
   avgLoss: number;
+  /**
+   * Reward:Risk = |avgWin| / |avgLoss|.
+   * Infinity-like values capped at 999 when no losses.
+   */
+  riskRewardRatio: number;
   maxDrawdown: number;
   maxDrawdownPct: number;
   profitFactor: number;
   finalEquity: number;
   initialCapital: number;
+  /** Sum of capital locked across all trades */
+  totalCapitalUsed: number;
+  /** Average capital per trade */
+  avgCapitalUsed: number;
+  /** Largest single-trade capital lock */
+  maxCapitalUsed: number;
 }
 
 export interface BacktestResult {
@@ -193,6 +207,7 @@ export interface ScanTradeDetail {
   /** Equity spot or option premium at entry */
   entryPrice: number;
   exitPrice: number;
+  capitalUsed?: number;
   /** Underlying equity spot (always set for options mode) */
   underlyingEntry?: number;
   underlyingExit?: number;
@@ -204,6 +219,15 @@ export interface ScanTradeDetail {
   pnl: number;
   pnlPct: number;
   barsHeld: number;
+}
+
+/** Named strategy saved by the user (browser storage for now). */
+export interface SavedStrategy {
+  id: string;
+  name: string;
+  strategy: StrategyConfig;
+  updatedAt: number;
+  createdAt: number;
 }
 
 /** One row in the multi-symbol F&O scan report. */

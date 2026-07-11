@@ -113,6 +113,7 @@ export async function POST(req: NextRequest) {
             exitTime: t.exitTime,
             entryPrice: t.entryPrice,
             exitPrice: t.exitPrice,
+            capitalUsed: t.capitalUsed ?? t.entryPrice * t.qty,
             underlyingEntry: t.underlyingEntry,
             underlyingExit: t.underlyingExit,
             strike: t.strike,

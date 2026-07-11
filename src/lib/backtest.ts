@@ -57,7 +57,8 @@ export function runBacktest(
   const entryLogic = req.strategy.entryLogic ?? "and";
   const exitLogic = req.strategy.exitLogic ?? "and";
   const initialCapital = req.initialCapital > 0 ? req.initialCapital : 100000;
-  const sizePct = Math.min(100, Math.max(1, req.positionSizePct || 100)) / 100;
+  // Equity only: max fraction of *total* capital per trade (default 25%)
+  const sizePct = Math.min(100, Math.max(1, req.positionSizePct || 25)) / 100;
   const oneTradePerDay = Boolean(req.oneTradePerDay);
   const tradeInstrument: TradeInstrument = req.tradeInstrument || "equity";
   const optCfg = mergeOptions(req.options, tradeInstrument === "options_atm");
@@ -203,17 +204,11 @@ export function runBacktest(
       if (q.source === "market") marketFills += 1;
       else modelFills += 1;
 
+      // F&O: always exactly 1 lot per trade; funded from total capital pool
+      const lots = 1;
       const costPerLot = premium * optCfg.lotSize;
       if (costPerLot < minLotCost) minLotCost = costPerLot;
-      if (costPerLot <= 0) {
-        skippedInsufficientCapital += 1;
-        return;
-      }
-
-      const budget = cash * sizePct;
-      let lots = Math.floor(budget / costPerLot);
-      if (lots <= 0 && cash >= costPerLot) lots = 1;
-      if (lots <= 0) {
+      if (costPerLot <= 0 || cash < costPerLot) {
         skippedInsufficientCapital += 1;
         return;
       }
@@ -239,8 +234,9 @@ export function runBacktest(
       return;
     }
 
-    const budget = cash * sizePct;
-    let qty = Math.floor(budget / spot);
+    // Equity: cap each trade by % of *total* capital (not compounding full stack)
+    const maxSpend = Math.min(cash, initialCapital * sizePct);
+    let qty = Math.floor(maxSpend / spot);
     if (qty <= 0 && cash >= spot) qty = 1;
     if (qty <= 0) {
       skippedInsufficientCapital += 1;
@@ -295,12 +291,15 @@ export function runBacktest(
     const pnl = (exitPx - entryPrice) * positionQty;
     const pnlPct = entryPrice > 0 ? ((exitPx - entryPrice) / entryPrice) * 100 : 0;
 
+    const capitalUsed = entryPrice * positionQty;
+
     const trade: Trade = {
       entryTime,
       exitTime: c.time,
       entryPrice,
       exitPrice: exitPx,
       qty: positionQty,
+      capitalUsed,
       pnl,
       pnlPct,
       barsHeld: i - entryBar,
@@ -394,11 +393,11 @@ function buildDiagnostics(d: {
     const need = d.minLotCost
       ? `approx Rs ${Math.ceil(d.minLotCost).toLocaleString("en-IN")}`
       : "1 full lot";
-    note = `Equity signals fired ${d.equitySignals}x but capital was too low for options. Need ${need} per lot (lot size ${d.lotSize}). Increase capital or lower lot size.`;
+    note = `Equity signals fired ${d.equitySignals}x but capital was too low for 1 lot. Need ${need} (lot size ${d.lotSize}). Increase total capital.`;
   } else if (d.entriesTaken === 0 && d.equitySignals > 0) {
-    note = `Equity signals fired ${d.equitySignals}x but no trades were opened. Check capital / lot size.`;
+    note = `Equity signals fired ${d.equitySignals}x but no trades were opened. Check capital.`;
   } else if (d.skippedInsufficientCapital > 0) {
-    note = `${d.skippedInsufficientCapital} signal(s) skipped - not enough capital for another lot.`;
+    note = `${d.skippedInsufficientCapital} signal(s) skipped - not enough free cash for the next 1-lot trade.`;
   } else if (d.tradeInstrument === "options_atm" && d.marketFills + d.modelFills > 0) {
     if (d.marketFills > 0 && d.modelFills === 0) {
       note = "Option premiums from live F&O market history (Upstox).";
@@ -547,6 +546,20 @@ function computeMetrics(
 
   const grossProfit = winners.reduce((s, t) => s + t.pnl, 0);
   const grossLoss = Math.abs(losers.reduce((s, t) => s + t.pnl, 0));
+  const avgWin = winners.length ? grossProfit / winners.length : 0;
+  const avgLoss = losers.length ? -grossLoss / losers.length : 0; // negative
+  const absAvgLoss = Math.abs(avgLoss);
+  const riskRewardRatio =
+    absAvgLoss > 0 ? avgWin / absAvgLoss : avgWin > 0 ? 999 : 0;
+
+  const totalCapitalUsed = trades.reduce(
+    (s, t) => s + (t.capitalUsed ?? t.entryPrice * t.qty),
+    0
+  );
+  const maxCapitalUsed = trades.reduce(
+    (m, t) => Math.max(m, t.capitalUsed ?? t.entryPrice * t.qty),
+    0
+  );
 
   let peak = -Infinity;
   let maxDd = 0;
@@ -568,12 +581,16 @@ function computeMetrics(
     totalPnl,
     totalPnlPct: initialCapital ? (totalPnl / initialCapital) * 100 : 0,
     avgPnl: totalTrades ? totalPnl / totalTrades : 0,
-    avgWin: winners.length ? grossProfit / winners.length : 0,
-    avgLoss: losers.length ? -grossLoss / losers.length : 0,
+    avgWin,
+    avgLoss,
+    riskRewardRatio,
     maxDrawdown: maxDd,
     maxDrawdownPct: maxDdPct,
     profitFactor: grossLoss > 0 ? grossProfit / grossLoss : grossProfit > 0 ? 999 : 0,
     finalEquity,
     initialCapital,
+    totalCapitalUsed,
+    avgCapitalUsed: totalTrades ? totalCapitalUsed / totalTrades : 0,
+    maxCapitalUsed,
   };
 }

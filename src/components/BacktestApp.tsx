@@ -2,9 +2,14 @@
 
 import { useMemo, useState } from "react";
 import { ConditionBuilder } from "./ConditionBuilder";
-import { EquityChart } from "./EquityChart";
 import { MetricsGrid } from "./MetricsGrid";
+import {
+  PerformanceCharts,
+  filterTradesByChart,
+  type ChartBarFilter,
+} from "./PerformanceCharts";
 import { ScanReportView } from "./ScanReport";
+import { StrategyLibrary } from "./StrategyLibrary";
 import { TradesTable } from "./TradesTable";
 import { STRATEGY_PRESETS, PRESET_OPENING_RANGE_EMA } from "@/lib/presets";
 import { defaultDateRange, uid } from "@/lib/format";
@@ -44,8 +49,10 @@ export function BacktestApp() {
   const [to, setTo] = useState(defaults.to);
   const [source, setSource] = useState<DataSource>("yahoo");
   const [upstoxToken, setUpstoxToken] = useState("");
+  /** Total capital pool for the entire backtest run */
   const [capital, setCapital] = useState(100000);
-  const [sizePct, setSizePct] = useState(100);
+  /** Equity only: max % of total capital per trade (not used for F&O — always 1 lot) */
+  const [equityAllocPct, setEquityAllocPct] = useState(25);
   const [oneTradePerDay, setOneTradePerDay] = useState(true);
   const [tradeInstrument, setTradeInstrument] =
     useState<TradeInstrument>("options_atm");
@@ -63,9 +70,15 @@ export function BacktestApp() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [scanReport, setScanReport] = useState<ScanReport | null>(null);
+  const [chartFilter, setChartFilter] = useState<ChartBarFilter | null>(null);
   const [showToken, setShowToken] = useState(false);
   const [scanMaxSymbols, setScanMaxSymbols] = useState(50);
   const [scanAllFno, setScanAllFno] = useState(false);
+
+  const filteredTrades = useMemo(
+    () => filterTradesByChart(result?.trades || [], chartFilter),
+    [result?.trades, chartFilter]
+  );
 
   function applyPreset(name: string) {
     const p = STRATEGY_PRESETS.find((x) => x.name === name);
@@ -78,6 +91,16 @@ export function BacktestApp() {
         })
       );
     }
+  }
+
+  function loadStrategy(s: StrategyConfig) {
+    setStrategy(
+      structuredClone({
+        ...s,
+        entry: s.entry.map((c) => ({ ...c, id: c.id || uid() })),
+        exit: s.exit.map((c) => ({ ...c, id: c.id || uid() })),
+      })
+    );
   }
 
   function buildOptions(): OptionsTradeSettings {
@@ -110,6 +133,7 @@ export function BacktestApp() {
     setError(null);
     setResult(null);
     setScanReport(null);
+    setChartFilter(null);
 
     try {
       if ((source === "yahoo" || source === "upstox") && !symbol.trim()) {
@@ -131,7 +155,7 @@ export function BacktestApp() {
           source,
           strategy,
           initialCapital: capital,
-          positionSizePct: sizePct,
+          positionSizePct: equityAllocPct,
           oneTradePerDay,
           tradeInstrument,
           options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
@@ -168,6 +192,7 @@ export function BacktestApp() {
     setError(null);
     setResult(null);
     setScanReport(null);
+    setChartFilter(null);
 
     try {
       validateCommon();
@@ -182,7 +207,7 @@ export function BacktestApp() {
           source: source === "sample" ? "yahoo" : source,
           strategy,
           initialCapital: capital,
-          positionSizePct: sizePct,
+          positionSizePct: equityAllocPct,
           oneTradePerDay,
           tradeInstrument,
           options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
@@ -375,11 +400,18 @@ export function BacktestApp() {
           </section>
 
           <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-            <h2 className="mb-5 text-sm font-medium tracking-wide text-neutral-500 uppercase">
+            <h2 className="mb-3 text-sm font-medium tracking-wide text-neutral-500 uppercase">
               Capital
             </h2>
-            <div className="grid grid-cols-2 gap-3">
-              <Field label="Initial capital (₹)">
+            <p className="mb-4 text-xs leading-relaxed text-neutral-500">
+              Total capital for the whole backtest (e.g. ₹1,00,000). Cash is
+              shared across sequential trades — not 100% reinvested per trade.
+              {tradeInstrument === "options_atm"
+                ? " F&O always uses 1 lot per trade if cash covers the premium."
+                : ""}
+            </p>
+            <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+              <Field label="Total capital (₹)">
                 <input
                   type="number"
                   min={1000}
@@ -389,16 +421,31 @@ export function BacktestApp() {
                   className="field-input"
                 />
               </Field>
-              <Field label="Position size %">
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  value={sizePct}
-                  onChange={(e) => setSizePct(Number(e.target.value))}
-                  className="field-input"
-                />
-              </Field>
+              {tradeInstrument === "equity" ? (
+                <Field label="Max capital per equity trade (% of total)">
+                  <input
+                    type="number"
+                    min={1}
+                    max={100}
+                    value={equityAllocPct}
+                    onChange={(e) =>
+                      setEquityAllocPct(
+                        Math.min(100, Math.max(1, Number(e.target.value) || 25))
+                      )
+                    }
+                    className="field-input"
+                  />
+                </Field>
+              ) : (
+                <div className="flex items-end">
+                  <p className="rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2.5 text-xs text-neutral-600">
+                    <strong className="text-neutral-900">F&amp;O:</strong> 1 lot
+                    per trade. With ₹{capital.toLocaleString("en-IN")} you can
+                    open as many sequential 1-lot trades as cash allows after
+                    each exit.
+                  </p>
+                </div>
+              )}
             </div>
           </section>
 
@@ -594,17 +641,22 @@ export function BacktestApp() {
               />
             </div>
 
-            <div className="mt-6 space-y-3 rounded-2xl bg-neutral-50 p-4 text-sm text-neutral-600">
-              <div>
-                <p className="font-medium text-neutral-800">
-                  Prev Day High (new)
-                </p>
-                <p className="mt-1 leading-relaxed">
-                  Use condition <strong>close &gt; Prev Day High</strong> so
-                  price must trade above yesterday&apos;s session high. Included
-                  in preset <strong>OR + EMA20 + Fib R3 + PDH</strong>.
-                </p>
-              </div>
+            <div className="mt-6">
+              <StrategyLibrary
+                strategy={strategy}
+                onLoad={loadStrategy}
+                onRenamed={(name) =>
+                  setStrategy((s) => ({ ...s, name }))
+                }
+              />
+            </div>
+
+            <div className="mt-4 space-y-3 rounded-2xl bg-neutral-50 p-4 text-sm text-neutral-600">
+              <p className="font-medium text-neutral-800">Tip</p>
+              <p className="leading-relaxed">
+                Use <strong>close &gt; Prev Day High</strong> for breakouts.
+                Save your strategy by name so you can reload it anytime.
+              </p>
             </div>
           </section>
 
@@ -756,6 +808,13 @@ export function BacktestApp() {
                       : "equity"}
                     {result.oneTradePerDay ? " · 1/day" : ""} ·{" "}
                     {result.trades.length} trades
+                    {" · "}
+                    Win {result.metrics.winRate.toFixed(1)}%
+                    {" · "}
+                    R:R{" "}
+                    {(result.metrics.riskRewardRatio ?? 0) >= 999
+                      ? "∞"
+                      : `${(result.metrics.riskRewardRatio ?? 0).toFixed(2)}:1`}
                   </p>
                   {result.optionsMeta && (
                     <p className="mt-1 text-xs text-neutral-500">
@@ -810,18 +869,50 @@ export function BacktestApp() {
                 <MetricsGrid metrics={result.metrics} />
               </section>
 
-              <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-                <h2 className="mb-4 text-sm font-medium tracking-wide text-neutral-500 uppercase">
-                  Equity curve
-                </h2>
-                <EquityChart data={result.equityCurve} />
+              {/* Charts always visible after metrics for single-symbol runs */}
+              <section
+                id="performance-charts"
+                className="rounded-3xl border border-neutral-200 bg-white p-4 shadow-[0_1px_2px_rgba(0,0,0,0.04)] sm:p-6"
+              >
+                <div className="mb-4 flex flex-wrap items-end justify-between gap-2">
+                  <div>
+                    <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
+                      Charts
+                    </h2>
+                    <p className="mt-1 text-xs text-neutral-500">
+                      (1) Latest day every 15 min · (2) Hold time entry → exit
+                      {result.trades?.length
+                        ? ` · ${result.trades.length} trade(s)`
+                        : " · no trades yet"}
+                    </p>
+                  </div>
+                </div>
+                <PerformanceCharts
+                  trades={result.trades || []}
+                  activeFilter={chartFilter}
+                  onFilterChange={setChartFilter}
+                />
               </section>
 
               <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-                <h2 className="mb-4 text-sm font-medium tracking-wide text-neutral-500 uppercase">
-                  Trades
-                </h2>
-                <TradesTable trades={result.trades} />
+                <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
+                  <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
+                    Trades
+                    {chartFilter
+                      ? ` · ${filteredTrades.length} of ${result.trades?.length || 0}`
+                      : ""}
+                  </h2>
+                  {chartFilter && (
+                    <button
+                      type="button"
+                      onClick={() => setChartFilter(null)}
+                      className="rounded-full border border-neutral-300 px-3 py-1 text-xs font-medium hover:border-black"
+                    >
+                      Show all trades
+                    </button>
+                  )}
+                </div>
+                <TradesTable trades={filteredTrades} />
               </section>
             </>
           )}
