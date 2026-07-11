@@ -4,6 +4,8 @@ import { safeErrorMessage } from "@/lib/http";
 import type { BacktestRequest } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
+/** Allow longer F&O / options runs on Vercel (capped by plan). */
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
