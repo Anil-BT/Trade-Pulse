@@ -2,6 +2,7 @@ import fs from "fs";
 import path from "path";
 import zlib from "zlib";
 import { promisify } from "util";
+import { ensureCacheDir, getCacheDir } from "./cache-dir";
 
 const gunzip = promisify(zlib.gunzip);
 
@@ -10,7 +11,6 @@ const NSE_URL =
 const BSE_URL =
   "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz";
 
-const CACHE_DIR = path.join(process.cwd(), ".data-cache");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // refresh daily (Upstox BOD ~6 AM)
 
 export interface UpstoxInstrument {
@@ -115,9 +115,9 @@ async function loadSymbolIndex(): Promise<SymbolIndex> {
     return memoryIndex;
   }
 
-  ensureDir();
-  const cachePath = path.join(CACHE_DIR, "upstox_symbol_index.json");
+  const cachePath = path.join(getCacheDir(), "upstox_symbol_index.json");
   try {
+    ensureCacheDir();
     if (fs.existsSync(cachePath)) {
       const raw = JSON.parse(fs.readFileSync(cachePath, "utf8")) as SymbolIndex;
       if (raw?.bySymbol && Date.now() - raw.savedAt < CACHE_TTL_MS) {
@@ -176,9 +176,10 @@ async function loadSymbolIndex(): Promise<SymbolIndex> {
   const index: SymbolIndex = { savedAt: Date.now(), bySymbol };
   memoryIndex = index;
   try {
+    ensureCacheDir();
     fs.writeFileSync(cachePath, JSON.stringify(index));
   } catch {
-    // non-fatal
+    // non-fatal on serverless / read-only FS
   }
   return index;
 }
@@ -245,6 +246,4 @@ async function fetchInstruments(url: string): Promise<UpstoxInstrument[]> {
   return data;
 }
 
-function ensureDir() {
-  if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
-}
+

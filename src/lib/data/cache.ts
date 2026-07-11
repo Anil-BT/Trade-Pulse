@@ -2,26 +2,19 @@ import fs from "fs";
 import path from "path";
 import type { Candle } from "../types";
 import { filterCandlesByRange } from "./dates";
-
-const CACHE_DIR = path.join(process.cwd(), ".data-cache");
-
-function ensureDir() {
-  if (!fs.existsSync(CACHE_DIR)) {
-    fs.mkdirSync(CACHE_DIR, { recursive: true });
-  }
-}
+import { ensureCacheDir, getCacheDir } from "./cache-dir";
 
 function safeName(key: string): string {
   return key.replace(/[^a-zA-Z0-9._|=-]/g, "_");
 }
 
 function keyPath(key: string): string {
-  return path.join(CACHE_DIR, `${safeName(key)}.json`);
+  return path.join(getCacheDir(), `${safeName(key)}.json`);
 }
 
 export function readCache(key: string, maxAgeMs = 12 * 60 * 60 * 1000): Candle[] | null {
   try {
-    ensureDir();
+    ensureCacheDir();
     const p = keyPath(key);
     if (!fs.existsSync(p)) return null;
     const raw = JSON.parse(fs.readFileSync(p, "utf8")) as {
@@ -48,22 +41,24 @@ export function readCacheCovering(opts: {
   maxAgeMs?: number;
 }): Candle[] | null {
   try {
-    ensureDir();
+    const cacheDir = ensureCacheDir();
     const maxAge = opts.maxAgeMs ?? 12 * 60 * 60 * 1000;
     const prefix = safeName(
       `${opts.source}_${opts.symbol.toUpperCase()}_${opts.interval}_`
     );
 
+    if (!fs.existsSync(cacheDir)) return null;
+
     let best: Candle[] | null = null;
     let bestCount = 0;
 
-    for (const file of fs.readdirSync(CACHE_DIR)) {
+    for (const file of fs.readdirSync(cacheDir)) {
       if (!file.endsWith(".json")) continue;
       if (!file.startsWith(prefix) && !file.startsWith(safeName(prefix))) continue;
 
       let raw: { savedAt: number; candles: Candle[] };
       try {
-        raw = JSON.parse(fs.readFileSync(path.join(CACHE_DIR, file), "utf8"));
+        raw = JSON.parse(fs.readFileSync(path.join(cacheDir, file), "utf8"));
       } catch {
         continue;
       }
@@ -85,13 +80,13 @@ export function readCacheCovering(opts: {
 
 export function writeCache(key: string, candles: Candle[]) {
   try {
-    ensureDir();
+    ensureCacheDir();
     fs.writeFileSync(
       keyPath(key),
       JSON.stringify({ savedAt: Date.now(), candles }),
       "utf8"
     );
   } catch {
-    // non-fatal
+    // non-fatal on serverless / read-only FS
   }
 }

@@ -3,11 +3,11 @@ import path from "path";
 import zlib from "zlib";
 import { promisify } from "util";
 import { normalizeTradingSymbol } from "./upstox-instruments";
+import { ensureCacheDir, getCacheDir } from "./cache-dir";
 
 const gunzip = promisify(zlib.gunzip);
 const NSE_URL =
   "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
-const CACHE_DIR = path.join(process.cwd(), ".data-cache");
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000;
 
 export interface FnoMeta {
@@ -168,8 +168,9 @@ async function loadFoCache(): Promise<FoCache> {
   if (memory && Date.now() - memory.savedAt < CACHE_TTL_MS) return memory;
 
   // v3 = equity-only FO underlyings (no commodity/currency)
-  const cachePath = path.join(CACHE_DIR, "upstox_fno_meta_v3.json");
+  const cachePath = path.join(getCacheDir(), "upstox_fno_meta_v3.json");
   try {
+    ensureCacheDir();
     if (fs.existsSync(cachePath)) {
       const raw = JSON.parse(fs.readFileSync(cachePath, "utf8")) as FoCache;
       if (raw?.byUnderlying && Date.now() - raw.savedAt < CACHE_TTL_MS) {
@@ -259,10 +260,10 @@ async function loadFoCache(): Promise<FoCache> {
   const cache: FoCache = { savedAt: Date.now(), byUnderlying };
   memory = cache;
   try {
-    if (!fs.existsSync(CACHE_DIR)) fs.mkdirSync(CACHE_DIR, { recursive: true });
+    ensureCacheDir();
     fs.writeFileSync(cachePath, JSON.stringify(cache));
   } catch {
-    // non-fatal
+    // non-fatal on serverless / read-only FS
   }
   return cache;
 }
