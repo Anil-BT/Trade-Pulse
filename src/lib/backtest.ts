@@ -7,6 +7,7 @@ import {
   yearsToExpiry,
   type OptionsConfig,
 } from "./options";
+import type { OptionPricer } from "./option-pricing";
 import type {
   BacktestMetrics,
   BacktestRequest,
@@ -27,7 +28,16 @@ function sessionDayKey(timeMs: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestResult {
+export interface BacktestExtras {
+  /** Market/model option pricer - when set, options_atm uses this for fills */
+  optionPricer?: OptionPricer;
+}
+
+export function runBacktest(
+  candles: Candle[],
+  req: BacktestRequest,
+  extras: BacktestExtras = {}
+): BacktestResult {
   if (candles.length < 5) {
     throw new Error("Not enough candles to backtest");
   }
@@ -51,6 +61,7 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
   const oneTradePerDay = Boolean(req.oneTradePerDay);
   const tradeInstrument: TradeInstrument = req.tradeInstrument || "equity";
   const optCfg = mergeOptions(req.options, tradeInstrument === "options_atm");
+  const pricer = extras.optionPricer;
 
   let cash = initialCapital;
   let positionQty = 0;
@@ -60,12 +71,16 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
   let entryUnderlying = 0;
   let entryStrike = 0;
   let entryLots = 0;
+  let entryLabel = "";
+  let entryPremiumSource: "market" | "model" | undefined;
   let tradesOnDay = 0;
   let currentDay = "";
 
   let equitySignals = 0;
   let skippedInsufficientCapital = 0;
   let minLotCost = Infinity;
+  let marketFills = 0;
+  let modelFills = 0;
 
   const trades: Trade[] = [];
   const equityCurve: EquityPoint[] = [];
@@ -80,21 +95,21 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
 
     const markUnit =
       positionQty > 0
-        ? markUnitPrice(c, tradeInstrument, optCfg, {
+        ? markUnitPrice(c, tradeInstrument, optCfg, pricer, {
             entryTime,
             entryStrike,
           })
         : 0;
     equityCurve.push({ time: c.time, equity: cash + positionQty * markUnit });
 
-    // EXIT — equity signal
+    // EXIT - equity signal
     if (positionQty > 0) {
       if (evalConditions(req.strategy.exit, exitLogic, i, seriesMap)) {
         closePosition(i, c);
       }
     }
 
-    // ENTRY — equity signal, then execute equity or ATM option
+    // ENTRY - equity signal, then execute equity or ATM option
     if (positionQty === 0) {
       const dayLimitHit = oneTradePerDay && tradesOnDay >= 1;
       if (
@@ -122,6 +137,8 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
     oneTradePerDay,
     lotSize: optCfg.lotSize,
     initialCapital,
+    marketFills,
+    modelFills,
   });
 
   return {
@@ -144,13 +161,17 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
             iv: optCfg.iv,
             daysToExpiry: optCfg.daysToExpiry,
             listedStrikesCount: optCfg.listedStrikes?.length || 0,
+            pricingMode: pricer?.pricingMode,
+            marketContractsUsed: pricer?.marketContractsUsed,
+            marketFills,
+            modelFills,
           }
         : undefined,
     diagnostics,
   };
 
   function openPosition(i: number, c: Candle) {
-    const spot = c.close; // equity close for signal bar
+    const spot = c.close;
 
     if (tradeInstrument === "options_atm") {
       if (optCfg.lotSize <= 0) {
@@ -159,20 +180,28 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
         );
       }
 
-      // True ATM from listed FO strikes (fallback: step)
-      const strike = atmStrike(
-        spot,
-        optCfg.strikeStep,
-        optCfg.listedStrikes
-      );
-      const premium = optionPremium(
-        spot,
-        strike,
-        entryYearsToExpiry(optCfg.daysToExpiry),
-        optCfg.riskFreeRate ?? 0.065,
-        optCfg.iv,
-        optCfg.side
-      );
+      const strike = pricer
+        ? pricer.strikeFor(spot)
+        : atmStrike(spot, optCfg.strikeStep, optCfg.listedStrikes);
+
+      const q = pricer
+        ? pricer.quote({ timeMs: c.time, spot, strike })
+        : {
+            premium: optionPremium(
+              spot,
+              strike,
+              entryYearsToExpiry(optCfg.daysToExpiry),
+              0.065,
+              optCfg.iv,
+              optCfg.side
+            ),
+            source: "model" as const,
+            strike,
+          };
+
+      const premium = q.premium;
+      if (q.source === "market") marketFills += 1;
+      else modelFills += 1;
 
       const costPerLot = premium * optCfg.lotSize;
       if (costPerLot < minLotCost) minLotCost = costPerLot;
@@ -181,28 +210,31 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
         return;
       }
 
-      // How many lots can we buy? Prefer at least 1 lot if cash allows.
       const budget = cash * sizePct;
       let lots = Math.floor(budget / costPerLot);
-      if (lots <= 0 && cash >= costPerLot) {
-        // Position-% floor left us at 0 but we can still afford 1 lot
-        lots = 1;
-      }
+      if (lots <= 0 && cash >= costPerLot) lots = 1;
       if (lots <= 0) {
         skippedInsufficientCapital += 1;
         return;
       }
 
       const units = lots * optCfg.lotSize;
-      const cost = units * premium;
-      cash -= cost;
+      cash -= units * premium;
       positionQty = units;
       entryPrice = premium;
       entryTime = c.time;
       entryBar = i;
       entryUnderlying = spot;
-      entryStrike = strike;
+      entryStrike = q.strike || strike;
       entryLots = lots;
+      entryPremiumSource = q.source;
+      entryLabel =
+        q.contractLabel ||
+        formatOptionLabel(
+          req.symbol.replace(/\.NS$/i, "").replace(/\.BO$/i, ""),
+          entryStrike,
+          optCfg.side
+        );
       tradesOnDay += 1;
       return;
     }
@@ -222,33 +254,46 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
     entryUnderlying = spot;
     entryStrike = 0;
     entryLots = 0;
+    entryLabel = "";
+    entryPremiumSource = undefined;
     tradesOnDay += 1;
   }
 
   function closePosition(i: number, c: Candle) {
     const spot = c.close;
     let exitPx: number;
+    let exitSource: "market" | "model" | undefined;
 
     if (tradeInstrument === "options_atm") {
-      exitPx = optionPremium(
-        spot,
-        entryStrike,
-        yearsToExpiry(optCfg.daysToExpiry, c.time - entryTime),
-        optCfg.riskFreeRate ?? 0.065,
-        optCfg.iv,
-        optCfg.side
-      );
+      if (pricer) {
+        const q = pricer.quote({
+          timeMs: c.time,
+          spot,
+          strike: entryStrike,
+          heldFromMs: entryTime,
+        });
+        exitPx = q.premium;
+        exitSource = q.source;
+        if (q.source === "market") marketFills += 1;
+        else modelFills += 1;
+      } else {
+        exitPx = optionPremium(
+          spot,
+          entryStrike,
+          yearsToExpiry(optCfg.daysToExpiry, c.time - entryTime),
+          0.065,
+          optCfg.iv,
+          optCfg.side
+        );
+        exitSource = "model";
+        modelFills += 1;
+      }
     } else {
       exitPx = spot;
     }
 
     const pnl = (exitPx - entryPrice) * positionQty;
     const pnlPct = entryPrice > 0 ? ((exitPx - entryPrice) / entryPrice) * 100 : 0;
-
-    const cleanSym = req.symbol
-      .replace(/\.NS$/i, "")
-      .replace(/\.BO$/i, "")
-      .toUpperCase();
 
     const trade: Trade = {
       entryTime,
@@ -269,9 +314,11 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
       trade.strike = entryStrike;
       trade.lots = entryLots;
       trade.lotSize = optCfg.lotSize;
-      trade.label = formatOptionLabel(cleanSym, entryStrike, optCfg.side);
+      trade.label = entryLabel;
       trade.lotCostEntry = entryPrice * optCfg.lotSize;
       trade.lotCostExit = exitPx * optCfg.lotSize;
+      trade.premiumSource = entryPremiumSource;
+      trade.exitPremiumSource = exitSource;
     }
 
     trades.push(trade);
@@ -280,60 +327,27 @@ export function runBacktest(candles: Candle[], req: BacktestRequest): BacktestRe
   }
 }
 
-function buildDiagnostics(d: {
-  equitySignals: number;
-  entriesTaken: number;
-  skippedInsufficientCapital: number;
-  minLotCost?: number;
-  tradeInstrument: TradeInstrument;
-  oneTradePerDay: boolean;
-  lotSize: number;
-  initialCapital: number;
-}): BacktestResult["diagnostics"] {
-  let note: string | undefined;
-
-  if (d.entriesTaken === 0 && d.equitySignals === 0) {
-    note =
-      "No equity entry signals in this range. Loosen the strategy, widen dates, or use a 5m interval on trading days.";
-  } else if (
-    d.entriesTaken === 0 &&
-    d.skippedInsufficientCapital > 0 &&
-    d.tradeInstrument === "options_atm"
-  ) {
-    const need = d.minLotCost
-      ? `≈ ₹${Math.ceil(d.minLotCost).toLocaleString("en-IN")}`
-      : "1 full lot";
-    note = `Equity signals fired ${d.equitySignals}× but capital was too low for options. Need ${need} per lot (lot size ${d.lotSize}). Increase capital or lower lot size.`;
-  } else if (d.entriesTaken === 0 && d.equitySignals > 0) {
-    note = `Equity signals fired ${d.equitySignals}× but no trades were opened. Check capital / lot size.`;
-  } else if (d.skippedInsufficientCapital > 0) {
-    note = `${d.skippedInsufficientCapital} signal(s) skipped - not enough capital for another lot.`;
-  } else if (d.oneTradePerDay) {
-    note = "Max 1 entry per session day is on.";
-  }
-
-  return {
-    equitySignals: d.equitySignals,
-    entriesTaken: d.entriesTaken,
-    skippedInsufficientCapital: d.skippedInsufficientCapital,
-    minLotCost:
-      d.minLotCost && Number.isFinite(d.minLotCost) ? d.minLotCost : undefined,
-    note,
-  };
-}
-
 function markUnitPrice(
   c: Candle,
   instrument: TradeInstrument,
   optCfg: OptionsConfig,
+  pricer: OptionPricer | undefined,
   pos: { entryTime: number; entryStrike: number }
 ): number {
   if (instrument !== "options_atm") return c.close;
+  if (pricer) {
+    return pricer.quote({
+      timeMs: c.time,
+      spot: c.close,
+      strike: pos.entryStrike,
+      heldFromMs: pos.entryTime,
+    }).premium;
+  }
   return optionPremium(
     c.close,
     pos.entryStrike,
     yearsToExpiry(optCfg.daysToExpiry, c.time - pos.entryTime),
-    optCfg.riskFreeRate ?? 0.065,
+    0.065,
     optCfg.iv,
     optCfg.side
   );
@@ -352,6 +366,59 @@ function mergeOptions(
     iv: Math.min(2, Math.max(0.05, settings?.iv ?? 0.18)),
     daysToExpiry: Math.max(1, settings?.daysToExpiry ?? 7),
     riskFreeRate: 0.065,
+  };
+}
+
+function buildDiagnostics(d: {
+  equitySignals: number;
+  entriesTaken: number;
+  skippedInsufficientCapital: number;
+  minLotCost?: number;
+  tradeInstrument: TradeInstrument;
+  oneTradePerDay: boolean;
+  lotSize: number;
+  initialCapital: number;
+  marketFills: number;
+  modelFills: number;
+}): BacktestResult["diagnostics"] {
+  let note: string | undefined;
+
+  if (d.entriesTaken === 0 && d.equitySignals === 0) {
+    note =
+      "No equity entry signals in this range. Loosen the strategy, widen dates, or use a 5m interval on trading days.";
+  } else if (
+    d.entriesTaken === 0 &&
+    d.skippedInsufficientCapital > 0 &&
+    d.tradeInstrument === "options_atm"
+  ) {
+    const need = d.minLotCost
+      ? `approx Rs ${Math.ceil(d.minLotCost).toLocaleString("en-IN")}`
+      : "1 full lot";
+    note = `Equity signals fired ${d.equitySignals}x but capital was too low for options. Need ${need} per lot (lot size ${d.lotSize}). Increase capital or lower lot size.`;
+  } else if (d.entriesTaken === 0 && d.equitySignals > 0) {
+    note = `Equity signals fired ${d.equitySignals}x but no trades were opened. Check capital / lot size.`;
+  } else if (d.skippedInsufficientCapital > 0) {
+    note = `${d.skippedInsufficientCapital} signal(s) skipped - not enough capital for another lot.`;
+  } else if (d.tradeInstrument === "options_atm" && d.marketFills + d.modelFills > 0) {
+    if (d.marketFills > 0 && d.modelFills === 0) {
+      note = "Option premiums from live F&O market history (Upstox).";
+    } else if (d.marketFills > 0) {
+      note = `Option premiums: ${d.marketFills} market fills, ${d.modelFills} model fills (realized-vol BS when F&O history missing).`;
+    } else {
+      note =
+        "Option premiums are model estimates (realized equity vol). Add Upstox access token for actual F&O option OHLC prices.";
+    }
+  } else if (d.oneTradePerDay) {
+    note = "Max 1 entry per session day is on.";
+  }
+
+  return {
+    equitySignals: d.equitySignals,
+    entriesTaken: d.entriesTaken,
+    skippedInsufficientCapital: d.skippedInsufficientCapital,
+    minLotCost:
+      d.minLotCost && Number.isFinite(d.minLotCost) ? d.minLotCost : undefined,
+    note,
   };
 }
 

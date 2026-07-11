@@ -124,6 +124,9 @@ export interface Trade {
   lotCostEntry?: number;
   lotCostExit?: number;
   label?: string;
+  /** market = real F&O OHLC; model = estimated */
+  premiumSource?: "market" | "model";
+  exitPremiumSource?: "market" | "model";
 }
 
 export interface EquityPoint {
@@ -168,6 +171,10 @@ export interface BacktestResult {
     daysToExpiry: number;
     lotSource?: string;
     listedStrikesCount?: number;
+    pricingMode?: "market" | "model" | "mixed";
+    marketContractsUsed?: number;
+    marketFills?: number;
+    modelFills?: number;
   };
   /** Diagnostics when few/no trades. */
   diagnostics?: {

@@ -28,6 +28,7 @@ export function TradesTable({ trades }: { trades: Trade[] }) {
               <>
                 <th className="px-3 py-3 font-medium">Contract</th>
                 <th className="px-3 py-3 font-medium text-right">Strike</th>
+                <th className="px-3 py-3 font-medium">Px src</th>
               </>
             )}
             <th className="px-3 py-3 font-medium">Entry</th>
@@ -65,15 +66,22 @@ export function TradesTable({ trades }: { trades: Trade[] }) {
                 <>
                   <td className="px-3 py-3 whitespace-nowrap text-xs font-medium">
                     {t.label ||
-                      `${t.strike ?? "—"} ${t.optionSide ?? ""}`}
+                      `${t.strike ?? "-"} ${t.optionSide ?? ""}`}
                   </td>
                   <td className="px-3 py-3 text-right tabular-nums font-medium">
-                    {t.strike != null ? t.strike.toFixed(0) : "—"}
+                    {t.strike != null ? t.strike.toFixed(0) : "-"}
                     {t.underlyingEntry != null && (
                       <span className="block text-[10px] font-normal text-neutral-400">
                         spot {t.underlyingEntry.toFixed(1)}
                       </span>
                     )}
+                  </td>
+                  <td className="px-3 py-3 text-[10px] uppercase tracking-wide text-neutral-500">
+                    {t.premiumSource === "market" ? "market" : "model"}
+                    {t.exitPremiumSource &&
+                    t.exitPremiumSource !== t.premiumSource
+                      ? `/${t.exitPremiumSource}`
+                      : ""}
                   </td>
                 </>
               )}

@@ -456,19 +456,21 @@ export function BacktestApp() {
                   <ol className="mt-2 list-decimal space-y-1 pl-4">
                     <li>
                       <strong>Signals</strong> run only on equity (close, EMA,
-                      opening range, Fib R3, …).
+                      opening range, Fib, prev day high, ...).
                     </li>
                     <li>
-                      On a valid entry we buy the <strong>ATM</strong>{" "}
-                      {optionSide} (strike nearest to equity close).
+                      On entry we buy the <strong>ATM</strong> {optionSide}{" "}
+                      (closest listed NSE strike).
                     </li>
                     <li>
-                      <strong>Lot size</strong> is taken from the live NSE F&amp;O
-                      master (e.g. RELIANCE 500, TCS 225) unless you override.
+                      <strong>Lot size</strong> from NSE F&amp;O master (auto)
+                      unless you override.
                     </li>
                     <li>
-                      Premium is estimated (Black–Scholes) — not a live option
-                      quote. Research only.
+                      <strong>Premiums:</strong> with an Upstox token we use{" "}
+                      <em>real F&amp;O historical OHLC</em> for that contract.
+                      Without a token we use a realized-vol model (better than
+                      fixed IV, still an estimate).
                     </li>
                   </ol>
                 </div>
@@ -765,10 +767,14 @@ export function BacktestApp() {
                         ? ` (${result.optionsMeta.lotSource})`
                         : ""}
                       {result.optionsMeta.listedStrikesCount
-                        ? ` · ${result.optionsMeta.listedStrikesCount} listed strikes`
+                        ? ` · ${result.optionsMeta.listedStrikesCount} strikes`
                         : ""}
-                      · IV {(result.optionsMeta.iv * 100).toFixed(0)}% · DTE{" "}
-                      {result.optionsMeta.daysToExpiry}d
+                      {" · "}
+                      {result.optionsMeta.pricingMode === "market"
+                        ? "premiums: market F&O"
+                        : result.optionsMeta.pricingMode === "mixed"
+                          ? `premiums: ${result.optionsMeta.marketFills ?? 0} market / ${result.optionsMeta.modelFills ?? 0} model`
+                          : "premiums: model (add Upstox token for real F&O prices)"}
                     </p>
                   )}
                   {result.diagnostics?.note && (
