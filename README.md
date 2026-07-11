@@ -2,6 +2,8 @@
 
 Minimal black-and-white app to pull **free historical stock data** and **backtest indicator strategies** — including ATM options simulation and F&O universe scans.
 
+**Live:** [https://tradepulse-nu.vercel.app](https://tradepulse-nu.vercel.app)
+
 ## Features
 
 - **Data sources**
@@ -11,7 +13,7 @@ Minimal black-and-white app to pull **free historical stock data** and **backtes
 - **Indicators** — EMA, SMA, RSI, Opening Range, Fib pivots, Prev Day High/Low
 - **Trade modes** — equity or ATM options (signals on equity, execute options)
 - **F&O scan** — run strategy across equity F&O names; single report with trade subtables
-- **Results** — metrics, equity curve, trade list, CSV export
+- **Results** — metrics, charts (15‑min P&L + hold-time P&L), trade list, CSV export
 
 ## Quick start
 
@@ -30,6 +32,21 @@ cp .env.example .env.local
 # set UPSTOX_ACCESS_TOKEN=...
 ```
 
+In production, paste the Upstox token in the UI (or set `UPSTOX_ACCESS_TOKEN` in the Vercel project env).
+
+## Hosting (Vercel)
+
+Production is deployed at **https://tradepulse-nu.vercel.app** (project `tradepulse`, team `alpha-traders-club`). GitHub repo is connected, so pushes to `main` redeploy automatically.
+
+```bash
+npx vercel --prod --yes   # manual production deploy
+```
+
+Notes:
+
+- Local `.data-cache` is ephemeral on Vercel (rebuilt per instance).
+- Large F&O scans may hit serverless timeouts on Hobby; use a smaller symbol count or upgrade the plan.
+
 ## Stack
 
-Next.js · TypeScript · Tailwind · Recharts
+Next.js · TypeScript · Tailwind · Recharts · Vercel
