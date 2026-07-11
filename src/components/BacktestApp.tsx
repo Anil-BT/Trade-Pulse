@@ -9,7 +9,6 @@ import {
   type ChartBarFilter,
 } from "./PerformanceCharts";
 import { ScanReportView } from "./ScanReport";
-import { AuthBar } from "./AuthBar";
 import { StrategyLibrary } from "./StrategyLibrary";
 import { TradesTable } from "./TradesTable";
 import { STRATEGY_PRESETS, PRESET_OPENING_RANGE_EMA } from "@/lib/presets";
@@ -234,9 +233,6 @@ export function BacktestApp() {
 
   return (
     <div className="mx-auto max-w-6xl px-5 pb-24 pt-10 sm:px-8">
-      <div className="mb-6 flex justify-end">
-        <AuthBar />
-      </div>
       <header className="mb-12 max-w-2xl">
         <p className="mb-3 text-xs font-medium tracking-[0.2em] text-neutral-500 uppercase">
           TradePulse

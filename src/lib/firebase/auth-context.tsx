@@ -16,6 +16,7 @@ import {
   signInWithEmailAndPassword,
   createUserWithEmailAndPassword,
   signOut as fbSignOut,
+  updateProfile,
   type User,
 } from "firebase/auth";
 import { getFirebase, isFirebaseConfigured } from "./client";
@@ -27,7 +28,12 @@ type AuthContextValue = {
   error: string | null;
   signInWithGoogle: () => Promise<void>;
   signInWithEmail: (email: string, password: string) => Promise<void>;
-  signUpWithEmail: (email: string, password: string) => Promise<void>;
+  signUpWithEmail: (
+    email: string,
+    password: string,
+    displayName?: string
+  ) => Promise<void>;
+  updateDisplayName: (name: string) => Promise<void>;
   signOut: () => Promise<void>;
   clearError: () => void;
 };
@@ -39,6 +45,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [user, setUser] = useState<User | null>(null);
   const [loading, setLoading] = useState(configured);
   const [error, setError] = useState<string | null>(null);
+  /** Bump to force re-render after profile update (User object mutates). */
+  const [profileTick, setProfileTick] = useState(0);
 
   useEffect(() => {
     const fb = getFirebase();
@@ -81,17 +89,53 @@ export function AuthProvider({ children }: { children: ReactNode }) {
     }
   }, []);
 
-  const signUpWithEmail = useCallback(async (email: string, password: string) => {
+  const signUpWithEmail = useCallback(
+    async (email: string, password: string, displayName?: string) => {
+      const fb = getFirebase();
+      if (!fb) {
+        setError("Firebase is not configured.");
+        return;
+      }
+      setError(null);
+      try {
+        const cred = await createUserWithEmailAndPassword(
+          fb.auth,
+          email.trim(),
+          password
+        );
+        const name = displayName?.trim();
+        if (name) {
+          await updateProfile(cred.user, { displayName: name });
+          setProfileTick((t) => t + 1);
+        }
+      } catch (e) {
+        setError(e instanceof Error ? e.message : "Sign-up failed");
+      }
+    },
+    []
+  );
+
+  const updateDisplayName = useCallback(async (name: string) => {
     const fb = getFirebase();
-    if (!fb) {
-      setError("Firebase is not configured.");
+    const current = fb?.auth.currentUser;
+    if (!current) {
+      setError("Not signed in.");
+      return;
+    }
+    const clean = name.trim();
+    if (!clean) {
+      setError("Name cannot be empty.");
       return;
     }
     setError(null);
     try {
-      await createUserWithEmailAndPassword(fb.auth, email.trim(), password);
+      await updateProfile(current, { displayName: clean });
+      // Refresh user from auth so UI picks up new displayName
+      setUser(fb.auth.currentUser);
+      setProfileTick((t) => t + 1);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Sign-up failed");
+      setError(e instanceof Error ? e.message : "Could not update name");
+      throw e;
     }
   }, []);
 
@@ -111,9 +155,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signInWithGoogle,
       signInWithEmail,
       signUpWithEmail,
+      updateDisplayName,
       signOut,
       clearError: () => setError(null),
     }),
+    // profileTick forces consumers to re-read user.displayName after updateProfile
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [
       configured,
       user,
@@ -122,7 +169,9 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       signInWithGoogle,
       signInWithEmail,
       signUpWithEmail,
+      updateDisplayName,
       signOut,
+      profileTick,
     ]
   );
 
