@@ -3,15 +3,14 @@ import path from "path";
 import zlib from "zlib";
 import { promisify } from "util";
 import { ensureCacheDir, getCacheDir } from "./cache-dir";
+import { lookupStaticUpstoxKey } from "./upstox-static-keys";
 
 const gunzip = promisify(zlib.gunzip);
 
 const NSE_URL =
   "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz";
-const BSE_URL =
-  "https://assets.upstox.com/market-quote/instruments/exchange/BSE.json.gz";
-
 const CACHE_TTL_MS = 24 * 60 * 60 * 1000; // refresh daily (Upstox BOD ~6 AM)
+const FETCH_TIMEOUT_MS = 25_000;
 
 export interface UpstoxInstrument {
   segment: string;
@@ -64,7 +63,29 @@ export async function resolveUpstoxInstrumentKey(
     };
   }
 
-  const index = await loadSymbolIndex();
+  // Fast path: static map (critical on Vercel cold starts)
+  if (exchange !== "BSE" && !symbol.toUpperCase().endsWith(".BO")) {
+    const staticHit = lookupStaticUpstoxKey(normalized);
+    if (staticHit) {
+      return {
+        instrumentKey: staticHit.instrumentKey,
+        tradingSymbol: staticHit.tradingSymbol,
+        name: staticHit.name,
+        segment: "NSE_EQ",
+        exchange: "NSE",
+      };
+    }
+  }
+
+  let index: SymbolIndex;
+  try {
+    index = await loadSymbolIndex();
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new Error(
+      `Could not load Upstox instrument list (${msg}). Use a full instrument key like NSE_EQ|INE002A01018, or retry.`
+    );
+  }
   const hit = index.bySymbol[normalized];
 
   if (!hit) {
@@ -72,7 +93,7 @@ export async function resolveUpstoxInstrumentKey(
     const alt = index.bySymbol[normalized.replace(/[-_\s]/g, "")];
     if (!alt) {
       throw new Error(
-        `Could not find Upstox instrument for "${symbol}". Use NSE trading symbol like RELIANCE, TCS, INFY, SBIN.`
+        `Could not find Upstox instrument for "${symbol}". Use NSE trading symbol like RELIANCE, TCS, INFY, SBIN, or paste instrument_key.`
       );
     }
     return mapHit(alt);
@@ -129,38 +150,21 @@ async function loadSymbolIndex(): Promise<SymbolIndex> {
     // rebuild
   }
 
-  const [nse, bse] = await Promise.all([
-    fetchInstruments(NSE_URL),
-    fetchInstruments(BSE_URL).catch(() => [] as UpstoxInstrument[]),
-  ]);
+  // NSE first (most lookups). Skip BSE unless needed — saves cold-start time on Vercel.
+  const nse = await fetchInstruments(NSE_URL);
 
   const bySymbol: Record<string, UpstoxInstrument> = {};
 
-  // Lower priority first so higher priority overwrites
-  // 1) BSE equity
-  for (const inst of bse) {
-    if (!isCashEquity(inst) && !isIndex(inst)) continue;
-    const sym = (inst.trading_symbol || "").toUpperCase();
-    if (!sym) continue;
-    // store BSE under BSE: prefix always
-    bySymbol[`BSE:${sym}`] = inst;
-    // only set primary if empty
-    if (!bySymbol[sym]) bySymbol[sym] = inst;
-  }
-
-  // 2) NSE equity + index (wins for primary symbol)
   for (const inst of nse) {
     if (!isCashEquity(inst) && !isIndex(inst)) continue;
     const sym = (inst.trading_symbol || "").toUpperCase();
     if (!sym) continue;
 
-    // Prefer EQ over BE over index when multiple
     const existing = bySymbol[sym];
     if (!existing || prefer(inst, existing)) {
       bySymbol[sym] = inst;
     }
 
-    // Short name alias (e.g. company short)
     if (inst.short_name) {
       const sn = inst.short_name.toUpperCase().replace(/\s+/g, " ").trim();
       if (sn && !bySymbol[sn]) bySymbol[sn] = inst;
@@ -173,11 +177,29 @@ async function loadSymbolIndex(): Promise<SymbolIndex> {
   alias(bySymbol, "BANKNIFTY", "NIFTY BANK");
   alias(bySymbol, "FINNIFTY", "NIFTY FIN SERVICE");
 
-  const index: SymbolIndex = { savedAt: Date.now(), bySymbol };
+  // Compact cache: only fields we need (full master is huge)
+  const compact: Record<string, UpstoxInstrument> = {};
+  for (const [k, v] of Object.entries(bySymbol)) {
+    compact[k] = {
+      segment: v.segment,
+      name: v.name,
+      exchange: v.exchange,
+      instrument_type: v.instrument_type,
+      instrument_key: v.instrument_key,
+      trading_symbol: v.trading_symbol,
+      short_name: v.short_name,
+    };
+  }
+
+  const index: SymbolIndex = { savedAt: Date.now(), bySymbol: compact };
   memoryIndex = index;
   try {
     ensureCacheDir();
-    fs.writeFileSync(cachePath, JSON.stringify(index));
+    // Cap write size — if somehow still huge, skip disk
+    const payload = JSON.stringify(index);
+    if (payload.length < 8_000_000) {
+      fs.writeFileSync(cachePath, payload);
+    }
   } catch {
     // non-fatal on serverless / read-only FS
   }
@@ -222,28 +244,42 @@ function rank(inst: UpstoxInstrument): number {
 
 async function fetchInstruments(url: string): Promise<UpstoxInstrument[]> {
   const { asciiHeaders } = await import("../http");
-  const res = await fetch(url, {
-    headers: asciiHeaders({
-      "User-Agent": "TradePulse/1.0",
-      Accept: "application/gzip, application/json, */*",
-    }),
-    cache: "no-store",
-  });
-  if (!res.ok) {
-    throw new Error(`Failed to download Upstox instruments (${res.status})`);
+  let lastErr = "unknown";
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), FETCH_TIMEOUT_MS);
+      const res = await fetch(url, {
+        headers: asciiHeaders({
+          "User-Agent": "TradePulse/1.0",
+          Accept: "application/gzip, application/json, */*",
+        }),
+        cache: "no-store",
+        signal: ctrl.signal,
+      });
+      clearTimeout(timer);
+      if (!res.ok) {
+        lastErr = `HTTP ${res.status}`;
+        continue;
+      }
+      const buf = Buffer.from(await res.arrayBuffer());
+      let jsonText: string;
+      if (url.endsWith(".gz") || buf[0] === 0x1f) {
+        jsonText = (await gunzip(buf)).toString("utf8");
+      } else {
+        jsonText = buf.toString("utf8");
+      }
+      const data = JSON.parse(jsonText) as UpstoxInstrument[];
+      if (!Array.isArray(data)) {
+        throw new Error("Unexpected Upstox instruments format");
+      }
+      return data;
+    } catch (e) {
+      lastErr = e instanceof Error ? e.message : String(e);
+      await new Promise((r) => setTimeout(r, 400 * (attempt + 1)));
+    }
   }
-  const buf = Buffer.from(await res.arrayBuffer());
-  let jsonText: string;
-  if (url.endsWith(".gz") || buf[0] === 0x1f) {
-    jsonText = (await gunzip(buf)).toString("utf8");
-  } else {
-    jsonText = buf.toString("utf8");
-  }
-  const data = JSON.parse(jsonText) as UpstoxInstrument[];
-  if (!Array.isArray(data)) {
-    throw new Error("Unexpected Upstox instruments format");
-  }
-  return data;
+  throw new Error(`Failed to download Upstox instruments: ${lastErr}`);
 }
 
 

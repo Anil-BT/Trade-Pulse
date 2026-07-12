@@ -48,9 +48,15 @@ export async function runBacktestJob(
   let resolvedInstrumentKey: string | undefined;
   let lotSource = "manual";
 
+  // Prefer request token; fall back to server env (useful on Vercel)
   const upstoxToken = sanitizeToken(
     body.upstoxAccessToken || process.env.UPSTOX_ACCESS_TOKEN || ""
   );
+  if (body.source === "upstox" && !upstoxToken) {
+    throw new Error(
+      "Upstox access token is required. Paste it under Market data, or set UPSTOX_ACCESS_TOKEN in Vercel Environment Variables and redeploy."
+    );
+  }
   const dhanToken = sanitizeToken(
     body.dhanAccessToken || process.env.DHAN_ACCESS_TOKEN || ""
   );

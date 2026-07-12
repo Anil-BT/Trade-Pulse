@@ -133,9 +133,7 @@ export function BacktestApp() {
   }
 
   function validateSourceCredentials() {
-    if (source === "upstox" && !upstoxToken.trim()) {
-      throw new Error("Paste your Upstox access token.");
-    }
+    // Upstox: allow empty if server has UPSTOX_ACCESS_TOKEN env
     if (source === "dhan" && !dhanToken.trim()) {
       throw new Error("Paste your Dhan access token.");
     }
@@ -191,11 +189,14 @@ export function BacktestApp() {
       });
 
       let data: { error?: string } & Partial<BacktestResult>;
+      const rawText = await res.text();
       try {
-        data = await res.json();
+        data = rawText ? JSON.parse(rawText) : {};
       } catch {
         throw new Error(
-          `Backtest failed (HTTP ${res.status}). Server returned an invalid response.`
+          res.status === 504 || res.status === 408
+            ? "Backtest timed out on the server. Use a shorter date range (e.g. 1–2 weeks) and retry."
+            : `Backtest failed (HTTP ${res.status}). ${rawText.slice(0, 180) || "Invalid response"}`
         );
       }
 
@@ -364,8 +365,10 @@ export function BacktestApp() {
                   </div>
                 </Field>
                 <p className="text-xs text-neutral-500">
-                  From the Upstox developer app. Optional env:{" "}
-                  <code className="text-neutral-800">UPSTOX_ACCESS_TOKEN</code>.
+                  Fresh token from the Upstox developer app (tokens expire daily).
+                  On production you can also set{" "}
+                  <code className="text-neutral-800">UPSTOX_ACCESS_TOKEN</code>{" "}
+                  in Vercel → Project → Environment Variables, then redeploy.
                 </p>
               </div>
             )}
