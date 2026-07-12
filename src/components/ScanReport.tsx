@@ -8,6 +8,12 @@ import type {
   ScanTradeDetail,
   Trade,
 } from "@/lib/types";
+import { useAuth } from "@/lib/firebase/auth-context";
+import {
+  cleanScanRows,
+  scanResultsAvailable,
+  saveScanResult,
+} from "@/lib/firebase/scan-results";
 import {
   PerformanceCharts,
   tradeMatchesChartFilter,
@@ -18,11 +24,18 @@ import { DayResultCalendar } from "./DayResultCalendar";
 export function ScanReportView({
   report,
   onClose,
+  /** Fingerprint of strategy + scan settings (no single symbol) */
+  cacheFingerprint,
+  /** True when this report was loaded from Firestore (no broker this run) */
+  fromCache = false,
 }: {
   report: ScanReportType;
   onClose?: () => void;
+  cacheFingerprint?: string;
+  fromCache?: boolean;
 }) {
   const s = report.summary;
+  const { user } = useAuth();
   const [filter, setFilter] = useState<"all" | "ok" | "no_trades" | "error">(
     "all"
   );
@@ -30,8 +43,48 @@ export function ScanReportView({
   const [chartFilter, setChartFilter] = useState<ChartBarFilter | null>(null);
   /** IST YYYY-MM-DD — filters stock list + trades (like chart bar click) */
   const [dayFilter, setDayFilter] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
 
   const noTradeCount = report.rows.filter((r) => r.status === "no_trades").length;
+  const cleanCount = cleanScanRows(report.rows).length;
+  const errorCount = report.rows.filter((r) => r.status === "error").length;
+
+  async function saveFnoResults() {
+    if (!user) {
+      setSaveMsg("Sign in (top-right) to save F&O scan results.");
+      return;
+    }
+    if (!scanResultsAvailable()) {
+      setSaveMsg("Firebase is not configured — cannot save to cloud.");
+      return;
+    }
+    if (!cacheFingerprint) {
+      setSaveMsg("Missing strategy fingerprint — re-run the scan, then save.");
+      return;
+    }
+    setSaving(true);
+    setSaveMsg(null);
+    try {
+      const { savedRows, skippedErrors } = await saveScanResult(
+        user.uid,
+        report,
+        cacheFingerprint
+      );
+      setSaveMsg(
+        `Saved ${savedRows} symbol(s) without errors` +
+          (skippedErrors
+            ? ` · skipped ${skippedErrors} with errors`
+            : " · full clean set stored") +
+          "."
+      );
+      setTimeout(() => setSaveMsg(null), 8000);
+    } catch (e) {
+      setSaveMsg(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
+    }
+  }
 
   /** Flatten all F&O trades for combined charts */
   const combinedTrades = useMemo(() => {
@@ -283,6 +336,59 @@ export function ScanReportView({
 
   return (
     <section className="w-full overflow-hidden rounded-3xl border border-neutral-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+      {fromCache && (
+        <div className="border-b border-emerald-200 bg-emerald-50 px-4 py-3 sm:px-6">
+          <p className="text-sm font-medium text-emerald-900">
+            F&amp;O universe loaded from cloud
+            {report.scanned
+              ? ` · ${report.scanned} symbol(s)`
+              : report.rows?.length
+                ? ` · ${report.rows.length} symbol(s)`
+                : ""}
+          </p>
+          <p className="mt-0.5 text-xs text-emerald-800/80">
+            Multi-stock result (including &quot;run all F&amp;O&quot;) — no
+            Upstox this run. Tick &quot;Force live scan&quot; only if you need a
+            fresh broker pull.
+          </p>
+        </div>
+      )}
+
+      {/* Save F&O scan — successful symbols only (not shown on single-symbol runs) */}
+      <div className="border-b-2 border-neutral-900 bg-white px-4 py-4 sm:px-6">
+        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold tracking-tight text-black">
+              Save F&amp;O scan results
+            </p>
+            <p className="mt-1 text-xs leading-relaxed text-neutral-500">
+              Uploads symbols that finished without errors ({cleanCount} clean
+              {errorCount ? ` · ${errorCount} error(s) skipped` : ""}
+              ). Same strategy + date range overwrites the previous save. Next
+              run loads this from cloud instead of Upstox.
+              {!user ? " Sign in (top right) to enable." : ""}
+            </p>
+          </div>
+          <button
+            type="button"
+            onClick={() => void saveFnoResults()}
+            disabled={saving || !cleanCount}
+            className="shrink-0 rounded-full bg-black px-6 py-3 text-sm font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+          >
+            {saving
+              ? "Saving F&O results…"
+              : !user
+                ? "Save F&O results (sign in required)"
+                : "Save F&O results (no-error symbols)"}
+          </button>
+        </div>
+        {saveMsg && (
+          <p className="mt-3 rounded-xl bg-neutral-50 px-3 py-2 text-xs text-neutral-700">
+            {saveMsg}
+          </p>
+        )}
+      </div>
+
       {/* Header */}
       <div className="space-y-4 border-b border-neutral-100 px-4 py-5 sm:px-6">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
@@ -618,7 +724,7 @@ function StockBlock({
                     </th>
                     {isOptions && (
                       <th className="px-3 py-2.5 font-medium text-right">
-                        Strike
+                        Lot size
                       </th>
                     )}
                     <th className="px-3 py-2.5 font-medium text-right">P&amp;L</th>
@@ -677,7 +783,7 @@ function TradeRow({
       </td>
       {isOptions && (
         <td className="px-3 py-2.5 text-right tabular-nums">
-          {t.strike ?? "-"}
+          {t.lotSize != null ? t.lotSize : "-"}
         </td>
       )}
       <td

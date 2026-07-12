@@ -27,7 +27,7 @@ export function TradesTable({ trades }: { trades: Trade[] }) {
             {isOptions && (
               <>
                 <th className="px-3 py-3 font-medium">Contract</th>
-                <th className="px-3 py-3 font-medium text-right">Strike</th>
+                <th className="px-3 py-3 font-medium text-right">Lot size</th>
               </>
             )}
             <th className="px-3 py-3 font-medium">Entry</th>
@@ -65,7 +65,7 @@ export function TradesTable({ trades }: { trades: Trade[] }) {
                       {t.label || `${t.strike ?? "-"} ${t.optionSide ?? ""}`}
                     </td>
                     <td className="px-3 py-3 text-right tabular-nums font-medium">
-                      {t.strike != null ? t.strike.toFixed(0) : "-"}
+                      {t.lotSize != null ? t.lotSize : "-"}
                       {t.underlyingEntry != null && (
                         <span className="block text-[10px] font-normal text-neutral-400">
                           spot {t.underlyingEntry.toFixed(1)}

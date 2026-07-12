@@ -64,8 +64,12 @@ export function rsi(values: number[], period = 14): (number | null)[] {
 
 /**
  * Opening range high/low for each bar of the session.
- * For equity markets we treat a new calendar day (local or IST-friendly UTC+5:30)
+ * For equity markets we treat a new calendar day (IST-friendly UTC+5:30)
  * as a new session. The first N bars of each session form the range.
+ *
+ * With period = 1 on a 5m chart → 1st 5-minute candle high/low (09:15–09:20).
+ * Levels are only available on bars AFTER the range bar(s) complete — not on
+ * the forming OR candle itself.
  */
 export function openingRange(
   candles: Candle[],
@@ -92,9 +96,12 @@ export function openingRange(
 
     const offset = i - sessionStart;
     if (offset < barsInRange) {
+      // Still forming the opening range (e.g. 1st 5m candle)
       rangeHigh = Math.max(rangeHigh, candles[i].high);
       rangeLow = Math.min(rangeLow, candles[i].low);
       if (offset === barsInRange - 1) rangeReady = true;
+      // Do not publish levels on OR bars — wait until range is complete
+      continue;
     }
 
     if (rangeReady) {
@@ -188,6 +195,38 @@ function calcFibLevels(H: number, L: number, C: number) {
 }
 
 /**
+ * Session VWAP — resets each IST trading day.
+ * Typical price = (H + L + C) / 3; VWAP = Σ(TP × V) / Σ(V).
+ * Period is ignored (always session-based).
+ */
+export function sessionVwap(candles: Candle[]): (number | null)[] {
+  const out: (number | null)[] = new Array(candles.length).fill(null);
+  if (!candles.length) return out;
+
+  let sessionKey = "";
+  let cumPV = 0;
+  let cumV = 0;
+
+  for (let i = 0; i < candles.length; i++) {
+    const c = candles[i];
+    const key = sessionDayKey(c.time);
+    if (key !== sessionKey) {
+      sessionKey = key;
+      cumPV = 0;
+      cumV = 0;
+    }
+    const tp = (c.high + c.low + c.close) / 3;
+    const vol = Number.isFinite(c.volume) && c.volume > 0 ? c.volume : 0;
+    // If volume is missing, still advance using unit volume so VWAP tracks price
+    const v = vol > 0 ? vol : 1;
+    cumPV += tp * v;
+    cumV += v;
+    out[i] = cumV > 0 ? cumPV / cumV : null;
+  }
+  return out;
+}
+
+/**
  * Previous session high or low, held constant for every bar of the current session.
  * Use e.g. close > PREV_DAY_HIGH for breakout above yesterday's high.
  */
@@ -242,6 +281,8 @@ export function computeIndicator(
       return sma(closes, period);
     case "RSI":
       return rsi(closes, period);
+    case "VWAP":
+      return sessionVwap(candles);
     case "OPENING_RANGE_HIGH": {
       // period = number of bars that form the opening range (default 1 for first 5m bar)
       return openingRange(candles, period || 1).high;
@@ -269,14 +310,17 @@ export function computeIndicator(
     case "BREAKOUT_HIGH":
       // period = opening-range bars (default 1 = first 5m candle)
       return breakoutHigh(candles, period || 1);
+    case "BREAKOUT_LOW":
+      return breakoutLow(candles, period || 1);
     default:
       return new Array(candles.length).fill(null);
   }
 }
 
 /**
- * Session breakout level = max(OR high, Fib pivot R3, previous day high).
- * Null until all components are available for that bar.
+ * Session breakout level = max(1st N-bar OR high, Fib pivot R3, previous day high).
+ * With orBars=1 on 5m → max(1st 5m high, Fib R3, PDH).
+ * Null until all components are available (after OR bar completes).
  */
 export function breakoutHigh(
   candles: Candle[],
@@ -296,10 +340,35 @@ export function breakoutHigh(
   return out;
 }
 
+/**
+ * Session breakdown level = min(1st N-bar OR low, Fib pivot S3, previous day low).
+ * With orBars=1 on 5m → min(1st 5m candle low, Fib S3, PDL).
+ * Null until all components are available (after OR bar completes).
+ */
+export function breakoutLow(
+  candles: Candle[],
+  orBars = 1
+): (number | null)[] {
+  const orl = openingRange(candles, orBars).low;
+  const s3 = fibonacciPivots(candles, "S3");
+  const pdl = previousDayLevel(candles, "low");
+  const out: (number | null)[] = new Array(candles.length).fill(null);
+  for (let i = 0; i < candles.length; i++) {
+    const a = orl[i];
+    const b = s3[i];
+    const c = pdl[i];
+    if (a == null || b == null || c == null) continue;
+    out[i] = Math.min(a, b, c);
+  }
+  return out;
+}
+
 export function indicatorKey(type: IndicatorType, period?: number): string {
   if (type === "OPENING_RANGE_HIGH") return `ORH_${period ?? 1}`;
   if (type === "OPENING_RANGE_LOW") return `ORL_${period ?? 1}`;
   if (type === "BREAKOUT_HIGH") return `BOH_${period ?? 1}`;
+  if (type === "BREAKOUT_LOW") return `BOL_${period ?? 1}`;
+  if (type === "VWAP") return "VWAP";
   if (type.startsWith("FIB_PIVOT")) return type;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return type;
   return `${type}_${period ?? 9}`;

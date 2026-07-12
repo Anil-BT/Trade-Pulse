@@ -42,6 +42,11 @@ service cloud.firestore {
       allow read, write: if request.auth != null
         && request.auth.uid == userId;
     }
+    // Full F&O universe scan results (successful symbols only)
+    match /users/{userId}/scanResults/{docId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
+    }
   }
 }
 ```
@@ -64,6 +69,12 @@ users/{uid}/dayCaches/{fingerprint_YYYY-MM-DD}
   trades: Trade[]
   candles: Candle[]     // that session only (optional/light)
   savedAt: number
+
+users/{uid}/scanResults/{fingerprint_from_to}
+  fingerprint: string   // strategy + FNO_UNIVERSE + settings
+  strategyName, from, to, interval, source
+  rows: ScanRow[]       // status ok | no_trades only (errors skipped)
+  summary, skippedErrors, savedAt
 ```
 
 ### Storage (optional — only if you need files later)
@@ -118,6 +129,8 @@ Redeploy after saving.
 | Feature | Without Firebase | With Firebase + signed in |
 |--------|-------------------|---------------------------|
 | Save strategy | `localStorage` | Firestore `users/{uid}/strategies` |
+| Save F&O scan | — | Firestore `users/{uid}/scanResults` (no-error symbols) |
+| Day cache (single symbol) | — | Firestore `users/{uid}/dayCaches` (auto on chunk) |
 | Cross-device | No | Yes |
 | Sign in UI | Hidden | Header **Sign in** |
 | First sign-in | — | Local strategies auto-migrated if cloud empty |
@@ -127,6 +140,8 @@ Code map:
 - `src/lib/firebase/client.ts` — init
 - `src/lib/firebase/auth-context.tsx` — session
 - `src/lib/firebase/strategies.ts` — Firestore CRUD
+- `src/lib/firebase/scan-results.ts` — F&O scan save
+- `src/lib/firebase/day-cache.ts` — single-symbol day cache
 - `src/components/AuthBar.tsx` — UI
 - `src/components/StrategyLibrary.tsx` — save/load cloud or local
 

@@ -13,7 +13,10 @@ import { StrategyLibrary } from "./StrategyLibrary";
 import { TradesTable } from "./TradesTable";
 import { STRATEGY_PRESETS, PRESET_OPENING_RANGE_EMA } from "@/lib/presets";
 import { defaultDateRange, uid } from "@/lib/format";
-import { buildCacheFingerprint } from "@/lib/fingerprint";
+import {
+  buildCacheFingerprint,
+  buildFnoScanFingerprints,
+} from "@/lib/fingerprint";
 import {
   chunkDayList,
   listWeekdays,
@@ -32,6 +35,11 @@ import {
   saveDayCaches,
   type DayCacheRecord,
 } from "@/lib/firebase/day-cache";
+import {
+  loadScanResult,
+  saveScanResult,
+  scanResultsAvailable,
+} from "@/lib/firebase/scan-results";
 import { useAuth } from "@/lib/firebase/auth-context";
 import type {
   BacktestResult,
@@ -128,12 +136,32 @@ export function BacktestApp() {
   const [showToken, setShowToken] = useState(false);
   const [scanMaxSymbols, setScanMaxSymbols] = useState(50);
   const [scanAllFno, setScanAllFno] = useState(false);
+  /** When true, F&O scan skips Firestore and hits broker APIs */
+  const [forceLiveScan, setForceLiveScan] = useState(false);
   const [runProgress, setRunProgress] = useState<string | null>(null);
-  const [saveMsg, setSaveMsg] = useState<string | null>(null);
-  const [saving, setSaving] = useState(false);
+  /** F&O report loaded from cloud (no Upstox this run) */
+  const [scanFromCache, setScanFromCache] = useState(false);
   const { user } = useAuth();
   /** Days that completed without fetch/backtest errors (safe to upload) */
   const okDaysRef = useRef<Set<string>>(new Set());
+
+  /**
+   * F&O multi-symbol cache keys (all stocks vs limited).
+   * Primary + legacy candidates so re-runs hit cloud without Upstox.
+   */
+  function fnoScanCacheKeys() {
+    const base = cacheSettings();
+    const { symbol: _sym, ...rest } = base;
+    return buildFnoScanFingerprints({
+      base: rest,
+      scanAll: scanAllFno,
+      maxSymbols: scanMaxSymbols,
+    });
+  }
+
+  function fnoCacheFingerprint(): string {
+    return fnoScanCacheKeys().primary;
+  }
 
   const filteredTrades = useMemo(() => {
     let list = filterTradesByChart(result?.trades || [], chartFilter);
@@ -333,7 +361,6 @@ export function BacktestApp() {
     setChartFilter(null);
     setDayFilter(null);
     setRunProgress(null);
-    setSaveMsg(null);
 
     try {
       if (!symbol.trim()) {
@@ -554,112 +581,58 @@ export function BacktestApp() {
     }
   }
 
-  /**
-   * Save every error-free day independently.
-   * Failed days are skipped so good days never need re-running.
-   */
-  async function saveResultToCloud() {
-    if (!result) {
-      setSaveMsg("Run a backtest first, then save.");
-      return;
-    }
-    if (!user) {
-      setSaveMsg("Sign in (top-right) to save clean days to Firestore.");
-      return;
-    }
-    setSaving(true);
-    setSaveMsg(null);
-    try {
-      const fingerprint = buildCacheFingerprint(cacheSettings());
-      const byDay = groupTradesByIstDay(result.trades || []);
-      const candleByDay = new Map<string, Candle[]>();
-      for (const c of result.candles || []) {
-        const day = istDayKey(c.time);
-        const list = candleByDay.get(day) || [];
-        list.push(c);
-        candleByDay.set(day, list);
-      }
-
-      const ok = okDaysRef.current;
-      // Days we can save = OK days from this run, or any day with clean trades
-      const candidateDays = new Set<string>([
-        ...ok,
-        ...byDay.keys(),
-        ...candleByDay.keys(),
-      ]);
-
-      const records: DayCacheRecord[] = [];
-      let skippedBadTrades = 0;
-
-      for (const day of candidateDays) {
-        const trades = byDay.get(day) || [];
-        if (!dayTradesAreClean(trades)) {
-          skippedBadTrades += 1;
-          continue;
-        }
-        // Save if: marked successful this run, OR has trades/candles (data exists)
-        const hasData =
-          ok.has(day) ||
-          trades.length > 0 ||
-          (candleByDay.get(day)?.length ?? 0) > 0;
-        if (!hasData) continue;
-
-        records.push({
-          fingerprint,
-          day,
-          symbol: result.symbol,
-          interval: result.interval,
-          source: result.source,
-          trades,
-          candles: candleByDay.get(day) || [],
-          savedAt: Date.now(),
-          strategyName: strategy.name,
-        });
-      }
-
-      if (!records.length) {
-        setSaveMsg(
-          skippedBadTrades
-            ? `No clean days to save (${skippedBadTrades} day(s) had invalid trade data).`
-            : "No successful days available to save yet."
-        );
-        return;
-      }
-
-      const n = await saveDayCaches(user.uid, records);
-      const failedLeft = listWeekdays(from, to).filter(
-        (d) => !records.some((r) => r.day === d)
-      ).length;
-      setSaveMsg(
-        `Saved ${n} day(s) without errors.` +
-          (failedLeft
-            ? ` ${failedLeft} day(s) still missing/failed — re-run will only fetch those.`
-            : ` Full range is cached for this strategy.`) +
-          (skippedBadTrades
-            ? ` Skipped ${skippedBadTrades} day(s) with bad trade data.`
-            : "")
-      );
-      setTimeout(() => setSaveMsg(null), 8000);
-    } catch (e) {
-      setSaveMsg(e instanceof Error ? e.message : "Save failed");
-    } finally {
-      setSaving(false);
-    }
-  }
-
   async function runFnoScan() {
     setScanning(true);
     setError(null);
     setResult(null);
     setScanReport(null);
+    setScanFromCache(false);
     setChartFilter(null);
     setDayFilter(null);
+    setRunProgress(null);
 
     try {
       validateCommon();
-
       validateSourceCredentials();
 
+      const { primary: fingerprint, candidates } = fnoScanCacheKeys();
+      const scopeLabel = scanAllFno
+        ? "all F&O stocks"
+        : `up to ${scanMaxSymbols} F&O symbols`;
+
+      // 1) Cloud cache for multi-symbol F&O (including "run all F&O") —
+      //    same strategy + date range → skip Upstox entirely
+      if (!forceLiveScan && user && scanResultsAvailable()) {
+        setRunProgress(
+          `Checking cloud cache for ${scopeLabel} (${from} → ${to})…`
+        );
+        const cached = await loadScanResult(
+          user.uid,
+          fingerprint,
+          from,
+          to,
+          candidates
+        );
+        if (cached) {
+          setScanReport(cached);
+          setScanFromCache(true);
+          setRunProgress(
+            `Loaded ${cached.scanned || cached.rows.length} symbol(s) from cloud — no Upstox calls.`
+          );
+          return;
+        }
+        setRunProgress(
+          `No saved ${scopeLabel} result for this strategy/dates — live scan via broker…`
+        );
+      } else if (!user) {
+        setRunProgress(
+          "Not signed in — live scan (sign in + save to skip Upstox next time)…"
+        );
+      } else if (forceLiveScan) {
+        setRunProgress("Force live scan — ignoring cloud cache…");
+      }
+
+      // 2) Live F&O scan (Upstox / Dhan / Kite) — full universe when scanAll
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -675,7 +648,8 @@ export function BacktestApp() {
           entryTimeWindows: entryTimeWindowsPayload(),
           maxRiskPerTrade: maxRiskPayload(),
           tradeInstrument,
-          options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
+          options:
+            tradeInstrument === "options_atm" ? buildOptions() : undefined,
           ...credentialsPayload(),
           maxSymbols: scanAllFno ? 400 : scanMaxSymbols,
           scanAll: scanAllFno,
@@ -687,12 +661,41 @@ export function BacktestApp() {
       if (!res.ok) {
         throw new Error(data.error || `Scan failed (${res.status})`);
       }
-      setScanReport(data as ScanReport);
+      const liveReport = data as ScanReport;
+      setScanReport(liveReport);
+      setScanFromCache(false);
+
+      // 3) Auto-save full F&O result so next "run all" hits cloud, not Upstox
+      if (user && scanResultsAvailable() && liveReport.rows?.length) {
+        try {
+          setRunProgress(
+            `Scan done — saving ${scopeLabel} to cloud for next run…`
+          );
+          const { savedRows, skippedErrors } = await saveScanResult(
+            user.uid,
+            liveReport,
+            fingerprint
+          );
+          setRunProgress(
+            `Saved ${savedRows} symbol(s) to cloud` +
+              (skippedErrors ? ` · ${skippedErrors} error(s) skipped` : "") +
+              `. Re-run same setup will skip Upstox.`
+          );
+        } catch (saveErr) {
+          // Non-fatal — user can still click Save on the report
+          const msg =
+            saveErr instanceof Error ? saveErr.message : "auto-save failed";
+          setRunProgress(`Live scan done · cloud auto-save failed: ${msg}`);
+        }
+      }
     } catch (e) {
       setScanReport(null);
+      setScanFromCache(false);
       setError(e instanceof Error ? e.message : "F&O scan failed");
     } finally {
       setScanning(false);
+      // Keep last progress briefly if from cache; clear after short delay
+      setTimeout(() => setRunProgress(null), 4000);
     }
   }
 
@@ -1328,8 +1331,10 @@ export function BacktestApp() {
                   Run on all F&amp;O stocks
                 </span>
                 <span className="mt-0.5 block text-xs text-neutral-500">
-                  Full NSE equity F&amp;O universe. Can take several minutes
-                  (Yahoo rate limits). Uncheck to limit count below.
+                  Full NSE equity F&amp;O universe (not single symbol). First
+                  live run hits Upstox; when signed in, result is auto-saved and
+                  the next run with the same strategy + dates loads from cloud
+                  (no broker). Uncheck to limit count below.
                 </span>
               </span>
             </label>
@@ -1352,6 +1357,25 @@ export function BacktestApp() {
                 </Field>
               </div>
             )}
+
+            <label className="mb-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-neutral-200 p-3">
+              <input
+                type="checkbox"
+                checked={forceLiveScan}
+                onChange={(e) => setForceLiveScan(e.target.checked)}
+                className="mt-1 h-4 w-4 accent-black"
+              />
+              <span>
+                <span className="block text-sm font-medium text-black">
+                  Force live scan (ignore cloud save)
+                </span>
+                <span className="mt-0.5 block text-xs text-neutral-500">
+                  Leave off so &quot;Run on all F&amp;O stocks&quot; reuses the
+                  cloud result for the same strategy + dates. Tick only when you
+                  want a fresh Upstox pull.
+                </span>
+              </span>
+            </label>
 
             <button
               type="button"
@@ -1451,45 +1475,13 @@ export function BacktestApp() {
             <ScanReportView
               report={scanReport}
               onClose={() => setScanReport(null)}
+              cacheFingerprint={fnoCacheFingerprint()}
+              fromCache={scanFromCache}
             />
           )}
 
           {result && !scanning && !scanReport && (
             <>
-              {/* Prominent save bar — only clean days are uploaded */}
-              <div className="rounded-3xl border-2 border-neutral-900 bg-white p-4 shadow-[0_1px_2px_rgba(0,0,0,0.04)] sm:p-5">
-                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-                  <div className="min-w-0">
-                    <p className="text-sm font-semibold tracking-tight text-black">
-                      Save successful days only
-                    </p>
-                    <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-                      Uploads days that finished without errors (even if other
-                      days failed). Next run skips those days and only fetches
-                      the rest. Auto-saves after each good chunk when signed in.
-                      {!user ? " Sign in (top right) to enable." : ""}
-                    </p>
-                  </div>
-                  <button
-                    type="button"
-                    onClick={() => void saveResultToCloud()}
-                    disabled={saving || loading}
-                    className="shrink-0 rounded-full bg-black px-6 py-3 text-sm font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
-                  >
-                    {saving
-                      ? "Saving successful days…"
-                      : !user
-                        ? "Save results (sign in required)"
-                        : "Save results by day (no-error days)"}
-                  </button>
-                </div>
-                {saveMsg && (
-                  <p className="mt-3 rounded-xl bg-neutral-50 px-3 py-2 text-xs text-neutral-700">
-                    {saveMsg}
-                  </p>
-                )}
-              </div>
-
               <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
                 <div className="mb-5">
                   <h2 className="text-lg font-semibold tracking-tight">

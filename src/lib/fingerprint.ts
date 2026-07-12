@@ -22,11 +22,17 @@ export type CacheSettings = {
   positionSizePct?: number;
   /** Lot size matters for options results */
   initialCapital?: number;
+  /**
+   * F&O universe scope — included so "all F&O" and "max N" caches stay separate.
+   * e.g. "FNO_ALL" | "FNO_50" | omit for single-symbol day cache
+   */
+  scanScope?: string;
 };
 
 export function buildCacheFingerprint(s: CacheSettings): string {
   const payload = {
     symbol: s.symbol.trim().toUpperCase().replace(/\.NS$/i, ""),
+    scanScope: s.scanScope || null,
     interval: s.interval,
     source: s.source,
     tradeInstrument: s.tradeInstrument || "equity",
@@ -68,6 +74,36 @@ export function buildCacheFingerprint(s: CacheSettings): string {
     },
   };
   return simpleHash(stableStringify(payload));
+}
+
+/**
+ * Fingerprint for multi-symbol F&O scan cache (not single stock).
+ * - scanAll → FNO_ALL
+ * - else → FNO_{maxSymbols}
+ * Also returns legacy keys so older saves still hit.
+ */
+export function buildFnoScanFingerprints(opts: {
+  base: Omit<CacheSettings, "symbol" | "scanScope">;
+  scanAll: boolean;
+  maxSymbols: number;
+}): { primary: string; candidates: string[] } {
+  const maxN = Math.min(400, Math.max(1, opts.maxSymbols || 50));
+  const scope = opts.scanAll ? "FNO_ALL" : `FNO_${maxN}`;
+
+  const primary = buildCacheFingerprint({
+    ...opts.base,
+    symbol: "FNO_UNIVERSE",
+    scanScope: scope,
+  });
+
+  // Legacy saves used symbol FNO_UNIVERSE with no scanScope
+  const legacyUniverse = buildCacheFingerprint({
+    ...opts.base,
+    symbol: "FNO_UNIVERSE",
+  });
+
+  const candidates = [...new Set([primary, legacyUniverse])];
+  return { primary, candidates };
 }
 
 function stableStringify(v: unknown): string {

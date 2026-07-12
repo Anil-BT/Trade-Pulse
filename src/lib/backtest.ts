@@ -658,8 +658,9 @@ function collectOperand(
 
 function defaultPeriod(type: IndicatorType): number {
   if (type === "RSI") return 14;
+  if (type === "VWAP") return 1;
   if (type === "OPENING_RANGE_HIGH" || type === "OPENING_RANGE_LOW") return 1;
-  if (type === "BREAKOUT_HIGH") return 1;
+  if (type === "BREAKOUT_HIGH" || type === "BREAKOUT_LOW") return 1;
   if (type.startsWith("FIB_PIVOT")) return 1;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return 1;
   return 9;

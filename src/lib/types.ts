@@ -26,6 +26,8 @@ export type IndicatorType =
   | "EMA"
   | "SMA"
   | "RSI"
+  /** Session VWAP (resets each IST trading day) */
+  | "VWAP"
   | "OPENING_RANGE_HIGH"
   | "OPENING_RANGE_LOW"
   /** Previous session Fibonacci pivot levels (classic fib pivots) */
@@ -40,10 +42,15 @@ export type IndicatorType =
   | "PREV_DAY_HIGH"
   | "PREV_DAY_LOW"
   /**
-   * Breakout high = max(Opening Range High, Fib R3, Prev Day High).
+   * Breakout high = max(1st OR bar high, Fib R3, Prev Day High).
    * Use with cross_above for true breakout entries.
    */
-  | "BREAKOUT_HIGH";
+  | "BREAKOUT_HIGH"
+  /**
+   * Breakdown low = min(1st OR bar low / 1st 5m low, Fib S3, Prev Day Low).
+   * Use with cross_below for true breakdown entries.
+   */
+  | "BREAKOUT_LOW";
 
 export type CompareOperand =
   | "close"

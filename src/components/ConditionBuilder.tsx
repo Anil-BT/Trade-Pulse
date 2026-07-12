@@ -14,8 +14,17 @@ const INDICATORS: { value: IndicatorType; label: string; defaultPeriod: number }
   { value: "EMA", label: "EMA", defaultPeriod: 9 },
   { value: "SMA", label: "SMA", defaultPeriod: 20 },
   { value: "RSI", label: "RSI", defaultPeriod: 14 },
-  { value: "OPENING_RANGE_HIGH", label: "Opening Range High (1st bar)", defaultPeriod: 1 },
-  { value: "OPENING_RANGE_LOW", label: "Opening Range Low", defaultPeriod: 1 },
+  { value: "VWAP", label: "VWAP (session)", defaultPeriod: 1 },
+  {
+    value: "OPENING_RANGE_HIGH",
+    label: "Opening Range High (1st 5m candle)",
+    defaultPeriod: 1,
+  },
+  {
+    value: "OPENING_RANGE_LOW",
+    label: "Opening Range Low (1st 5m candle)",
+    defaultPeriod: 1,
+  },
   { value: "FIB_PIVOT", label: "Fib Pivot (P)", defaultPeriod: 1 },
   { value: "FIB_PIVOT_R1", label: "Fib Pivot R1", defaultPeriod: 1 },
   { value: "FIB_PIVOT_R2", label: "Fib Pivot R2", defaultPeriod: 1 },
@@ -27,10 +36,27 @@ const INDICATORS: { value: IndicatorType; label: string; defaultPeriod: number }
   { value: "PREV_DAY_LOW", label: "Prev Day Low", defaultPeriod: 1 },
   {
     value: "BREAKOUT_HIGH",
-    label: "Breakout High (max OR / Fib R3 / PDH)",
+    label: "Breakout High (max 1st 5m high / Fib R3 / PDH)",
+    defaultPeriod: 1,
+  },
+  {
+    value: "BREAKOUT_LOW",
+    label: "Breakdown Low (min 1st 5m low / Fib S3 / PDL)",
     defaultPeriod: 1,
   },
 ];
+
+function isSessionLevelIndicator(type: IndicatorType): boolean {
+  return (
+    type === "VWAP" ||
+    type.startsWith("OPENING") ||
+    type.startsWith("FIB_PIVOT") ||
+    type === "PREV_DAY_HIGH" ||
+    type === "PREV_DAY_LOW" ||
+    type === "BREAKOUT_HIGH" ||
+    type === "BREAKOUT_LOW"
+  );
+}
 
 const OPS: { value: Comparator; label: string }[] = [
   { value: "gt", label: ">" },
@@ -237,25 +263,43 @@ function OperandSelect({
               </option>
             ))}
           </select>
-          <input
-            type="number"
-            min={1}
-            max={500}
-            value={value.period ?? 9}
-            onChange={(e) =>
-              onChange({
-                ...value,
-                period: Math.max(1, Number(e.target.value) || 1),
-              })
-            }
-            className="w-16 rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-black"
-            title={
-              value.indicator.startsWith("OPENING") ||
-              value.indicator === "BREAKOUT_HIGH"
-                ? "Bars in opening range"
-                : "Period"
-            }
-          />
+          {/* Period for EMA/SMA/RSI; OR/breakout use bars; VWAP/pivots/PD hide period */}
+          {(value.indicator === "EMA" ||
+            value.indicator === "SMA" ||
+            value.indicator === "RSI" ||
+            value.indicator.startsWith("OPENING") ||
+            value.indicator === "BREAKOUT_HIGH" ||
+            value.indicator === "BREAKOUT_LOW") && (
+            <input
+              type="number"
+              min={1}
+              max={500}
+              value={value.period ?? (value.indicator === "RSI" ? 14 : 9)}
+              onChange={(e) =>
+                onChange({
+                  ...value,
+                  period: Math.max(1, Number(e.target.value) || 1),
+                })
+              }
+              className="w-16 rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-black"
+              title={
+                value.indicator.startsWith("OPENING") ||
+                value.indicator === "BREAKOUT_HIGH" ||
+                value.indicator === "BREAKOUT_LOW"
+                  ? "Bars in opening range"
+                  : value.indicator === "RSI"
+                    ? "RSI period"
+                    : "Period"
+              }
+            />
+          )}
+          {isSessionLevelIndicator(value.indicator) &&
+            value.indicator !== "OPENING_RANGE_HIGH" &&
+            value.indicator !== "OPENING_RANGE_LOW" &&
+            value.indicator !== "BREAKOUT_HIGH" &&
+            value.indicator !== "BREAKOUT_LOW" && (
+              <span className="text-[10px] text-neutral-400">session</span>
+            )}
         </>
       )}
 

@@ -293,10 +293,12 @@ function collect(
     op.period ??
     (op.indicator === "RSI"
       ? 14
-      : op.indicator.startsWith("FIB") ||
+      : op.indicator === "VWAP" ||
+          op.indicator.startsWith("FIB") ||
           op.indicator.startsWith("OPENING") ||
           op.indicator.startsWith("PREV") ||
-          op.indicator === "BREAKOUT_HIGH"
+          op.indicator === "BREAKOUT_HIGH" ||
+          op.indicator === "BREAKOUT_LOW"
         ? 1
         : 9);
   needed.set(indicatorKey(op.indicator, period), {
@@ -342,10 +344,12 @@ function val(
     operand.period ??
     (operand.indicator === "RSI"
       ? 14
-      : operand.indicator.startsWith("FIB") ||
+      : operand.indicator === "VWAP" ||
+          operand.indicator.startsWith("FIB") ||
           operand.indicator.startsWith("OPENING") ||
           operand.indicator.startsWith("PREV") ||
-          operand.indicator === "BREAKOUT_HIGH"
+          operand.indicator === "BREAKOUT_HIGH" ||
+          operand.indicator === "BREAKOUT_LOW"
         ? 1
         : 9);
   return map.get(indicatorKey(operand.indicator, period))?.[i] ?? null;
