@@ -701,16 +701,16 @@ export function BacktestApp() {
 
   return (
     <div className="mx-auto max-w-6xl px-5 pb-24 pt-10 sm:px-8">
-      <header className="mb-12 max-w-2xl">
+      <header className="mb-10 max-w-2xl">
         <p className="mb-3 text-xs font-medium tracking-[0.2em] text-neutral-500 uppercase">
-          TradePulse
+          Backtest
         </p>
-        <h1 className="text-4xl font-semibold tracking-tight text-black sm:text-5xl">
+        <h1 className="text-3xl font-semibold tracking-tight text-black sm:text-4xl">
           Test strategies.
           <br />
           <span className="text-neutral-400">With real history.</span>
         </h1>
-        <p className="mt-5 text-base leading-relaxed text-neutral-600 sm:text-lg">
+        <p className="mt-4 text-base leading-relaxed text-neutral-600">
           Pull free historical candles, define rules with technical indicators,
           and see how a strategy would have performed — clean and simple.
         </p>

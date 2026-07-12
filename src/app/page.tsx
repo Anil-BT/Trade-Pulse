@@ -1,20 +1,64 @@
-import { AuthBar } from "@/components/AuthBar";
+import Link from "next/link";
 import { AuthGate } from "@/components/AuthGate";
-import { BacktestApp } from "@/components/BacktestApp";
+import { AppHeader } from "@/components/AppHeader";
 
 export default function Home() {
   return (
     <main className="flex-1">
       <AuthGate>
-        <nav className="sticky top-0 z-20 border-b border-neutral-200/80 bg-white/80 backdrop-blur-xl">
-          <div className="mx-auto flex h-12 max-w-6xl items-center justify-between gap-3 px-5 sm:px-8">
-            <span className="shrink-0 text-sm font-semibold tracking-tight">
+        <AppHeader />
+        <div className="mx-auto max-w-6xl px-5 pb-24 pt-12 sm:px-8">
+          <header className="mb-12 max-w-2xl">
+            <p className="mb-3 text-xs font-medium tracking-[0.2em] text-neutral-500 uppercase">
               TradePulse
-            </span>
-            <AuthBar />
+            </p>
+            <h1 className="text-4xl font-semibold tracking-tight text-black sm:text-5xl">
+              Markets.
+              <br />
+              <span className="text-neutral-400">Tools that compound.</span>
+            </h1>
+            <p className="mt-5 text-base leading-relaxed text-neutral-600 sm:text-lg">
+              Choose a workspace from the header. Backtest is ready; more
+              features land here as we build them.
+            </p>
+          </header>
+
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
+            <Link
+              href="/backtest"
+              className="group rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition hover:border-neutral-400"
+            >
+              <p className="text-xs font-medium tracking-wide text-neutral-500 uppercase">
+                Menu
+              </p>
+              <h2 className="mt-2 text-xl font-semibold tracking-tight text-black group-hover:underline">
+                Backtest
+              </h2>
+              <p className="mt-2 text-sm leading-relaxed text-neutral-600">
+                Historical candles, strategy rules, single-symbol and F&amp;O
+                universe scans — what used to be the home page.
+              </p>
+              <p className="mt-4 text-sm font-medium text-black">Open →</p>
+            </Link>
+
+            <Link
+              href="/paper"
+              className="group rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition hover:border-neutral-400"
+            >
+              <p className="text-xs font-medium tracking-wide text-neutral-500 uppercase">
+                Menu
+              </p>
+              <h2 className="mt-2 text-xl font-semibold tracking-tight text-black group-hover:underline">
+                Paper trading
+              </h2>
+              <p className="mt-2 text-sm leading-relaxed text-neutral-600">
+                Same strategies as Backtest on live Upstox data. Logs simulated
+                entry/exit — no real orders.
+              </p>
+              <p className="mt-4 text-sm font-medium text-black">Open →</p>
+            </Link>
           </div>
-        </nav>
-        <BacktestApp />
+        </div>
       </AuthGate>
     </main>
   );

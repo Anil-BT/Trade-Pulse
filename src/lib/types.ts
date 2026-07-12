@@ -153,6 +153,11 @@ export interface BacktestRequest {
    * Used after fetching warmup lookback candles for indicators.
    */
   entryNotBeforeMs?: number;
+  /**
+   * Paper trading: do not force-close open positions on last bar (no synthetic EOD).
+   * Open leg is returned on result.openPosition.
+   */
+  leaveOpenPositions?: boolean;
 }
 
 export interface Trade {
@@ -249,6 +254,22 @@ export interface DaySummary {
   cumulativePnl: number;
 }
 
+/** Open paper/live leg (not yet exited). */
+export interface OpenPosition {
+  entryTime: number;
+  entryPrice: number;
+  qty: number;
+  capitalUsed: number;
+  underlyingEntry?: number;
+  strike?: number;
+  lots?: number;
+  optionSide?: "CE" | "PE";
+  markPrice: number;
+  unrealizedPnl: number;
+  symbol?: string;
+  label?: string;
+}
+
 export interface BacktestResult {
   candles: Candle[];
   trades: Trade[];
@@ -262,6 +283,8 @@ export interface BacktestResult {
   interval: Interval;
   tradeInstrument?: TradeInstrument;
   oneTradePerDay?: boolean;
+  /** Set when leaveOpenPositions and a leg is still open */
+  openPosition?: OpenPosition;
   /** Resolved options params used for execution (signals stay on equity). */
   optionsMeta?: {
     side: "CE" | "PE";

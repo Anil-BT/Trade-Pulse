@@ -190,10 +190,34 @@ export function runBacktest(
     }
   }
 
+  let openLeg: BacktestResult["openPosition"] | undefined;
   if (positionQty > 0) {
     const last = candles[candles.length - 1];
-    closePosition(candles.length - 1, last, "eod");
-    equityCurve[equityCurve.length - 1] = { time: last.time, equity: cash };
+    if (req.leaveOpenPositions) {
+      // Paper / live: keep leg open — mark-to-market on last bar for equity curve
+      const mark = last.close;
+      const unrealized = (mark - entryPrice) * positionQty;
+      equityCurve[equityCurve.length - 1] = {
+        time: last.time,
+        equity: cash + unrealized,
+      };
+      openLeg = {
+        entryTime,
+        entryPrice,
+        qty: positionQty,
+        capitalUsed: entryPrice * Math.abs(positionQty),
+        underlyingEntry: entryUnderlying || undefined,
+        strike: entryStrike || undefined,
+        lots: entryLots || undefined,
+        optionSide: tradeInstrument === "options_atm" ? optCfg.side : undefined,
+        markPrice: mark,
+        unrealizedPnl: unrealized,
+        symbol: req.symbol,
+      };
+    } else {
+      closePosition(candles.length - 1, last, "eod");
+      equityCurve[equityCurve.length - 1] = { time: last.time, equity: cash };
+    }
   }
 
   const diagnostics = buildDiagnostics({
@@ -229,6 +253,7 @@ export function runBacktest(
     interval: req.interval,
     tradeInstrument,
     oneTradePerDay,
+    openPosition: openLeg,
     optionsMeta:
       tradeInstrument === "options_atm"
         ? {

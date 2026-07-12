@@ -16,5 +16,14 @@ service cloud.firestore {
       allow read, write: if request.auth != null
         && request.auth.uid == userId;
     }
+    // Durable paper-trading sessions (server worker + client view)
+    match /users/{userId}/paperSessions/{docId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
+    }
+    // Worker discovery index (Admin SDK bypasses rules; client has no need)
+    match /paperSessionIndex/{docId} {
+      allow read, write: if false;
+    }
   }
 }

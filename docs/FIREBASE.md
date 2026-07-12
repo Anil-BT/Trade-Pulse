@@ -47,9 +47,25 @@ service cloud.firestore {
       allow read, write: if request.auth != null
         && request.auth.uid == userId;
     }
+    match /users/{userId}/paperSessions/{docId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
+    }
+    match /paperSessionIndex/{docId} {
+      allow read, write: if false;
+    }
   }
 }
 ```
+
+For **durable paper trading** (keeps running after browser close on multi-instance / Vercel), also set:
+
+```bash
+FIREBASE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
+CRON_SECRET=some-long-random-string
+```
+
+Vercel Cron hits `/api/paper/session/worker` every minute (see `vercel.json`).
 
 5. **Publish**
 

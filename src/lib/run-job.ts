@@ -96,7 +96,7 @@ export async function runBacktestJob(
         from: body.from,
         to: body.to,
         accessToken: upstoxToken,
-        lookbackDays: 10,
+        lookbackDays: body.leaveOpenPositions ? 12 : 10,
       });
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
