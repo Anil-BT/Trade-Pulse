@@ -63,6 +63,8 @@ export function runBacktest(
   const tradeInstrument: TradeInstrument = req.tradeInstrument || "equity";
   const optCfg = mergeOptions(req.options, tradeInstrument === "options_atm");
   const pricer = extras.optionPricer;
+  /** Skip new entries during indicator warmup bars (lookback fetch). */
+  const entryNotBeforeMs = req.entryNotBeforeMs ?? 0;
 
   let cash = initialCapital;
   let positionQty = 0;
@@ -112,8 +114,10 @@ export function runBacktest(
 
     // ENTRY - equity signal, then execute equity or ATM option
     if (positionQty === 0) {
+      const inWindow = !entryNotBeforeMs || c.time >= entryNotBeforeMs;
       const dayLimitHit = oneTradePerDay && tradesOnDay >= 1;
       if (
+        inWindow &&
         !dayLimitHit &&
         evalConditions(req.strategy.entry, entryLogic, i, seriesMap)
       ) {
@@ -140,6 +144,9 @@ export function runBacktest(
     initialCapital,
     marketFills,
     modelFills,
+    candleCount: candles.length,
+    firstBarTime: candles[0]?.time,
+    lastBarTime: candles[candles.length - 1]?.time,
   });
 
   return {
@@ -379,12 +386,24 @@ function buildDiagnostics(d: {
   initialCapital: number;
   marketFills: number;
   modelFills: number;
+  candleCount?: number;
+  firstBarTime?: number;
+  lastBarTime?: number;
 }): BacktestResult["diagnostics"] {
   let note: string | undefined;
+  const barsNote =
+    d.candleCount != null
+      ? ` Loaded ${d.candleCount} bar(s)${
+          d.firstBarTime && d.lastBarTime
+            ? ` (${new Date(d.firstBarTime + 5.5 * 3600000).toISOString().slice(0, 10)} → ${new Date(d.lastBarTime + 5.5 * 3600000).toISOString().slice(0, 10)} IST)`
+            : ""
+        }.`
+      : "";
 
   if (d.entriesTaken === 0 && d.equitySignals === 0) {
     note =
-      "No equity entry signals in this range. Loosen the strategy, widen dates, or use a 5m interval on trading days.";
+      "No equity entry signals in this range. Loosen the strategy, widen dates, or use a 5m interval on trading days." +
+      barsNote;
   } else if (
     d.entriesTaken === 0 &&
     d.skippedInsufficientCapital > 0 &&
@@ -415,6 +434,9 @@ function buildDiagnostics(d: {
     equitySignals: d.equitySignals,
     entriesTaken: d.entriesTaken,
     skippedInsufficientCapital: d.skippedInsufficientCapital,
+    candleCount: d.candleCount,
+    firstBarTime: d.firstBarTime,
+    lastBarTime: d.lastBarTime,
     minLotCost:
       d.minLotCost && Number.isFinite(d.minLotCost) ? d.minLotCost : undefined,
     note,

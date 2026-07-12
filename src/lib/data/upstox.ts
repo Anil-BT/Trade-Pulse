@@ -1,14 +1,16 @@
 import type { Candle, Interval } from "../types";
 import { asciiHeaders, sanitizeToken, safeErrorMessage } from "../http";
+import {
+  addCalendarDays,
+  chunkCalendarRange,
+  dayBoundsUnix,
+  filterCandlesByRange,
+  parseMarketTime,
+} from "./dates";
 
 /**
  * Upstox Historical Candle V3
  * Docs: https://upstox.com/developer/api-documentation/v3/get-historical-candle-data/
- *
- * Requires a valid access token from Upstox developer console.
- * instrument_key example: NSE_EQ|INE002A01018 (Reliance)
- *
- * Interval limits: 1–15 minute data max ~1 month per request.
  */
 
 interface UpstoxUnitInterval {
@@ -34,6 +36,11 @@ export async function fetchUpstoxCandles(opts: {
   from: string;
   to: string;
   accessToken: string;
+  /**
+   * Extra calendar days before `from` so EMA / OR / pivots warm up.
+   * Entries outside the user range are blocked in the backtest engine.
+   */
+  lookbackDays?: number;
 }): Promise<Candle[]> {
   const { instrumentKey, interval, from, to } = opts;
   const accessToken = sanitizeToken(opts.accessToken);
@@ -49,12 +56,14 @@ export async function fetchUpstoxCandles(opts: {
   }
 
   const map = INTERVAL_MAP[interval];
-  // Upstox 1-15m limited to ~1 month; chunk monthly when needed
-  const chunks = chunkDateRange(
-    from,
-    to,
-    map.unit === "minutes" && map.interval <= 15 ? 28 : 90
-  );
+  const lookback =
+    opts.lookbackDays ??
+    (map.unit === "minutes" || map.unit === "hours" ? 10 : 30);
+  const fetchFrom = addCalendarDays(from, -lookback);
+
+  // Upstox 1-15m limited to ~1 month per request
+  const maxDays = map.unit === "minutes" && map.interval <= 15 ? 28 : 90;
+  const chunks = chunkCalendarRange(fetchFrom, to, maxDays);
   const all: Candle[] = [];
 
   for (const chunk of chunks) {
@@ -69,10 +78,19 @@ export async function fetchUpstoxCandles(opts: {
     all.push(...part);
   }
 
-  // Dedupe by time and sort
   const byTime = new Map<number, Candle>();
-  for (const c of all) byTime.set(c.time, c);
-  return Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+  for (const c of all) {
+    if (Number.isFinite(c.time) && Number.isFinite(c.close)) {
+      byTime.set(c.time, c);
+    }
+  }
+  let sorted = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
+
+  // Keep lookback + requested range (trim only junk outside fetch window)
+  const { startMs, endMs } = dayBoundsUnix(fetchFrom, to, instrumentKey);
+  sorted = filterCandlesByRange(sorted, startMs, endMs);
+
+  return sorted;
 }
 
 async function fetchUpstoxChunkWithRetry(opts: {
@@ -89,8 +107,10 @@ async function fetchUpstoxChunkWithRetry(opts: {
       return await fetchUpstoxChunk(opts);
     } catch (e) {
       lastError = e instanceof Error ? e.message : String(e);
-      // Don't retry hard auth failures
-      if (/401|403|token/i.test(lastError) && !/429|timeout|fetch|network|ECONN|503|502/i.test(lastError)) {
+      if (
+        /401|403|auth failed|token/i.test(lastError) &&
+        !/429|timeout|fetch|network|ECONN|503|502/i.test(lastError)
+      ) {
         throw e;
       }
       await new Promise((r) => setTimeout(r, 500 * (attempt + 1)));
@@ -148,22 +168,15 @@ async function fetchUpstoxChunk(opts: {
         `Upstox rate limit (429). Wait a minute and retry. ${snippet}`
       );
     }
-    throw new Error(
-      safeErrorMessage(`Upstox error ${res.status}: ${snippet}`)
-    );
+    throw new Error(safeErrorMessage(`Upstox error ${res.status}: ${snippet}`));
   }
 
   const json = await res.json();
   const raw: unknown[][] = json?.data?.candles || [];
 
-  // candle: [timestamp, open, high, low, close, volume, oi]
   return raw
     .map((row) => {
-      const ts = row[0];
-      const time =
-        typeof ts === "string"
-          ? new Date(ts).getTime()
-          : Number(ts) * (Number(ts) < 1e12 ? 1000 : 1);
+      const time = parseMarketTime(row[0] as string | number);
       return {
         time,
         open: Number(row[1]),
@@ -174,33 +187,4 @@ async function fetchUpstoxChunk(opts: {
       } satisfies Candle;
     })
     .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close));
-}
-
-function chunkDateRange(
-  from: string,
-  to: string,
-  maxDays: number
-): { from: string; to: string }[] {
-  const start = new Date(from + "T00:00:00");
-  const end = new Date(to + "T00:00:00");
-  if (end < start) throw new Error("End date must be on or after start date");
-
-  const chunks: { from: string; to: string }[] = [];
-  let cursor = new Date(start);
-  while (cursor <= end) {
-    const chunkEnd = new Date(cursor);
-    chunkEnd.setDate(chunkEnd.getDate() + maxDays - 1);
-    if (chunkEnd > end) chunkEnd.setTime(end.getTime());
-    chunks.push({
-      from: formatDate(cursor),
-      to: formatDate(chunkEnd),
-    });
-    cursor = new Date(chunkEnd);
-    cursor.setDate(cursor.getDate() + 1);
-  }
-  return chunks;
-}
-
-function formatDate(d: Date): string {
-  return d.toISOString().slice(0, 10);
 }

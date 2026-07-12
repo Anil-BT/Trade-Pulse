@@ -10,6 +10,7 @@ import { resolveFnoMeta } from "./data/fno-meta";
 import { sanitizeToken } from "./http";
 import { createOptionPricer } from "./option-pricing";
 import { computeIndicator, indicatorKey } from "./indicators";
+import { dayBoundsUnix } from "./data/dates";
 import type {
   BacktestRequest,
   BacktestResult,
@@ -72,6 +73,13 @@ export async function runBacktestJob(
 
   const source = body.source || "upstox";
 
+  // Block new entries before the user's From date (warmup lookback still loads)
+  const { startMs: entryNotBeforeMs } = dayBoundsUnix(
+    body.from,
+    body.to,
+    `${symbol}.NS`
+  );
+
   if (source === "upstox") {
     const resolved = await resolveUpstoxInstrumentKey(
       body.upstoxInstrumentKey?.includes("|")
@@ -87,6 +95,7 @@ export async function runBacktestJob(
       from: body.from,
       to: body.to,
       accessToken: upstoxToken,
+      lookbackDays: 10,
     });
   } else if (source === "dhan") {
     candles = await fetchDhanCandles({
@@ -176,6 +185,7 @@ export async function runBacktestJob(
       options,
       initialCapital: body.initialCapital ?? 100000,
       positionSizePct: body.positionSizePct ?? 100,
+      entryNotBeforeMs,
     },
     { optionPricer }
   );

@@ -932,17 +932,22 @@ export function BacktestApp() {
                       <p className="mt-1 leading-relaxed">
                         {result.diagnostics.note}
                       </p>
-                      {result.diagnostics.equitySignals > 0 && (
-                        <p className="mt-1 text-xs text-neutral-500">
-                          Equity signals: {result.diagnostics.equitySignals}
-                          {result.diagnostics.skippedInsufficientCapital
-                            ? ` · skipped (capital): ${result.diagnostics.skippedInsufficientCapital}`
+                      <p className="mt-1 text-xs text-neutral-500">
+                        {result.diagnostics.candleCount != null
+                          ? `${result.diagnostics.candleCount} bars loaded`
+                          : ""}
+                        {result.diagnostics.equitySignals > 0
+                          ? ` · equity signals: ${result.diagnostics.equitySignals}`
+                          : result.diagnostics.candleCount != null
+                            ? " · equity signals: 0"
                             : ""}
-                          {result.diagnostics.minLotCost
-                            ? ` · ~₹${Math.ceil(result.diagnostics.minLotCost).toLocaleString("en-IN")}/lot`
-                            : ""}
-                        </p>
-                      )}
+                        {result.diagnostics.skippedInsufficientCapital
+                          ? ` · skipped (capital): ${result.diagnostics.skippedInsufficientCapital}`
+                          : ""}
+                        {result.diagnostics.minLotCost
+                          ? ` · ~₹${Math.ceil(result.diagnostics.minLotCost).toLocaleString("en-IN")}/lot`
+                          : ""}
+                      </p>
                     </div>
                   )}
                 </div>

@@ -108,6 +108,11 @@ export interface BacktestRequest {
   kiteApiKey?: string;
   /** Zerodha Kite session access token */
   kiteAccessToken?: string;
+  /**
+   * Do not open new trades before this timestamp (ms).
+   * Used after fetching warmup lookback candles for indicators.
+   */
+  entryNotBeforeMs?: number;
 }
 
 export interface Trade {
@@ -205,6 +210,10 @@ export interface BacktestResult {
     skippedInsufficientCapital: number;
     minLotCost?: number;
     note?: string;
+    /** Bars used for indicators / signals */
+    candleCount?: number;
+    firstBarTime?: number;
+    lastBarTime?: number;
   };
 }
 
