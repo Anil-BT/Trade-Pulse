@@ -26,7 +26,7 @@ export async function POST(req: NextRequest) {
       from,
       to,
       interval = "5m",
-      source = "yahoo",
+      source = "upstox",
       strategy,
       initialCapital = 100000,
       positionSizePct = 100,
@@ -34,6 +34,10 @@ export async function POST(req: NextRequest) {
       tradeInstrument = "options_atm",
       options,
       upstoxAccessToken,
+      dhanAccessToken,
+      dhanClientId,
+      kiteApiKey,
+      kiteAccessToken,
       maxSymbols = 200,
       concurrency = 3,
       scanAll = false,
@@ -50,6 +54,10 @@ export async function POST(req: NextRequest) {
       tradeInstrument?: TradeInstrument;
       options?: BacktestRequest["options"];
       upstoxAccessToken?: string;
+      dhanAccessToken?: string;
+      dhanClientId?: string;
+      kiteApiKey?: string;
+      kiteAccessToken?: string;
       maxSymbols?: number;
       concurrency?: number;
       /** When true, ignore maxSymbols and scan full equity F&O list */
@@ -93,11 +101,11 @@ export async function POST(req: NextRequest) {
         const sym = item.symbol;
         try {
           const result = await runBacktestJob({
-            symbol: source === "yahoo" ? `${sym}.NS` : sym,
+            symbol: sym,
             interval: interval as BacktestRequest["interval"],
             from,
             to,
-            source: source || "yahoo",
+            source: source || "upstox",
             strategy,
             initialCapital,
             positionSizePct,
@@ -105,6 +113,10 @@ export async function POST(req: NextRequest) {
             tradeInstrument,
             options,
             upstoxAccessToken,
+            dhanAccessToken,
+            dhanClientId,
+            kiteApiKey,
+            kiteAccessToken,
           });
 
           const m = result.metrics;
@@ -199,7 +211,7 @@ export async function POST(req: NextRequest) {
       from,
       to,
       interval,
-      source: source || "yahoo",
+      source: source || "upstox",
       tradeInstrument: tradeInstrument || "equity",
       oneTradePerDay: Boolean(oneTradePerDay),
       universeSize: universe.length,

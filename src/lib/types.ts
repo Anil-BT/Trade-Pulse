@@ -9,7 +9,7 @@ export type Interval =
   | "1wk"
   | "1mo";
 
-export type DataSource = "yahoo" | "upstox" | "sample";
+export type DataSource = "upstox" | "dhan" | "kite";
 
 export type TradeInstrument = "equity" | "options_atm";
 
@@ -100,6 +100,14 @@ export interface BacktestRequest {
   options?: OptionsTradeSettings;
   upstoxAccessToken?: string;
   upstoxInstrumentKey?: string;
+  /** DhanHQ JWT access token */
+  dhanAccessToken?: string;
+  /** Optional Dhan client id (some APIs require client-id header) */
+  dhanClientId?: string;
+  /** Zerodha Kite Connect API key */
+  kiteApiKey?: string;
+  /** Zerodha Kite session access token */
+  kiteAccessToken?: string;
 }
 
 export interface Trade {

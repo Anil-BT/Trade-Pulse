@@ -6,9 +6,10 @@ Minimal black-and-white app to pull **free historical stock data** and **backtes
 
 ## Features
 
-- **Data sources**
-  - **Yahoo Finance** (default, no API key) — NSE symbols like `RELIANCE.NS`
-  - **Upstox** Historical Candle V3 (free API + access token; symbol resolved to instrument key)
+- **Data sources** (broker APIs — token required)
+  - **Upstox** Historical Candle V3
+  - **Dhan** DhanHQ historical (intraday + daily)
+  - **Zerodha Kite** Connect historical
 - **Strategy builder** — entry/exit conditions with AND/OR logic
 - **Indicators** — EMA, SMA, RSI, Opening Range, Fib pivots, Prev Day High/Low
 - **Trade modes** — equity or ATM options (signals on equity, execute options)

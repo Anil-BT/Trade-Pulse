@@ -2,11 +2,11 @@
  * Shared single-symbol backtest job used by /api/backtest and /api/scan.
  */
 import { runBacktest } from "./backtest";
-import { fetchYahooCandles } from "./data/yahoo";
 import { fetchUpstoxCandles } from "./data/upstox";
 import { resolveUpstoxInstrumentKey } from "./data/upstox-instruments";
+import { fetchDhanCandles } from "./data/dhan";
+import { fetchKiteCandles } from "./data/kite";
 import { resolveFnoMeta } from "./data/fno-meta";
-import { generateSampleCandles } from "./data/sample";
 import { sanitizeToken } from "./http";
 import { createOptionPricer } from "./option-pricing";
 import { computeIndicator, indicatorKey } from "./indicators";
@@ -18,10 +18,18 @@ import type {
   IndicatorType,
 } from "./types";
 
+function cleanSymbol(symbol: string): string {
+  return symbol
+    .trim()
+    .toUpperCase()
+    .replace(/\.NS$/i, "")
+    .replace(/\.BO$/i, "");
+}
+
 export async function runBacktestJob(
   body: BacktestRequest
 ): Promise<BacktestResult & { instrumentKey?: string }> {
-  if (!body.symbol?.trim() && body.source !== "sample") {
+  if (!body.symbol?.trim()) {
     throw new Error("Symbol is required");
   }
   if (!body.from || !body.to) {
@@ -35,15 +43,30 @@ export async function runBacktestJob(
   }
 
   const interval = body.interval || "5m";
-  let symbol = body.symbol?.trim() || "SAMPLE";
+  let symbol = cleanSymbol(body.symbol);
   let candles;
   let resolvedInstrumentKey: string | undefined;
   let lotSource = "manual";
-  const token = sanitizeToken(
+
+  const upstoxToken = sanitizeToken(
     body.upstoxAccessToken || process.env.UPSTOX_ACCESS_TOKEN || ""
   );
+  const dhanToken = sanitizeToken(
+    body.dhanAccessToken || process.env.DHAN_ACCESS_TOKEN || ""
+  );
+  const dhanClientId = sanitizeToken(
+    body.dhanClientId || process.env.DHAN_CLIENT_ID || ""
+  );
+  const kiteApiKey = sanitizeToken(
+    body.kiteApiKey || process.env.KITE_API_KEY || ""
+  );
+  const kiteAccessToken = sanitizeToken(
+    body.kiteAccessToken || process.env.KITE_ACCESS_TOKEN || ""
+  );
 
-  if (body.source === "upstox") {
+  const source = body.source || "upstox";
+
+  if (source === "upstox") {
     const resolved = await resolveUpstoxInstrumentKey(
       body.upstoxInstrumentKey?.includes("|")
         ? body.upstoxInstrumentKey
@@ -57,14 +80,30 @@ export async function runBacktestJob(
       interval,
       from: body.from,
       to: body.to,
-      accessToken: token,
+      accessToken: upstoxToken,
     });
-  } else if (body.source === "sample") {
-    candles = generateSampleCandles(symbol, interval, body.from, body.to);
+  } else if (source === "dhan") {
+    candles = await fetchDhanCandles({
+      symbol,
+      interval,
+      from: body.from,
+      to: body.to,
+      accessToken: dhanToken,
+      clientId: dhanClientId || undefined,
+    });
+  } else if (source === "kite") {
+    candles = await fetchKiteCandles({
+      symbol,
+      interval,
+      from: body.from,
+      to: body.to,
+      apiKey: kiteApiKey,
+      accessToken: kiteAccessToken,
+    });
   } else {
-    const ySym = symbol.includes(".") ? symbol : `${symbol}.NS`;
-    candles = await fetchYahooCandles(ySym, interval, body.from, body.to);
-    symbol = symbol.replace(/\.NS$/i, "").replace(/\.BO$/i, "");
+    throw new Error(
+      `Unknown data source “${source}”. Use upstox, dhan, or kite.`
+    );
   }
 
   if (!candles.length) {
@@ -116,7 +155,7 @@ export async function runBacktestJob(
       lotSize: options.lotSize,
       preferredDaysToExpiry: options.daysToExpiry ?? 7,
       fallbackIv: options.iv ?? 0.18,
-      accessToken: token || undefined,
+      accessToken: upstoxToken || undefined,
       signalTimes,
     });
   }
@@ -127,6 +166,7 @@ export async function runBacktestJob(
       ...body,
       symbol,
       interval,
+      source,
       options,
       initialCapital: body.initialCapital ?? 100000,
       positionSizePct: body.positionSizePct ?? 100,

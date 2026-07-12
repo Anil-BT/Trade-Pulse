@@ -1,8 +1,8 @@
 import { NextRequest, NextResponse } from "next/server";
-import { fetchYahooCandles } from "@/lib/data/yahoo";
 import { fetchUpstoxCandles } from "@/lib/data/upstox";
 import { resolveUpstoxInstrumentKey } from "@/lib/data/upstox-instruments";
-import { generateSampleCandles } from "@/lib/data/sample";
+import { fetchDhanCandles } from "@/lib/data/dhan";
+import { fetchKiteCandles } from "@/lib/data/kite";
 import { ema } from "@/lib/indicators";
 import type { Candle, DataSource, Interval } from "@/lib/types";
 
@@ -10,27 +10,30 @@ export const dynamic = "force-dynamic";
 
 /**
  * GET /api/data?symbol=RELIANCE&interval=5m&from=...&to=...&source=upstox
- * For Upstox, symbol is resolved to instrument_key automatically.
  */
 export async function GET(req: NextRequest) {
   try {
     const sp = req.nextUrl.searchParams;
-    let symbol = (sp.get("symbol") || "").trim().toUpperCase() || "SAMPLE";
+    let symbol = (sp.get("symbol") || "").trim().toUpperCase();
     const interval = (sp.get("interval") || "5m") as Interval;
     const from = sp.get("from") || "";
     const to = sp.get("to") || "";
-    const source = (sp.get("source") || "yahoo") as DataSource;
-    const token = sp.get("token") || process.env.UPSTOX_ACCESS_TOKEN || "";
+    const source = (sp.get("source") || "upstox") as DataSource;
     const emaPeriod = Math.max(1, Number(sp.get("emaPeriod") || 9) || 9);
 
     if (!from || !to) {
       return NextResponse.json({ error: "from and to required" }, { status: 400 });
+    }
+    if (!symbol) {
+      return NextResponse.json({ error: "symbol required" }, { status: 400 });
     }
 
     let candles: Candle[];
     let instrumentKey: string | undefined;
 
     if (source === "upstox") {
+      const token =
+        sp.get("token") || process.env.UPSTOX_ACCESS_TOKEN || "";
       const resolved = await resolveUpstoxInstrumentKey(symbol);
       instrumentKey = resolved.instrumentKey;
       symbol = resolved.tradingSymbol;
@@ -41,10 +44,31 @@ export async function GET(req: NextRequest) {
         to,
         accessToken: token,
       });
-    } else if (source === "sample") {
-      candles = generateSampleCandles(symbol, interval, from, to);
+    } else if (source === "dhan") {
+      candles = await fetchDhanCandles({
+        symbol,
+        interval,
+        from,
+        to,
+        accessToken:
+          sp.get("token") || process.env.DHAN_ACCESS_TOKEN || "",
+        clientId: sp.get("clientId") || process.env.DHAN_CLIENT_ID || undefined,
+      });
+    } else if (source === "kite") {
+      candles = await fetchKiteCandles({
+        symbol,
+        interval,
+        from,
+        to,
+        apiKey: sp.get("apiKey") || process.env.KITE_API_KEY || "",
+        accessToken:
+          sp.get("token") || process.env.KITE_ACCESS_TOKEN || "",
+      });
     } else {
-      candles = await fetchYahooCandles(symbol, interval, from, to);
+      return NextResponse.json(
+        { error: "source must be upstox, dhan, or kite" },
+        { status: 400 }
+      );
     }
 
     if (!candles.length) {

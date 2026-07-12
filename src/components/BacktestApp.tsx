@@ -33,12 +33,12 @@ const INTERVALS: { value: Interval; label: string }[] = [
 ];
 
 const POPULAR = [
-  { symbol: "RELIANCE", yahoo: "RELIANCE.NS", label: "Reliance" },
-  { symbol: "TCS", yahoo: "TCS.NS", label: "TCS" },
-  { symbol: "INFY", yahoo: "INFY.NS", label: "Infosys" },
-  { symbol: "HDFCBANK", yahoo: "HDFCBANK.NS", label: "HDFC Bank" },
-  { symbol: "SBIN", yahoo: "SBIN.NS", label: "SBI" },
-  { symbol: "NIFTYBEES", yahoo: "NIFTYBEES.NS", label: "Nifty BeES" },
+  { symbol: "RELIANCE", label: "Reliance" },
+  { symbol: "TCS", label: "TCS" },
+  { symbol: "INFY", label: "Infosys" },
+  { symbol: "HDFCBANK", label: "HDFC Bank" },
+  { symbol: "SBIN", label: "SBI" },
+  { symbol: "NIFTYBEES", label: "Nifty BeES" },
 ];
 
 export function BacktestApp() {
@@ -47,8 +47,12 @@ export function BacktestApp() {
   const [interval, setInterval] = useState<Interval>("5m");
   const [from, setFrom] = useState(defaults.from);
   const [to, setTo] = useState(defaults.to);
-  const [source, setSource] = useState<DataSource>("yahoo");
+  const [source, setSource] = useState<DataSource>("upstox");
   const [upstoxToken, setUpstoxToken] = useState("");
+  const [dhanToken, setDhanToken] = useState("");
+  const [dhanClientId, setDhanClientId] = useState("");
+  const [kiteApiKey, setKiteApiKey] = useState("");
+  const [kiteAccessToken, setKiteAccessToken] = useState("");
   /** Total capital pool for the entire backtest run */
   const [capital, setCapital] = useState(100000);
   /** Equity only: max % of total capital per trade (not used for F&O — always 1 lot) */
@@ -128,6 +132,31 @@ export function BacktestApp() {
     }
   }
 
+  function validateSourceCredentials() {
+    if (source === "upstox" && !upstoxToken.trim()) {
+      throw new Error("Paste your Upstox access token.");
+    }
+    if (source === "dhan" && !dhanToken.trim()) {
+      throw new Error("Paste your Dhan access token.");
+    }
+    if (source === "kite" && (!kiteApiKey.trim() || !kiteAccessToken.trim())) {
+      throw new Error("Paste Kite API key and access token.");
+    }
+  }
+
+  function credentialsPayload() {
+    return {
+      upstoxAccessToken:
+        source === "upstox" ? upstoxToken || undefined : undefined,
+      dhanAccessToken: source === "dhan" ? dhanToken || undefined : undefined,
+      dhanClientId:
+        source === "dhan" ? dhanClientId || undefined : undefined,
+      kiteApiKey: source === "kite" ? kiteApiKey || undefined : undefined,
+      kiteAccessToken:
+        source === "kite" ? kiteAccessToken || undefined : undefined,
+    };
+  }
+
   async function run() {
     setLoading(true);
     setError(null);
@@ -136,19 +165,17 @@ export function BacktestApp() {
     setChartFilter(null);
 
     try {
-      if ((source === "yahoo" || source === "upstox") && !symbol.trim()) {
+      if (!symbol.trim()) {
         throw new Error("Please enter a stock symbol (e.g. RELIANCE or TCS).");
       }
       validateCommon();
-
-      const requestSymbol =
-        source === "yahoo" ? toYahooSymbol(symbol) : toUpstoxSymbol(symbol);
+      validateSourceCredentials();
 
       const res = await fetch("/api/backtest", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          symbol: requestSymbol,
+          symbol: cleanSymbol(symbol),
           interval,
           from,
           to,
@@ -159,7 +186,7 @@ export function BacktestApp() {
           oneTradePerDay,
           tradeInstrument,
           options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
-          upstoxAccessToken: upstoxToken || undefined,
+          ...credentialsPayload(),
         }),
       });
 
@@ -197,6 +224,8 @@ export function BacktestApp() {
     try {
       validateCommon();
 
+      validateSourceCredentials();
+
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -204,14 +233,14 @@ export function BacktestApp() {
           from,
           to,
           interval,
-          source: source === "sample" ? "yahoo" : source,
+          source,
           strategy,
           initialCapital: capital,
           positionSizePct: equityAllocPct,
           oneTradePerDay,
           tradeInstrument,
           options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
-          upstoxAccessToken: upstoxToken || undefined,
+          ...credentialsPayload(),
           maxSymbols: scanAllFno ? 400 : scanMaxSymbols,
           scanAll: scanAllFno,
           concurrency: 3,
@@ -259,9 +288,9 @@ export function BacktestApp() {
             <div className="mb-5 flex flex-wrap gap-2">
               {(
                 [
-                  { id: "yahoo", label: "Yahoo (free)" },
                   { id: "upstox", label: "Upstox" },
-                  { id: "sample", label: "Sample" },
+                  { id: "dhan", label: "Dhan" },
+                  { id: "kite", label: "Zerodha Kite" },
                 ] as const
               ).map((s) => (
                 <button
@@ -279,61 +308,44 @@ export function BacktestApp() {
               ))}
             </div>
 
-            {(source === "yahoo" || source === "upstox") && (
-              <div className="space-y-4">
-                <Field label="Symbol">
-                  <input
-                    value={symbol}
-                    onChange={(e) => setSymbol(e.target.value.toUpperCase())}
-                    placeholder={
-                      source === "upstox" ? "RELIANCE" : "RELIANCE or RELIANCE.NS"
-                    }
-                    className="field-input"
-                  />
-                </Field>
-                <div className="flex flex-wrap gap-2">
-                  {POPULAR.map((p) => {
-                    const active =
-                      toUpstoxSymbol(symbol) === p.symbol ||
-                      symbol === p.yahoo ||
-                      symbol === p.symbol;
-                    return (
-                      <button
-                        key={p.symbol}
-                        type="button"
-                        onClick={() =>
-                          setSymbol(source === "yahoo" ? p.yahoo : p.symbol)
-                        }
-                        className={`rounded-full border px-3 py-1 text-xs transition ${
-                          active
-                            ? "border-black bg-black text-white"
-                            : "border-neutral-200 text-neutral-600 hover:border-neutral-400"
-                        }`}
-                      >
-                        {p.label}
-                      </button>
-                    );
-                  })}
-                </div>
-                {source === "yahoo" ? (
-                  <p className="text-xs text-neutral-500">
-                    NSE symbols work as <code className="text-neutral-800">RELIANCE</code>{" "}
-                    or <code className="text-neutral-800">RELIANCE.NS</code>. Default
-                    interval is 5 min.
-                  </p>
-                ) : (
-                  <p className="text-xs text-neutral-500">
-                    Type the NSE trading symbol (e.g.{" "}
-                    <code className="text-neutral-800">RELIANCE</code>). We look up the
-                    Upstox instrument key for you.
-                  </p>
-                )}
+            <div className="space-y-4">
+              <Field label="Symbol">
+                <input
+                  value={symbol}
+                  onChange={(e) => setSymbol(e.target.value.toUpperCase())}
+                  placeholder="RELIANCE"
+                  className="field-input"
+                />
+              </Field>
+              <div className="flex flex-wrap gap-2">
+                {POPULAR.map((p) => {
+                  const active = cleanSymbol(symbol) === p.symbol;
+                  return (
+                    <button
+                      key={p.symbol}
+                      type="button"
+                      onClick={() => setSymbol(p.symbol)}
+                      className={`rounded-full border px-3 py-1 text-xs transition ${
+                        active
+                          ? "border-black bg-black text-white"
+                          : "border-neutral-200 text-neutral-600 hover:border-neutral-400"
+                      }`}
+                    >
+                      {p.label}
+                    </button>
+                  );
+                })}
               </div>
-            )}
+              <p className="text-xs text-neutral-500">
+                NSE trading symbol (e.g.{" "}
+                <code className="text-neutral-800">RELIANCE</code>). Instrument
+                id is resolved automatically.
+              </p>
+            </div>
 
             {source === "upstox" && (
               <div className="mt-4 space-y-4">
-                <Field label="Access token">
+                <Field label="Upstox access token">
                   <div className="relative">
                     <input
                       type={showToken ? "text" : "password"}
@@ -352,18 +364,83 @@ export function BacktestApp() {
                   </div>
                 </Field>
                 <p className="text-xs text-neutral-500">
-                  Free Upstox historical API. Paste your access token, or set{" "}
-                  <code className="text-neutral-800">UPSTOX_ACCESS_TOKEN</code> in{" "}
-                  <code className="text-neutral-800">.env.local</code>.
+                  From the Upstox developer app. Optional env:{" "}
+                  <code className="text-neutral-800">UPSTOX_ACCESS_TOKEN</code>.
                 </p>
               </div>
             )}
 
-            {source === "sample" && (
-              <p className="text-xs leading-relaxed text-neutral-500">
-                Offline synthetic candles — useful when live APIs are
-                rate-limited.
-              </p>
+            {source === "dhan" && (
+              <div className="mt-4 space-y-4">
+                <Field label="Dhan access token">
+                  <div className="relative">
+                    <input
+                      type={showToken ? "text" : "password"}
+                      value={dhanToken}
+                      onChange={(e) => setDhanToken(e.target.value)}
+                      placeholder="JWT from web.dhan.co → DhanHQ APIs"
+                      className="field-input pr-16 font-mono text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowToken((v) => !v)}
+                      className="absolute top-1/2 right-3 -translate-y-1/2 text-xs text-neutral-500 hover:text-black"
+                    >
+                      {showToken ? "Hide" : "Show"}
+                    </button>
+                  </div>
+                </Field>
+                <Field label="Client ID (optional)">
+                  <input
+                    value={dhanClientId}
+                    onChange={(e) => setDhanClientId(e.target.value)}
+                    placeholder="Dhan client id if required"
+                    className="field-input font-mono text-sm"
+                  />
+                </Field>
+                <p className="text-xs text-neutral-500">
+                  DhanHQ historical (1/5/15/60m, daily). Env:{" "}
+                  <code className="text-neutral-800">DHAN_ACCESS_TOKEN</code>.
+                </p>
+              </div>
+            )}
+
+            {source === "kite" && (
+              <div className="mt-4 space-y-4">
+                <Field label="Kite API key">
+                  <input
+                    type={showToken ? "text" : "password"}
+                    value={kiteApiKey}
+                    onChange={(e) => setKiteApiKey(e.target.value)}
+                    placeholder="API key from developers.kite.trade"
+                    className="field-input font-mono text-sm"
+                  />
+                </Field>
+                <Field label="Kite access token">
+                  <div className="relative">
+                    <input
+                      type={showToken ? "text" : "password"}
+                      value={kiteAccessToken}
+                      onChange={(e) => setKiteAccessToken(e.target.value)}
+                      placeholder="Session access token"
+                      className="field-input pr-16 font-mono text-sm"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => setShowToken((v) => !v)}
+                      className="absolute top-1/2 right-3 -translate-y-1/2 text-xs text-neutral-500 hover:text-black"
+                    >
+                      {showToken ? "Hide" : "Show"}
+                    </button>
+                  </div>
+                </Field>
+                <p className="text-xs text-neutral-500">
+                  Kite Connect historical requires a paid app + daily login
+                  token. Env:{" "}
+                  <code className="text-neutral-800">KITE_API_KEY</code>,{" "}
+                  <code className="text-neutral-800">KITE_ACCESS_TOKEN</code>.
+                </p>
+              </div>
             )}
 
             <div className="mt-5 grid grid-cols-2 gap-3 sm:grid-cols-3">
@@ -955,22 +1032,12 @@ function Field({
   );
 }
 
-/** NSE trading symbol for Upstox lookup (strip Yahoo suffixes). */
-function toUpstoxSymbol(s: string): string {
+/** NSE trading symbol (strip exchange suffixes). */
+function cleanSymbol(s: string): string {
   return s
     .trim()
     .toUpperCase()
     .replace(/\.NS$/i, "")
     .replace(/\.BO$/i, "")
     .replace(/\.BSE$/i, "");
-}
-
-/** Yahoo symbol — add .NS for plain NSE names when missing an exchange suffix. */
-function toYahooSymbol(s: string): string {
-  const t = s.trim().toUpperCase();
-  if (!t) return t;
-  if (t.includes(".")) return t;
-  // US-looking single names without dots stay as-is only if user intends US;
-  // for this India-first app, bare names map to NSE.
-  return `${t}.NS`;
 }
