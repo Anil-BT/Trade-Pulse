@@ -38,7 +38,12 @@ export type IndicatorType =
   | "FIB_PIVOT_S3"
   /** Previous session high / low (flat for current day) */
   | "PREV_DAY_HIGH"
-  | "PREV_DAY_LOW";
+  | "PREV_DAY_LOW"
+  /**
+   * Breakout high = max(Opening Range High, Fib R3, Prev Day High).
+   * Use with cross_above for true breakout entries.
+   */
+  | "BREAKOUT_HIGH";
 
 export type CompareOperand =
   | "close"
@@ -84,6 +89,15 @@ export interface OptionsTradeSettings {
   listedStrikes?: number[];
 }
 
+/** Intraday window (IST) when new entries are allowed. */
+export interface EntryTimeWindow {
+  enabled: boolean;
+  /** HH:mm IST, inclusive */
+  start: string;
+  /** HH:mm IST, inclusive */
+  end: string;
+}
+
 export interface BacktestRequest {
   symbol: string;
   interval: Interval;
@@ -95,6 +109,25 @@ export interface BacktestRequest {
   positionSizePct: number; // 0-100, % of capital per trade
   /** Max 1 entry per session day. */
   oneTradePerDay?: boolean;
+  /**
+   * Up to two IST entry windows. If any window is enabled, entries only fire
+   * when bar time falls inside at least one enabled window.
+   * If none enabled (or omitted), entries allowed all session.
+   */
+  entryTimeWindows?: EntryTimeWindow[];
+  /**
+   * Hard stop: exit open trade if unrealized loss ≥ this amount.
+   * - Equity: (entry − mark) × qty
+   * - Options: (entry premium − mark premium) × units
+   */
+  maxRiskPerTrade?: {
+    enabled: boolean;
+    mode: "pct" | "amount";
+    /** % of initial capital (e.g. 2 = 2%) when mode is pct */
+    pct?: number;
+    /** Absolute ₹ cap when mode is amount */
+    amount?: number;
+  };
   /** equity (default) or ATM options simulation. */
   tradeInstrument?: TradeInstrument;
   options?: OptionsTradeSettings;
@@ -127,6 +160,8 @@ export interface Trade {
   pnl: number;
   pnlPct: number;
   barsHeld: number;
+  /** Why the trade closed (strategy signal vs max-risk stop) */
+  exitReason?: "signal" | "max_risk" | "eod";
   /** Equity underlying spot used for signals at entry/exit */
   underlyingEntry?: number;
   underlyingExit?: number;
@@ -160,6 +195,10 @@ export interface BacktestMetrics {
   avgWin: number;
   /** Average loss as negative number */
   avgLoss: number;
+  /** Sum of winning trade P&L */
+  grossProfit: number;
+  /** Sum of |losing trade P&L| (positive number) */
+  grossLoss: number;
   /**
    * Reward:Risk = |avgWin| / |avgLoss|.
    * Infinity-like values capped at 999 when no losses.
@@ -178,11 +217,38 @@ export interface BacktestMetrics {
   maxCapitalUsed: number;
 }
 
+/** One trading day's aggregate (IST). */
+export interface DaySummary {
+  /** YYYY-MM-DD IST */
+  date: string;
+  trades: number;
+  winners: number;
+  losers: number;
+  winRate: number;
+  pnl: number;
+  /** Gross profit (sum of winning trades) */
+  grossProfit: number;
+  /** Gross loss as positive number */
+  grossLoss: number;
+  avgPnl: number;
+  avgWin: number;
+  avgLoss: number;
+  bestTrade: number;
+  worstTrade: number;
+  capitalUsed: number;
+  maxRiskStops: number;
+  signalExits: number;
+  /** Cumulative P&L through this day (running total) */
+  cumulativePnl: number;
+}
+
 export interface BacktestResult {
   candles: Candle[];
   trades: Trade[];
   equityCurve: EquityPoint[];
   metrics: BacktestMetrics;
+  /** Present when backtest spans more than one session day */
+  daySummaries?: DaySummary[];
   indicators: Record<string, (number | null)[]>;
   source: DataSource;
   symbol: string;
@@ -208,7 +274,10 @@ export interface BacktestResult {
     equitySignals: number;
     entriesTaken: number;
     skippedInsufficientCapital: number;
+    /** Trades closed because unrealized loss hit max risk */
+    maxRiskStops?: number;
     minLotCost?: number;
+    maxRiskCap?: number;
     note?: string;
     /** Bars used for indicators / signals */
     candleCount?: number;

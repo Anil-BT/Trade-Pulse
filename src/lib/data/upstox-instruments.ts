@@ -63,7 +63,32 @@ export async function resolveUpstoxInstrumentKey(
     };
   }
 
-  // Fast path: static map (critical on Vercel cold starts)
+  // Prefer live instrument master (ISINs change after demergers / corp actions).
+  // Static map is only a fallback when master download fails.
+  try {
+    const index = await loadSymbolIndex();
+    const candidates = [
+      normalized,
+      normalized.replace(/[-_\s]/g, ""),
+      // Tata Motors rename
+      normalized === "TATAMOTORS" ? "TMCV" : "",
+      normalized === "TATAMOTORS" ? "TMPV" : "",
+    ].filter(Boolean);
+
+    for (const cand of candidates) {
+      const hit = index.bySymbol[cand];
+      if (hit) {
+        if (exchange === "BSE" || symbol.toUpperCase().endsWith(".BO")) {
+          const bse = index.bySymbol[`BSE:${cand}`];
+          if (bse) return mapHit(bse);
+        }
+        return mapHit(hit);
+      }
+    }
+  } catch {
+    // fall through to static
+  }
+
   if (exchange !== "BSE" && !symbol.toUpperCase().endsWith(".BO")) {
     const staticHit = lookupStaticUpstoxKey(normalized);
     if (staticHit) {
@@ -77,36 +102,9 @@ export async function resolveUpstoxInstrumentKey(
     }
   }
 
-  let index: SymbolIndex;
-  try {
-    index = await loadSymbolIndex();
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new Error(
-      `Could not load Upstox instrument list (${msg}). Use a full instrument key like NSE_EQ|INE002A01018, or retry.`
-    );
-  }
-  const hit = index.bySymbol[normalized];
-
-  if (!hit) {
-    // try without spaces / common aliases
-    const alt = index.bySymbol[normalized.replace(/[-_\s]/g, "")];
-    if (!alt) {
-      throw new Error(
-        `Could not find Upstox instrument for "${symbol}". Use NSE trading symbol like RELIANCE, TCS, INFY, SBIN, or paste instrument_key.`
-      );
-    }
-    return mapHit(alt);
-  }
-
-  // If user forced BSE via .BO and we stored NSE, re-search BSE-only map key
-  if (exchange === "BSE" || symbol.toUpperCase().endsWith(".BO")) {
-    const bseKey = `BSE:${normalized}`;
-    const bse = index.bySymbol[bseKey];
-    if (bse) return mapHit(bse);
-  }
-
-  return mapHit(hit);
+  throw new Error(
+    `Could not find Upstox instrument for "${symbol}". Use NSE trading symbol (e.g. RELIANCE, TCS) or full key NSE_EQ|ISIN. Note: TATAMOTORS is now TMCV / TMPV.`
+  );
 }
 
 function mapHit(hit: UpstoxInstrument) {
@@ -136,7 +134,8 @@ async function loadSymbolIndex(): Promise<SymbolIndex> {
     return memoryIndex;
   }
 
-  const cachePath = path.join(getCacheDir(), "upstox_symbol_index.json");
+  // v2: force refresh after static-key / demerger fixes
+  const cachePath = path.join(getCacheDir(), "upstox_symbol_index_v2.json");
   try {
     ensureCacheDir();
     if (fs.existsSync(cachePath)) {

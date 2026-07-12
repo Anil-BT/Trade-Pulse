@@ -44,6 +44,97 @@ export function ScanReportView({
     return list;
   }, [report.rows, report.tradeInstrument]);
 
+  /** Overall money totals across all stocks */
+  const moneyTotals = useMemo(() => {
+    let capitalUsed = 0;
+    let grossProfit = 0;
+    let grossLoss = 0;
+    for (const t of combinedTrades) {
+      capitalUsed += t.capitalUsed ?? t.entryPrice * t.qty;
+      if (t.pnl > 0) grossProfit += t.pnl;
+      else grossLoss += Math.abs(t.pnl);
+    }
+    return {
+      capitalUsed: Number(capitalUsed.toFixed(2)),
+      grossProfit: Number(grossProfit.toFixed(2)),
+      grossLoss: Number(grossLoss.toFixed(2)),
+    };
+  }, [combinedTrades]);
+
+  /**
+   * Per-day scan summary (same style as overall chips):
+   * stocks that traded, win%, P&L, capital / profit / loss
+   */
+  const daySummaries = useMemo(() => {
+    type DayAcc = {
+      date: string;
+      /** symbol -> pnl that day */
+      stockPnl: Map<string, number>;
+      totalTrades: number;
+      capitalUsed: number;
+      grossProfit: number;
+      grossLoss: number;
+      combinedPnl: number;
+    };
+    const byDay = new Map<string, DayAcc>();
+
+    for (const r of report.rows) {
+      if (!r.tradeList?.length) continue;
+      for (const t of r.tradeList) {
+        const date = istDayKey(t.entryTime);
+        let row = byDay.get(date);
+        if (!row) {
+          row = {
+            date,
+            stockPnl: new Map(),
+            totalTrades: 0,
+            capitalUsed: 0,
+            grossProfit: 0,
+            grossLoss: 0,
+            combinedPnl: 0,
+          };
+          byDay.set(date, row);
+        }
+        row.totalTrades += 1;
+        row.combinedPnl += t.pnl;
+        row.capitalUsed += t.capitalUsed ?? t.entryPrice * (t.lots || 1) * (t.lotSize || 1);
+        if (t.pnl > 0) row.grossProfit += t.pnl;
+        else row.grossLoss += Math.abs(t.pnl);
+        row.stockPnl.set(r.symbol, (row.stockPnl.get(r.symbol) || 0) + t.pnl);
+      }
+    }
+
+    const eligibleNoTradeBase = report.rows.filter(
+      (r) => r.status === "ok" || r.status === "no_trades"
+    ).length;
+
+    return [...byDay.values()]
+      .sort((a, b) => (a.date < b.date ? -1 : 1))
+      .map((d) => {
+        const withTrades = d.stockPnl.size;
+        let winners = 0;
+        let losers = 0;
+        for (const pnl of d.stockPnl.values()) {
+          if (pnl > 0) winners += 1;
+          else losers += 1;
+        }
+        return {
+          date: d.date,
+          combinedPnl: Number(d.combinedPnl.toFixed(2)),
+          withTrades,
+          winners,
+          losers,
+          winPct: withTrades ? (winners / withTrades) * 100 : 0,
+          noTrade: Math.max(0, eligibleNoTradeBase - withTrades),
+          errors: s.errors,
+          totalTrades: d.totalTrades,
+          capitalUsed: Number(d.capitalUsed.toFixed(2)),
+          grossProfit: Number(d.grossProfit.toFixed(2)),
+          grossLoss: Number(d.grossLoss.toFixed(2)),
+        };
+      });
+  }, [report.rows, s.errors]);
+
   const rows = useMemo(() => {
     let base =
       filter === "all"
@@ -219,22 +310,112 @@ export function ScanReportView({
           </div>
         </div>
 
-        {/* Summary chips */}
-        <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
-          <MiniStat label="Combined P&L" value={formatMoney(s.totalPnl)} />
-          <MiniStat
-            label="Win %"
-            value={
-              s.withTrades
-                ? `${((s.winners / s.withTrades) * 100).toFixed(0)}%`
-                : "-"
-            }
-            sub={`${s.winners}W / ${s.losers}L stocks`}
-          />
-          <MiniStat label="With trades" value={String(s.withTrades)} />
-          <MiniStat label="No trade" value={String(noTradeCount)} />
-          <MiniStat label="Errors" value={String(s.errors)} />
+        {/* Overall summary — same chips as before + capital / profit / loss */}
+        <div>
+          <p className="mb-2 text-[10px] font-medium tracking-wide text-neutral-500 uppercase">
+            Overall
+          </p>
+          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+            <MiniStat
+              label="Combined P&L"
+              value={formatMoney(s.totalPnl)}
+              strong={s.totalPnl >= 0}
+            />
+            <MiniStat
+              label="Win %"
+              value={
+                s.withTrades
+                  ? `${((s.winners / s.withTrades) * 100).toFixed(0)}%`
+                  : "-"
+              }
+              sub={`${s.winners}W / ${s.losers}L stocks`}
+            />
+            <MiniStat label="With trades" value={String(s.withTrades)} />
+            <MiniStat label="No trade" value={String(noTradeCount)} />
+            <MiniStat label="Errors" value={String(s.errors)} />
+          </div>
+          <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+            <MiniStat
+              label="Capital used"
+              value={formatMoney(moneyTotals.capitalUsed)}
+              sub="sum of entry capital across all trades"
+            />
+            <MiniStat
+              label="Profit made"
+              value={formatMoney(moneyTotals.grossProfit)}
+              sub="sum of winning trades"
+              strong
+            />
+            <MiniStat
+              label="Loss made"
+              value={formatMoney(moneyTotals.grossLoss)}
+              sub="sum of losing trades"
+            />
+          </div>
         </div>
+
+        {/* Per-day summary — same layout as overall */}
+        {daySummaries.length > 0 && (
+          <div className="space-y-3 border-t border-neutral-100 pt-4">
+            <p className="text-[10px] font-medium tracking-wide text-neutral-500 uppercase">
+              Each day
+              <span className="ml-2 font-normal normal-case text-neutral-400">
+                ({daySummaries.length} session day
+                {daySummaries.length === 1 ? "" : "s"} · entry day IST)
+              </span>
+            </p>
+            <div className="space-y-3">
+              {daySummaries.map((d) => (
+                <div
+                  key={d.date}
+                  className="rounded-2xl border border-neutral-200 bg-neutral-50/60 p-3"
+                >
+                  <p className="mb-2 text-sm font-semibold tracking-tight">
+                    {formatIstDate(d.date)}
+                    <span className="ml-2 text-xs font-normal text-neutral-400">
+                      {d.totalTrades} trade{d.totalTrades === 1 ? "" : "s"}
+                    </span>
+                  </p>
+                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
+                    <MiniStat
+                      label="Combined P&L"
+                      value={formatMoney(d.combinedPnl)}
+                      strong={d.combinedPnl >= 0}
+                    />
+                    <MiniStat
+                      label="Win %"
+                      value={
+                        d.withTrades ? `${d.winPct.toFixed(0)}%` : "-"
+                      }
+                      sub={`${d.winners}W / ${d.losers}L stocks`}
+                    />
+                    <MiniStat
+                      label="With trades"
+                      value={String(d.withTrades)}
+                    />
+                    <MiniStat label="No trade" value={String(d.noTrade)} />
+                    <MiniStat label="Errors" value={String(d.errors)} />
+                  </div>
+                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
+                    <MiniStat
+                      label="Capital used"
+                      value={formatMoney(d.capitalUsed)}
+                    />
+                    <MiniStat
+                      label="Profit made"
+                      value={formatMoney(d.grossProfit)}
+                      strong
+                    />
+                    <MiniStat
+                      label="Loss made"
+                      value={formatMoney(d.grossLoss)}
+                    />
+                  </div>
+                </div>
+              ))}
+            </div>
+          </div>
+        )}
 
         {/* Filters */}
         <div className="flex flex-wrap gap-2">
@@ -541,13 +722,21 @@ function MiniStat({
   label,
   value,
   sub,
+  strong,
 }: {
   label: string;
   value: string;
   sub?: string;
+  strong?: boolean;
 }) {
   return (
-    <div className="rounded-xl border border-neutral-200 px-3 py-2">
+    <div
+      className={`rounded-xl border px-3 py-2 ${
+        strong
+          ? "border-neutral-900 bg-white"
+          : "border-neutral-200 bg-white"
+      }`}
+    >
       <p className="text-[10px] font-medium tracking-wide text-neutral-500 uppercase">
         {label}
       </p>
@@ -557,6 +746,26 @@ function MiniStat({
       {sub && <p className="text-[10px] text-neutral-500">{sub}</p>}
     </div>
   );
+}
+
+function istDayKey(ms: number): string {
+  const d = new Date(ms + 5.5 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 10);
+}
+
+function formatIstDate(ymd: string): string {
+  try {
+    const [y, m, d] = ymd.split("-").map(Number);
+    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-IN", {
+      weekday: "short",
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+  } catch {
+    return ymd;
+  }
 }
 
 function csvEscape(s: string) {

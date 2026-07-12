@@ -31,6 +31,8 @@ export async function POST(req: NextRequest) {
       initialCapital = 100000,
       positionSizePct = 100,
       oneTradePerDay = true,
+      entryTimeWindows,
+      maxRiskPerTrade,
       tradeInstrument = "options_atm",
       options,
       upstoxAccessToken,
@@ -51,6 +53,8 @@ export async function POST(req: NextRequest) {
       initialCapital?: number;
       positionSizePct?: number;
       oneTradePerDay?: boolean;
+      entryTimeWindows?: BacktestRequest["entryTimeWindows"];
+      maxRiskPerTrade?: BacktestRequest["maxRiskPerTrade"];
       tradeInstrument?: TradeInstrument;
       options?: BacktestRequest["options"];
       upstoxAccessToken?: string;
@@ -110,6 +114,8 @@ export async function POST(req: NextRequest) {
             initialCapital,
             positionSizePct,
             oneTradePerDay,
+            entryTimeWindows,
+            maxRiskPerTrade,
             tradeInstrument,
             options,
             upstoxAccessToken,

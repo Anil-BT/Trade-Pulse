@@ -47,6 +47,7 @@ export function TradesTable({ trades }: { trades: Trade[] }) {
             )}
             <th className="px-3 py-3 font-medium text-right">P&amp;L</th>
             <th className="px-3 py-3 font-medium text-right">%</th>
+            <th className="px-3 py-3 font-medium">Exit reason</th>
           </tr>
         </thead>
         <tbody>
@@ -108,6 +109,13 @@ export function TradesTable({ trades }: { trades: Trade[] }) {
                 </td>
                 <td className="px-3 py-3 text-right tabular-nums text-neutral-600">
                   {formatPct(t.pnlPct)}
+                </td>
+                <td className="px-3 py-3 text-xs whitespace-nowrap text-neutral-500">
+                  {t.exitReason === "max_risk"
+                    ? "Max risk stop"
+                    : t.exitReason === "eod"
+                      ? "End of data"
+                      : "Strategy"}
                 </td>
               </tr>
             );

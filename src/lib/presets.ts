@@ -112,8 +112,13 @@ export const PRESET_OR_EMA20_FIB_R3: StrategyConfig = {
 };
 
 /**
- * Entry: close > 1st 5m high AND > EMA20 AND > Fib R3 AND > previous day high
+ * Entry (breakout):
+ *  1) Trend filter: close > EMA20
+ *  2) Structure filters: close > OR high, Fib R3, and PDH (all three levels cleared)
+ *  3) Trigger: close **crosses above** breakout high = max(OR high, Fib R3, PDH)
+ *     → only the breakout bar, not every bar while already above
  * Exit: close < EMA20
+ * Use on 5m; OR period = 1 = first session bar.
  */
 export const PRESET_OR_EMA20_FIB_R3_PDH: StrategyConfig = {
   name: "OR + EMA20 + Fib R3 + PDH",
@@ -124,13 +129,13 @@ export const PRESET_OR_EMA20_FIB_R3_PDH: StrategyConfig = {
       id: "e1",
       left: "close",
       op: "gt",
-      right: { indicator: "OPENING_RANGE_HIGH", period: 1 },
+      right: { indicator: "EMA", period: 20 },
     },
     {
       id: "e2",
       left: "close",
       op: "gt",
-      right: { indicator: "EMA", period: 20 },
+      right: { indicator: "OPENING_RANGE_HIGH", period: 1 },
     },
     {
       id: "e3",
@@ -143,6 +148,12 @@ export const PRESET_OR_EMA20_FIB_R3_PDH: StrategyConfig = {
       left: "close",
       op: "gt",
       right: { indicator: "PREV_DAY_HIGH", period: 1 },
+    },
+    {
+      id: "e5",
+      left: "close",
+      op: "cross_above",
+      right: { indicator: "BREAKOUT_HIGH", period: 1 },
     },
   ],
   exit: [

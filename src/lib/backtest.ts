@@ -15,6 +15,8 @@ import type {
   Candle,
   CompareOperand,
   Condition,
+  DaySummary,
+  EntryTimeWindow,
   EquityPoint,
   IndicatorType,
   OptionsTradeSettings,
@@ -26,6 +28,46 @@ import type {
 function sessionDayKey(timeMs: number): string {
   const d = new Date(timeMs + 5.5 * 60 * 60 * 1000);
   return d.toISOString().slice(0, 10);
+}
+
+/** Minutes from midnight IST. */
+function istMinutesFromMidnight(timeMs: number): number {
+  const d = new Date(timeMs + 5.5 * 60 * 60 * 1000);
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+
+function parseHmToMinutes(hm: string): number | null {
+  const m = /^(\d{1,2}):(\d{2})$/.exec(String(hm || "").trim());
+  if (!m) return null;
+  const h = Number(m[1]);
+  const min = Number(m[2]);
+  if (!Number.isFinite(h) || !Number.isFinite(min) || h > 23 || min > 59) {
+    return null;
+  }
+  return h * 60 + min;
+}
+
+/**
+ * If no windows enabled → allow all day.
+ * Else entry time (IST) must fall in at least one enabled [start, end] inclusive.
+ */
+export function isInEntryTimeWindows(
+  timeMs: number,
+  windows: EntryTimeWindow[] | undefined
+): boolean {
+  if (!windows?.length) return true;
+  const active = windows.filter((w) => w.enabled);
+  if (!active.length) return true;
+
+  const mins = istMinutesFromMidnight(timeMs);
+  return active.some((w) => {
+    const a = parseHmToMinutes(w.start);
+    const b = parseHmToMinutes(w.end);
+    if (a == null || b == null) return false;
+    if (a <= b) return mins >= a && mins <= b;
+    // wraps midnight (unusual for NSE cash)
+    return mins >= a || mins <= b;
+  });
 }
 
 export interface BacktestExtras {
@@ -65,6 +107,8 @@ export function runBacktest(
   const pricer = extras.optionPricer;
   /** Skip new entries during indicator warmup bars (lookback fetch). */
   const entryNotBeforeMs = req.entryNotBeforeMs ?? 0;
+  const entryWindows = req.entryTimeWindows;
+  const maxRiskCap = resolveMaxRiskCap(req.maxRiskPerTrade, initialCapital);
 
   let cash = initialCapital;
   let positionQty = 0;
@@ -81,6 +125,7 @@ export function runBacktest(
 
   let equitySignals = 0;
   let skippedInsufficientCapital = 0;
+  let maxRiskStops = 0;
   let minLotCost = Infinity;
   let marketFills = 0;
   let modelFills = 0;
@@ -105,19 +150,37 @@ export function runBacktest(
         : 0;
     equityCurve.push({ time: c.time, equity: cash + positionQty * markUnit });
 
-    // EXIT - equity signal
-    if (positionQty > 0) {
+    // EXIT — max risk stop first (fill at stop, not worse close), then strategy
+    if (positionQty > 0 && i > entryBar) {
+      const stop = maxRiskStopHit(
+        c,
+        tradeInstrument,
+        entryPrice,
+        positionQty,
+        maxRiskCap,
+        markUnit
+      );
+      if (stop.hit) {
+        maxRiskStops += 1;
+        closePosition(i, c, "max_risk", stop.exitPx);
+      } else if (evalConditions(req.strategy.exit, exitLogic, i, seriesMap)) {
+        closePosition(i, c, "signal");
+      }
+    } else if (positionQty > 0) {
+      // entry bar: strategy exit only (no same-bar stop after close entry)
       if (evalConditions(req.strategy.exit, exitLogic, i, seriesMap)) {
-        closePosition(i, c);
+        closePosition(i, c, "signal");
       }
     }
 
     // ENTRY - equity signal, then execute equity or ATM option
     if (positionQty === 0) {
-      const inWindow = !entryNotBeforeMs || c.time >= entryNotBeforeMs;
+      const inDateWindow = !entryNotBeforeMs || c.time >= entryNotBeforeMs;
+      const inTimeWindow = isInEntryTimeWindows(c.time, entryWindows);
       const dayLimitHit = oneTradePerDay && tradesOnDay >= 1;
       if (
-        inWindow &&
+        inDateWindow &&
+        inTimeWindow &&
         !dayLimitHit &&
         evalConditions(req.strategy.entry, entryLogic, i, seriesMap)
       ) {
@@ -129,7 +192,7 @@ export function runBacktest(
 
   if (positionQty > 0) {
     const last = candles[candles.length - 1];
-    closePosition(candles.length - 1, last);
+    closePosition(candles.length - 1, last, "eod");
     equityCurve[equityCurve.length - 1] = { time: last.time, equity: cash };
   }
 
@@ -137,7 +200,9 @@ export function runBacktest(
     equitySignals,
     entriesTaken: trades.length,
     skippedInsufficientCapital,
+    maxRiskStops,
     minLotCost: Number.isFinite(minLotCost) ? minLotCost : undefined,
+    maxRiskCap: maxRiskCap ?? undefined,
     tradeInstrument,
     oneTradePerDay,
     lotSize: optCfg.lotSize,
@@ -149,11 +214,15 @@ export function runBacktest(
     lastBarTime: candles[candles.length - 1]?.time,
   });
 
+  const metrics = computeMetrics(trades, initialCapital, equityCurve);
+  const daySummaries = buildDaySummaries(trades);
+
   return {
     candles,
     trades,
     equityCurve,
-    metrics: computeMetrics(trades, initialCapital, equityCurve),
+    metrics,
+    daySummaries: daySummaries.length > 0 ? daySummaries : undefined,
     indicators,
     source: req.source,
     symbol: req.symbol,
@@ -262,12 +331,24 @@ export function runBacktest(
     tradesOnDay += 1;
   }
 
-  function closePosition(i: number, c: Candle) {
+  function closePosition(
+    i: number,
+    c: Candle,
+    exitReason: "signal" | "max_risk" | "eod" = "signal",
+    /** When set (max-risk stop), fill at this unit price so loss ≈ cap */
+    forcedExitPx?: number
+  ) {
     const spot = c.close;
     let exitPx: number;
     let exitSource: "market" | "model" | undefined;
 
-    if (tradeInstrument === "options_atm") {
+    if (forcedExitPx != null && Number.isFinite(forcedExitPx)) {
+      exitPx = Math.max(0, forcedExitPx);
+      exitSource =
+        tradeInstrument === "options_atm"
+          ? entryPremiumSource || "model"
+          : undefined;
+    } else if (tradeInstrument === "options_atm") {
       if (pricer) {
         const q = pricer.quote({
           timeMs: c.time,
@@ -295,6 +376,19 @@ export function runBacktest(
       exitPx = spot;
     }
 
+    // Final safety: never realize worse than -maxRiskCap on a max_risk exit
+    if (
+      exitReason === "max_risk" &&
+      maxRiskCap != null &&
+      positionQty > 0
+    ) {
+      const rawPnl = (exitPx - entryPrice) * positionQty;
+      if (rawPnl < -maxRiskCap) {
+        exitPx = entryPrice - maxRiskCap / positionQty;
+        exitPx = Math.max(0, exitPx);
+      }
+    }
+
     const pnl = (exitPx - entryPrice) * positionQty;
     const pnlPct = entryPrice > 0 ? ((exitPx - entryPrice) / entryPrice) * 100 : 0;
 
@@ -313,6 +407,7 @@ export function runBacktest(
       underlyingEntry: entryUnderlying,
       underlyingExit: spot,
       instrument: tradeInstrument,
+      exitReason,
     };
 
     if (tradeInstrument === "options_atm") {
@@ -359,6 +454,47 @@ function markUnitPrice(
   );
 }
 
+/**
+ * Detect max-risk stop and the fill unit price so realized loss ≈ cap
+ * (not the worse bar close after the stop was already blown through).
+ *
+ * Equity longs: use candle low vs stop price.
+ * Options: premium only available at bar close — clamp exit premium to stop.
+ */
+function maxRiskStopHit(
+  c: Candle,
+  instrument: TradeInstrument,
+  entryPrice: number,
+  qty: number,
+  maxRiskCap: number | null,
+  markUnit: number
+): { hit: boolean; exitPx?: number } {
+  if (maxRiskCap == null || qty <= 0 || entryPrice <= 0) {
+    return { hit: false };
+  }
+
+  // Unit price where PnL = -maxRiskCap
+  const stopUnit = entryPrice - maxRiskCap / qty;
+
+  if (instrument !== "options_atm") {
+    // Long equity: stop if bar traded down through stop level
+    if (c.low <= stopUnit || c.close <= stopUnit) {
+      // Fill at stop (or open if gapped through below stop)
+      const fill =
+        c.open < stopUnit ? Math.max(0, c.open) : Math.max(0, stopUnit);
+      return { hit: true, exitPx: fill };
+    }
+    return { hit: false };
+  }
+
+  // Options long premium: stop when mark premium implies loss >= cap
+  const unrealized = (markUnit - entryPrice) * qty;
+  if (unrealized <= -maxRiskCap) {
+    return { hit: true, exitPx: Math.max(0, stopUnit) };
+  }
+  return { hit: false };
+}
+
 function mergeOptions(
   settings: OptionsTradeSettings | undefined,
   enabled: boolean
@@ -375,11 +511,28 @@ function mergeOptions(
   };
 }
 
+function resolveMaxRiskCap(
+  cfg: BacktestRequest["maxRiskPerTrade"],
+  initialCapital: number
+): number | null {
+  if (!cfg?.enabled) return null;
+  if (cfg.mode === "amount") {
+    const a = Number(cfg.amount);
+    if (!Number.isFinite(a) || a <= 0) return null;
+    return a;
+  }
+  const pct = Number(cfg.pct);
+  if (!Number.isFinite(pct) || pct <= 0) return null;
+  return (initialCapital * Math.min(100, pct)) / 100;
+}
+
 function buildDiagnostics(d: {
   equitySignals: number;
   entriesTaken: number;
   skippedInsufficientCapital: number;
+  maxRiskStops?: number;
   minLotCost?: number;
+  maxRiskCap?: number;
   tradeInstrument: TradeInstrument;
   oneTradePerDay: boolean;
   lotSize: number;
@@ -399,6 +552,10 @@ function buildDiagnostics(d: {
             : ""
         }.`
       : "";
+  const riskCapNote =
+    d.maxRiskCap != null
+      ? ` Stop when loss >= Rs ${Math.round(d.maxRiskCap).toLocaleString("en-IN")}.`
+      : "";
 
   if (d.entriesTaken === 0 && d.equitySignals === 0) {
     note =
@@ -415,6 +572,8 @@ function buildDiagnostics(d: {
     note = `Equity signals fired ${d.equitySignals}x but capital was too low for 1 lot. Need ${need} (lot size ${d.lotSize}). Increase total capital.`;
   } else if (d.entriesTaken === 0 && d.equitySignals > 0) {
     note = `Equity signals fired ${d.equitySignals}x but no trades were opened. Check capital.`;
+  } else if ((d.maxRiskStops || 0) > 0) {
+    note = `${d.maxRiskStops} trade(s) exited on max-risk stop.${riskCapNote}`;
   } else if (d.skippedInsufficientCapital > 0) {
     note = `${d.skippedInsufficientCapital} signal(s) skipped - not enough free cash for the next 1-lot trade.`;
   } else if (d.tradeInstrument === "options_atm" && d.marketFills + d.modelFills > 0) {
@@ -434,9 +593,11 @@ function buildDiagnostics(d: {
     equitySignals: d.equitySignals,
     entriesTaken: d.entriesTaken,
     skippedInsufficientCapital: d.skippedInsufficientCapital,
+    maxRiskStops: d.maxRiskStops || 0,
     candleCount: d.candleCount,
     firstBarTime: d.firstBarTime,
     lastBarTime: d.lastBarTime,
+    maxRiskCap: d.maxRiskCap,
     minLotCost:
       d.minLotCost && Number.isFinite(d.minLotCost) ? d.minLotCost : undefined,
     note,
@@ -498,6 +659,7 @@ function collectOperand(
 function defaultPeriod(type: IndicatorType): number {
   if (type === "RSI") return 14;
   if (type === "OPENING_RANGE_HIGH" || type === "OPENING_RANGE_LOW") return 1;
+  if (type === "BREAKOUT_HIGH") return 1;
   if (type.startsWith("FIB_PIVOT")) return 1;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return 1;
   return 9;
@@ -553,6 +715,92 @@ function evalCondition(
   return false;
 }
 
+/** Aggregate trades by IST session day (entry day). */
+export function buildDaySummaries(trades: Trade[]): DaySummary[] {
+  type Acc = {
+    trades: number;
+    winners: number;
+    losers: number;
+    pnl: number;
+    grossProfit: number;
+    grossLoss: number;
+    capitalUsed: number;
+    maxRiskStops: number;
+    signalExits: number;
+    bestTrade: number;
+    worstTrade: number;
+  };
+
+  const byDay = new Map<string, Acc>();
+
+  for (const t of trades) {
+    const date = sessionDayKey(t.entryTime);
+    let row = byDay.get(date);
+    if (!row) {
+      row = {
+        trades: 0,
+        winners: 0,
+        losers: 0,
+        pnl: 0,
+        grossProfit: 0,
+        grossLoss: 0,
+        capitalUsed: 0,
+        maxRiskStops: 0,
+        signalExits: 0,
+        bestTrade: -Infinity,
+        worstTrade: Infinity,
+      };
+      byDay.set(date, row);
+    }
+    row.trades += 1;
+    if (t.pnl > 0) {
+      row.winners += 1;
+      row.grossProfit += t.pnl;
+    } else {
+      row.losers += 1;
+      row.grossLoss += Math.abs(t.pnl);
+    }
+    row.pnl += t.pnl;
+    row.capitalUsed += t.capitalUsed ?? t.entryPrice * t.qty;
+    if (t.exitReason === "max_risk") row.maxRiskStops += 1;
+    else if (t.exitReason === "signal" || !t.exitReason) row.signalExits += 1;
+    row.bestTrade = Math.max(row.bestTrade, t.pnl);
+    row.worstTrade = Math.min(row.worstTrade, t.pnl);
+  }
+
+  let cumulative = 0;
+  return [...byDay.entries()]
+    .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+    .map(([date, r]) => {
+      cumulative += r.pnl;
+      return {
+        date,
+        trades: r.trades,
+        winners: r.winners,
+        losers: r.losers,
+        winRate: r.trades ? (r.winners / r.trades) * 100 : 0,
+        pnl: Number(r.pnl.toFixed(2)),
+        grossProfit: Number(r.grossProfit.toFixed(2)),
+        grossLoss: Number(r.grossLoss.toFixed(2)),
+        avgPnl: r.trades ? Number((r.pnl / r.trades).toFixed(2)) : 0,
+        avgWin: r.winners ? Number((r.grossProfit / r.winners).toFixed(2)) : 0,
+        avgLoss: r.losers
+          ? Number((-(r.grossLoss / r.losers)).toFixed(2))
+          : 0,
+        bestTrade: Number.isFinite(r.bestTrade)
+          ? Number(r.bestTrade.toFixed(2))
+          : 0,
+        worstTrade: Number.isFinite(r.worstTrade)
+          ? Number(r.worstTrade.toFixed(2))
+          : 0,
+        capitalUsed: Number(r.capitalUsed.toFixed(2)),
+        maxRiskStops: r.maxRiskStops,
+        signalExits: r.signalExits,
+        cumulativePnl: Number(cumulative.toFixed(2)),
+      };
+    });
+}
+
 function computeMetrics(
   trades: Trade[],
   initialCapital: number,
@@ -605,6 +853,8 @@ function computeMetrics(
     avgPnl: totalTrades ? totalPnl / totalTrades : 0,
     avgWin,
     avgLoss,
+    grossProfit: Number(grossProfit.toFixed(2)),
+    grossLoss: Number(grossLoss.toFixed(2)),
     riskRewardRatio,
     maxDrawdown: maxDd,
     maxDrawdownPct: maxDdPct,

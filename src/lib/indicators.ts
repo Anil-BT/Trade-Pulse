@@ -266,14 +266,40 @@ export function computeIndicator(
       return previousDayLevel(candles, "high");
     case "PREV_DAY_LOW":
       return previousDayLevel(candles, "low");
+    case "BREAKOUT_HIGH":
+      // period = opening-range bars (default 1 = first 5m candle)
+      return breakoutHigh(candles, period || 1);
     default:
       return new Array(candles.length).fill(null);
   }
 }
 
+/**
+ * Session breakout level = max(OR high, Fib pivot R3, previous day high).
+ * Null until all components are available for that bar.
+ */
+export function breakoutHigh(
+  candles: Candle[],
+  orBars = 1
+): (number | null)[] {
+  const orh = openingRange(candles, orBars).high;
+  const r3 = fibonacciPivots(candles, "R3");
+  const pdh = previousDayLevel(candles, "high");
+  const out: (number | null)[] = new Array(candles.length).fill(null);
+  for (let i = 0; i < candles.length; i++) {
+    const a = orh[i];
+    const b = r3[i];
+    const c = pdh[i];
+    if (a == null || b == null || c == null) continue;
+    out[i] = Math.max(a, b, c);
+  }
+  return out;
+}
+
 export function indicatorKey(type: IndicatorType, period?: number): string {
   if (type === "OPENING_RANGE_HIGH") return `ORH_${period ?? 1}`;
   if (type === "OPENING_RANGE_LOW") return `ORL_${period ?? 1}`;
+  if (type === "BREAKOUT_HIGH") return `BOH_${period ?? 1}`;
   if (type.startsWith("FIB_PIVOT")) return type;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return type;
   return `${type}_${period ?? 9}`;

@@ -2,7 +2,7 @@
 
 import { useMemo, useState } from "react";
 import { ConditionBuilder } from "./ConditionBuilder";
-import { MetricsGrid } from "./MetricsGrid";
+import { BacktestReport } from "./BacktestReport";
 import {
   PerformanceCharts,
   filterTradesByChart,
@@ -16,6 +16,7 @@ import { defaultDateRange, uid } from "@/lib/format";
 import type {
   BacktestResult,
   DataSource,
+  EntryTimeWindow,
   Interval,
   OptionsTradeSettings,
   ScanReport,
@@ -38,6 +39,8 @@ const POPULAR = [
   { symbol: "INFY", label: "Infosys" },
   { symbol: "HDFCBANK", label: "HDFC Bank" },
   { symbol: "SBIN", label: "SBI" },
+  { symbol: "BAJFINANCE", label: "Bajaj Fin" },
+  { symbol: "TMCV", label: "Tata Motors" },
   { symbol: "NIFTYBEES", label: "Nifty BeES" },
 ];
 
@@ -58,6 +61,23 @@ export function BacktestApp() {
   /** Equity only: max % of total capital per trade (not used for F&O — always 1 lot) */
   const [equityAllocPct, setEquityAllocPct] = useState(25);
   const [oneTradePerDay, setOneTradePerDay] = useState(true);
+  /** Cap capital-at-risk per trade (equity notional / options premium) */
+  const [maxRiskEnabled, setMaxRiskEnabled] = useState(false);
+  const [maxRiskMode, setMaxRiskMode] = useState<"pct" | "amount">("pct");
+  const [maxRiskPct, setMaxRiskPct] = useState(2);
+  const [maxRiskAmount, setMaxRiskAmount] = useState(5000);
+  /** Limit new entries to up to 2 IST time windows */
+  const [limitEntryTimes, setLimitEntryTimes] = useState(false);
+  const [entryWindow1, setEntryWindow1] = useState<EntryTimeWindow>({
+    enabled: true,
+    start: "09:15",
+    end: "11:00",
+  });
+  const [entryWindow2, setEntryWindow2] = useState<EntryTimeWindow>({
+    enabled: true,
+    start: "13:15",
+    end: "15:15",
+  });
   const [tradeInstrument, setTradeInstrument] =
     useState<TradeInstrument>("options_atm");
   const [optionSide, setOptionSide] = useState<"CE" | "PE">("CE");
@@ -155,6 +175,24 @@ export function BacktestApp() {
     };
   }
 
+  function entryTimeWindowsPayload(): EntryTimeWindow[] | undefined {
+    if (!limitEntryTimes) return undefined;
+    return [
+      { ...entryWindow1 },
+      { ...entryWindow2 },
+    ];
+  }
+
+  function maxRiskPayload() {
+    if (!maxRiskEnabled) return undefined;
+    return {
+      enabled: true as const,
+      mode: maxRiskMode,
+      pct: maxRiskMode === "pct" ? maxRiskPct : undefined,
+      amount: maxRiskMode === "amount" ? maxRiskAmount : undefined,
+    };
+  }
+
   async function run() {
     setLoading(true);
     setError(null);
@@ -182,6 +220,8 @@ export function BacktestApp() {
           initialCapital: capital,
           positionSizePct: equityAllocPct,
           oneTradePerDay,
+          entryTimeWindows: entryTimeWindowsPayload(),
+          maxRiskPerTrade: maxRiskPayload(),
           tradeInstrument,
           options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
           ...credentialsPayload(),
@@ -239,6 +279,8 @@ export function BacktestApp() {
           initialCapital: capital,
           positionSizePct: equityAllocPct,
           oneTradePerDay,
+          entryTimeWindows: entryTimeWindowsPayload(),
+          maxRiskPerTrade: maxRiskPayload(),
           tradeInstrument,
           options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
           ...credentialsPayload(),
@@ -556,7 +598,7 @@ export function BacktestApp() {
               ))}
             </div>
 
-            <label className="mb-5 flex cursor-pointer items-start gap-3 rounded-2xl border border-neutral-200 bg-neutral-50/80 p-4">
+            <label className="mb-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-neutral-200 bg-neutral-50/80 p-4">
               <input
                 type="checkbox"
                 checked={oneTradePerDay}
@@ -573,6 +615,136 @@ export function BacktestApp() {
                 </span>
               </span>
             </label>
+
+            <div className="mb-4 rounded-2xl border border-neutral-200 bg-neutral-50/80 p-4">
+              <label className="flex cursor-pointer items-start gap-3">
+                <input
+                  type="checkbox"
+                  checked={maxRiskEnabled}
+                  onChange={(e) => setMaxRiskEnabled(e.target.checked)}
+                  className="mt-1 h-4 w-4 accent-black"
+                />
+                <span>
+                  <span className="block text-sm font-medium text-black">
+                    Max risk per trade (stop)
+                  </span>
+                  <span className="mt-0.5 block text-xs text-neutral-500">
+                    Hard stop: exit when loss reaches this limit. Equity uses
+                    the bar low so the fill is at the stop price (not a worse
+                    close). Options clamp premium so loss ≈ the cap.
+                  </span>
+                </span>
+              </label>
+
+              {maxRiskEnabled && (
+                <div className="mt-4 space-y-3 border-t border-neutral-200 pt-4">
+                  <div className="flex flex-wrap gap-2">
+                    {(
+                      [
+                        { id: "pct" as const, label: "% of capital" },
+                        { id: "amount" as const, label: "Fixed ₹" },
+                      ] as const
+                    ).map((m) => (
+                      <button
+                        key={m.id}
+                        type="button"
+                        onClick={() => setMaxRiskMode(m.id)}
+                        className={`rounded-full px-3 py-1.5 text-xs font-medium transition ${
+                          maxRiskMode === m.id
+                            ? "bg-black text-white"
+                            : "bg-white text-neutral-600 ring-1 ring-neutral-200 hover:ring-neutral-400"
+                        }`}
+                      >
+                        {m.label}
+                      </button>
+                    ))}
+                  </div>
+                  {maxRiskMode === "pct" ? (
+                    <Field label="Max loss (% of total capital)">
+                      <input
+                        type="number"
+                        min={0.1}
+                        max={100}
+                        step={0.1}
+                        value={maxRiskPct}
+                        onChange={(e) =>
+                          setMaxRiskPct(Math.max(0.1, Number(e.target.value) || 0.1))
+                        }
+                        className="field-input"
+                      />
+                    </Field>
+                  ) : (
+                    <Field label="Max loss (₹)">
+                      <input
+                        type="number"
+                        min={1}
+                        step={100}
+                        value={maxRiskAmount}
+                        onChange={(e) =>
+                          setMaxRiskAmount(
+                            Math.max(1, Number(e.target.value) || 1)
+                          )
+                        }
+                        className="field-input"
+                      />
+                    </Field>
+                  )}
+                  <p className="text-[11px] text-neutral-400">
+                    Stop ≈ −₹
+                    {Math.round(
+                      maxRiskMode === "pct"
+                        ? (capital * maxRiskPct) / 100
+                        : maxRiskAmount
+                    ).toLocaleString("en-IN")}{" "}
+                    MTM loss
+                    {tradeInstrument === "options_atm"
+                      ? " on option premium"
+                      : " on equity position"}
+                    .
+                  </p>
+                </div>
+              )}
+            </div>
+
+            <div className="mb-5 rounded-2xl border border-neutral-200 bg-neutral-50/80 p-4">
+              <label className="flex cursor-pointer items-start gap-3">
+                <input
+                  type="checkbox"
+                  checked={limitEntryTimes}
+                  onChange={(e) => setLimitEntryTimes(e.target.checked)}
+                  className="mt-1 h-4 w-4 accent-black"
+                />
+                <span>
+                  <span className="block text-sm font-medium text-black">
+                    Entry time windows (IST)
+                  </span>
+                  <span className="mt-0.5 block text-xs text-neutral-500">
+                    Only open new trades when the bar time falls in one of the
+                    two ranges below (e.g. morning + afternoon). Exits still
+                    work anytime.
+                  </span>
+                </span>
+              </label>
+
+              {limitEntryTimes && (
+                <div className="mt-4 space-y-3 border-t border-neutral-200 pt-4">
+                  <TimeWindowRow
+                    label="Window 1"
+                    window={entryWindow1}
+                    onChange={setEntryWindow1}
+                  />
+                  <TimeWindowRow
+                    label="Window 2"
+                    window={entryWindow2}
+                    onChange={setEntryWindow2}
+                  />
+                  <p className="text-[11px] text-neutral-400">
+                    NSE cash session is typically 09:15–15:30 IST. Uncheck a
+                    window to disable it.
+                  </p>
+                </div>
+              )}
+            </div>
 
             {tradeInstrument === "options_atm" && (
               <div className="space-y-4">
@@ -944,6 +1116,12 @@ export function BacktestApp() {
                         {result.diagnostics.skippedInsufficientCapital
                           ? ` · skipped (capital): ${result.diagnostics.skippedInsufficientCapital}`
                           : ""}
+                        {result.diagnostics.maxRiskStops
+                          ? ` · max-risk stops: ${result.diagnostics.maxRiskStops}`
+                          : ""}
+                        {result.diagnostics.maxRiskCap
+                          ? ` · stop −₹${Math.round(result.diagnostics.maxRiskCap).toLocaleString("en-IN")}`
+                          : ""}
                         {result.diagnostics.minLotCost
                           ? ` · ~₹${Math.ceil(result.diagnostics.minLotCost).toLocaleString("en-IN")}/lot`
                           : ""}
@@ -951,7 +1129,7 @@ export function BacktestApp() {
                     </div>
                   )}
                 </div>
-                <MetricsGrid metrics={result.metrics} />
+                <BacktestReport result={result} />
               </section>
 
               {/* Charts always visible after metrics for single-symbol runs */}
@@ -1037,6 +1215,48 @@ function Field({
       </span>
       {children}
     </label>
+  );
+}
+
+function TimeWindowRow({
+  label,
+  window,
+  onChange,
+}: {
+  label: string;
+  window: EntryTimeWindow;
+  onChange: (w: EntryTimeWindow) => void;
+}) {
+  return (
+    <div className="flex flex-wrap items-center gap-2 sm:gap-3">
+      <label className="flex items-center gap-2 text-xs font-medium text-neutral-700">
+        <input
+          type="checkbox"
+          checked={window.enabled}
+          onChange={(e) =>
+            onChange({ ...window, enabled: e.target.checked })
+          }
+          className="h-3.5 w-3.5 accent-black"
+        />
+        {label}
+      </label>
+      <input
+        type="time"
+        value={window.start}
+        disabled={!window.enabled}
+        onChange={(e) => onChange({ ...window, start: e.target.value })}
+        className="field-input w-auto py-1.5 text-sm disabled:opacity-40"
+      />
+      <span className="text-xs text-neutral-400">to</span>
+      <input
+        type="time"
+        value={window.end}
+        disabled={!window.enabled}
+        onChange={(e) => onChange({ ...window, end: e.target.value })}
+        className="field-input w-auto py-1.5 text-sm disabled:opacity-40"
+      />
+      <span className="text-[10px] text-neutral-400">IST</span>
+    </div>
   );
 }
 

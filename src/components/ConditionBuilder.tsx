@@ -25,6 +25,11 @@ const INDICATORS: { value: IndicatorType; label: string; defaultPeriod: number }
   { value: "FIB_PIVOT_S3", label: "Fib Pivot S3", defaultPeriod: 1 },
   { value: "PREV_DAY_HIGH", label: "Prev Day High", defaultPeriod: 1 },
   { value: "PREV_DAY_LOW", label: "Prev Day Low", defaultPeriod: 1 },
+  {
+    value: "BREAKOUT_HIGH",
+    label: "Breakout High (max OR / Fib R3 / PDH)",
+    defaultPeriod: 1,
+  },
 ];
 
 const OPS: { value: Comparator; label: string }[] = [
@@ -245,7 +250,8 @@ function OperandSelect({
             }
             className="w-16 rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-black"
             title={
-              value.indicator.startsWith("OPENING")
+              value.indicator.startsWith("OPENING") ||
+              value.indicator === "BREAKOUT_HIGH"
                 ? "Bars in opening range"
                 : "Period"
             }

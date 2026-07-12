@@ -89,14 +89,39 @@ export async function runBacktestJob(
     resolvedInstrumentKey = resolved.instrumentKey;
     symbol = resolved.tradingSymbol;
 
-    candles = await fetchUpstoxCandles({
-      instrumentKey: resolved.instrumentKey,
-      interval,
-      from: body.from,
-      to: body.to,
-      accessToken: upstoxToken,
-      lookbackDays: 10,
-    });
+    try {
+      candles = await fetchUpstoxCandles({
+        instrumentKey: resolved.instrumentKey,
+        interval,
+        from: body.from,
+        to: body.to,
+        accessToken: upstoxToken,
+        lookbackDays: 10,
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      // Stale ISIN / wrong static key → re-resolve from master and retry once
+      if (/UDAPI100011|Invalid Instrument key/i.test(msg)) {
+        const again = await resolveUpstoxInstrumentKey(symbol);
+        if (again.instrumentKey === resolved.instrumentKey) {
+          throw new Error(
+            `Upstox invalid instrument key for ${symbol} (${resolved.instrumentKey}). Try symbol alias (e.g. TATAMOTORS → TMCV) or paste full NSE_EQ|… key.`
+          );
+        }
+        resolvedInstrumentKey = again.instrumentKey;
+        symbol = again.tradingSymbol;
+        candles = await fetchUpstoxCandles({
+          instrumentKey: again.instrumentKey,
+          interval,
+          from: body.from,
+          to: body.to,
+          accessToken: upstoxToken,
+          lookbackDays: 10,
+        });
+      } else {
+        throw e;
+      }
+    }
   } else if (source === "dhan") {
     candles = await fetchDhanCandles({
       symbol,
@@ -270,7 +295,8 @@ function collect(
       ? 14
       : op.indicator.startsWith("FIB") ||
           op.indicator.startsWith("OPENING") ||
-          op.indicator.startsWith("PREV")
+          op.indicator.startsWith("PREV") ||
+          op.indicator === "BREAKOUT_HIGH"
         ? 1
         : 9);
   needed.set(indicatorKey(op.indicator, period), {
@@ -318,7 +344,8 @@ function val(
       ? 14
       : operand.indicator.startsWith("FIB") ||
           operand.indicator.startsWith("OPENING") ||
-          operand.indicator.startsWith("PREV")
+          operand.indicator.startsWith("PREV") ||
+          operand.indicator === "BREAKOUT_HIGH"
         ? 1
         : 9);
   return map.get(indicatorKey(operand.indicator, period))?.[i] ?? null;
