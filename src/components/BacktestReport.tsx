@@ -1,20 +1,24 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo } from "react";
 import type { BacktestResult, DaySummary, Trade } from "@/lib/types";
-import { formatMoney, formatPct, formatTime } from "@/lib/format";
+import { formatMoney, formatPct } from "@/lib/format";
+import { DayResultCalendar } from "./DayResultCalendar";
 
 /**
- * Full backtest report: overall + per-day summary cards on top, then detail table.
+ * Full backtest report: overall + calendar day summary.
+ * Day click filters the trades table below (via onDayFilterChange).
  */
-export function BacktestReport({ result }: { result: BacktestResult }) {
+export function BacktestReport({
+  result,
+  dayFilter = null,
+  onDayFilterChange,
+}: {
+  result: BacktestResult;
+  dayFilter?: string | null;
+  onDayFilterChange?: (date: string | null) => void;
+}) {
   const m = result.metrics;
-  const [expanded, setExpanded] = useState<string | null>(null);
-
-  const tradesByDay = useMemo(
-    () => groupTradesByDay(result.trades),
-    [result.trades]
-  );
 
   /** Prefer server daySummaries; rebuild client-side if missing */
   const days = useMemo(() => {
@@ -25,15 +29,11 @@ export function BacktestReport({ result }: { result: BacktestResult }) {
   const profitableDays = days.filter((d) => d.pnl > 0).length;
   const losingDays = days.filter((d) => d.pnl < 0).length;
   const flatDays = days.filter((d) => d.pnl === 0).length;
-  const bestDay = days.reduce<DaySummary | null>(
-    (b, d) => (!b || d.pnl > b.pnl ? d : b),
-    null
-  );
-  const worstDay = days.reduce<DaySummary | null>(
-    (b, d) => (!b || d.pnl < b.pnl ? d : b),
-    null
-  );
-  const maxAbsDayPnl = Math.max(1, ...days.map((d) => Math.abs(d.pnl)));
+
+  function selectDay(date: string) {
+    const next = dayFilter === date ? null : date;
+    onDayFilterChange?.(next);
+  }
 
   const expectancy =
     m.totalTrades > 0
@@ -122,7 +122,7 @@ export function BacktestReport({ result }: { result: BacktestResult }) {
           />
         </div>
 
-        {/* Per-day summary cards — always on top when we have days */}
+        {/* Per-day calendar — green / red cells by month */}
         {days.length > 0 && (
           <div>
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
@@ -130,149 +130,48 @@ export function BacktestReport({ result }: { result: BacktestResult }) {
                 Each day
               </p>
               <p className="text-[11px] text-neutral-400">
-                {profitableDays} green · {losingDays} red
-                {flatDays ? ` · ${flatDays} flat` : ""}
-                {bestDay
-                  ? ` · best ${formatIstDateShort(bestDay.date)} ${formatMoney(bestDay.pnl)}`
-                  : ""}
-                {worstDay && days.length > 1
-                  ? ` · worst ${formatIstDateShort(worstDay.date)} ${formatMoney(worstDay.pnl)}`
-                  : ""}
+                <span className="mr-1.5 inline-block h-2.5 w-2.5 rounded-sm bg-emerald-50 ring-1 ring-emerald-200" />
+                Profit
+                <span className="ml-2 mr-1.5 inline-block h-2.5 w-2.5 rounded-sm bg-red-50 ring-1 ring-red-200" />
+                Loss
+                <span className="ml-2">
+                  · {profitableDays} green · {losingDays} red
+                  {flatDays ? ` · ${flatDays} flat` : ""}
+                </span>
               </p>
             </div>
 
-            <div className="grid grid-cols-1 gap-2 sm:grid-cols-2 lg:grid-cols-3 xl:grid-cols-4">
-              {days.map((d) => {
-                const selected = expanded === d.date;
-                return (
-                  <button
-                    key={d.date}
-                    type="button"
-                    onClick={() =>
-                      setExpanded((cur) => (cur === d.date ? null : d.date))
-                    }
-                    className={`rounded-2xl border p-3 text-left transition ${
-                      selected
-                        ? "border-black bg-neutral-50 shadow-sm"
-                        : "border-neutral-200 bg-white hover:border-neutral-400"
-                    }`}
-                  >
-                    <div className="flex items-start justify-between gap-2">
-                      <div>
-                        <p className="text-sm font-semibold tracking-tight">
-                          {formatIstDate(d.date)}
-                        </p>
-                        <p className="mt-0.5 text-[11px] text-neutral-400">
-                          {d.trades} trade{d.trades === 1 ? "" : "s"} ·{" "}
-                          {d.winners}W/{d.losers}L · {d.winRate.toFixed(0)}%
-                        </p>
-                      </div>
-                      <p
-                        className={`text-sm font-semibold tabular-nums ${
-                          d.pnl >= 0 ? "text-black" : "text-neutral-500"
-                        }`}
-                      >
-                        {formatMoney(d.pnl)}
-                      </p>
-                    </div>
-                    <div className="mt-2 h-1.5 overflow-hidden rounded-full bg-neutral-100">
-                      <div
-                        className={`h-full rounded-full ${
-                          d.pnl >= 0 ? "bg-neutral-900" : "bg-neutral-400"
-                        }`}
-                        style={{
-                          width: `${Math.min(100, (Math.abs(d.pnl) / maxAbsDayPnl) * 100)}%`,
-                        }}
-                      />
-                    </div>
-                    <div className="mt-2 flex flex-wrap gap-x-3 gap-y-0.5 text-[10px] text-neutral-500">
-                      <span>
-                        capital {formatMoney(d.capitalUsed)}
-                      </span>
-                      <span className="text-black">
-                        profit {formatMoney(d.grossProfit ?? 0)}
-                      </span>
-                      <span>
-                        loss {formatMoney(d.grossLoss ?? 0)}
-                      </span>
-                      <span>avg {formatMoney(d.avgPnl)}</span>
-                      {d.maxRiskStops > 0 && (
-                        <span className="font-medium text-neutral-700">
-                          {d.maxRiskStops} stop
-                          {d.maxRiskStops === 1 ? "" : "s"}
-                        </span>
-                      )}
-                      <span className="text-neutral-400">
-                        cum {formatMoney(d.cumulativePnl)}
-                      </span>
-                    </div>
-                    <p className="mt-1.5 text-[10px] text-neutral-400">
-                      {selected ? "Hide trades ▴" : "Show trades ▾"}
-                    </p>
-                  </button>
-                );
-              })}
-            </div>
-
-            {/* Expanded day trades under the cards */}
-            {expanded && (tradesByDay.get(expanded)?.length ?? 0) > 0 && (
-              <div className="mt-3 overflow-x-auto rounded-2xl border border-neutral-200 bg-white">
-                <div className="border-b border-neutral-100 px-3 py-2 text-xs font-medium text-neutral-600">
-                  Trades · {formatIstDate(expanded)}
-                </div>
-                <table className="w-full min-w-[640px] text-left text-xs">
-                  <thead>
-                    <tr className="border-b border-neutral-100 text-[10px] tracking-wide text-neutral-400 uppercase">
-                      <th className="px-2.5 py-2 font-medium">#</th>
-                      <th className="px-2.5 py-2 font-medium">Entry</th>
-                      <th className="px-2.5 py-2 font-medium">Exit</th>
-                      <th className="px-2.5 py-2 font-medium text-right">In</th>
-                      <th className="px-2.5 py-2 font-medium text-right">Out</th>
-                      <th className="px-2.5 py-2 font-medium text-right">
-                        P&amp;L
-                      </th>
-                      <th className="px-2.5 py-2 font-medium">Reason</th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {(tradesByDay.get(expanded) || []).map((t, i) => (
-                      <tr
-                        key={`${t.entryTime}-${i}`}
-                        className="border-b border-neutral-50 last:border-0"
-                      >
-                        <td className="px-2.5 py-1.5 text-neutral-400">
-                          {i + 1}
-                        </td>
-                        <td className="px-2.5 py-1.5 whitespace-nowrap">
-                          {formatTime(t.entryTime)}
-                        </td>
-                        <td className="px-2.5 py-1.5 whitespace-nowrap">
-                          {formatTime(t.exitTime)}
-                        </td>
-                        <td className="px-2.5 py-1.5 text-right tabular-nums">
-                          {t.entryPrice.toFixed(2)}
-                        </td>
-                        <td className="px-2.5 py-1.5 text-right tabular-nums">
-                          {t.exitPrice.toFixed(2)}
-                        </td>
-                        <td
-                          className={`px-2.5 py-1.5 text-right tabular-nums font-medium ${
-                            t.pnl >= 0 ? "text-black" : "text-neutral-500"
-                          }`}
-                        >
-                          {formatMoney(t.pnl)}
-                        </td>
-                        <td className="px-2.5 py-1.5 text-neutral-500">
-                          {t.exitReason === "max_risk"
-                            ? "Max risk"
-                            : t.exitReason === "eod"
-                              ? "EOD"
-                              : "Strategy"}
-                        </td>
-                      </tr>
-                    ))}
-                  </tbody>
-                </table>
+            <DayResultCalendar
+              mode="single"
+              selectedDate={dayFilter}
+              onDayClick={onDayFilterChange ? selectDay : undefined}
+              days={days.map((d) => ({
+                date: d.date,
+                pnl: d.pnl,
+                trades: d.trades,
+                winners: d.winners,
+                losers: d.losers,
+                winPct: d.winRate,
+                capitalUsed: d.capitalUsed,
+                grossProfit: d.grossProfit,
+                grossLoss: d.grossLoss,
+              }))}
+            />
+            {dayFilter && onDayFilterChange && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs text-neutral-600">
+                <span>
+                  Filtering trades table to{" "}
+                  <strong className="text-neutral-900">
+                    {formatIstDate(dayFilter)}
+                  </strong>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => onDayFilterChange(null)}
+                  className="rounded-full bg-black px-3 py-1 text-[11px] font-medium text-white hover:bg-neutral-800"
+                >
+                  Clear day filter
+                </button>
               </div>
             )}
           </div>
@@ -384,9 +283,7 @@ export function BacktestReport({ result }: { result: BacktestResult }) {
                   <tr
                     key={d.date}
                     className="cursor-pointer border-b border-neutral-100 hover:bg-neutral-50"
-                    onClick={() =>
-                      setExpanded((cur) => (cur === d.date ? null : d.date))
-                    }
+                    onClick={() => selectDay(d.date)}
                   >
                     <td className="px-3 py-2.5 font-medium whitespace-nowrap">
                       {formatIstDate(d.date)}
@@ -511,17 +408,6 @@ function MiniStat({
   );
 }
 
-function groupTradesByDay(trades: Trade[]): Map<string, Trade[]> {
-  const map = new Map<string, Trade[]>();
-  for (const t of trades) {
-    const d = istDay(t.entryTime);
-    const list = map.get(d) || [];
-    list.push(t);
-    map.set(d, list);
-  }
-  return map;
-}
-
 function istDay(ms: number): string {
   const d = new Date(ms + 5.5 * 60 * 60 * 1000);
   return d.toISOString().slice(0, 10);
@@ -625,15 +511,3 @@ function formatIstDate(ymd: string): string {
   }
 }
 
-function formatIstDateShort(ymd: string): string {
-  try {
-    const [y, m, d] = ymd.split("-").map(Number);
-    return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-IN", {
-      day: "2-digit",
-      month: "short",
-      timeZone: "UTC",
-    });
-  } catch {
-    return ymd;
-  }
-}

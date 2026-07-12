@@ -13,6 +13,7 @@ import {
   tradeMatchesChartFilter,
   type ChartBarFilter,
 } from "./PerformanceCharts";
+import { DayResultCalendar } from "./DayResultCalendar";
 
 export function ScanReportView({
   report,
@@ -27,6 +28,8 @@ export function ScanReportView({
   );
   const [expanded, setExpanded] = useState<Record<string, boolean>>({});
   const [chartFilter, setChartFilter] = useState<ChartBarFilter | null>(null);
+  /** IST YYYY-MM-DD — filters stock list + trades (like chart bar click) */
+  const [dayFilter, setDayFilter] = useState<string | null>(null);
 
   const noTradeCount = report.rows.filter((r) => r.status === "no_trades").length;
 
@@ -141,18 +144,24 @@ export function ScanReportView({
         ? report.rows
         : report.rows.filter((r) => r.status === filter);
 
-    if (!chartFilter) return base;
+    if (!chartFilter && !dayFilter) return base;
 
-    // Only rows that have trades matching the clicked chart bar
+    // Only rows that have trades matching chart bar and/or calendar day
     return base
       .map((r) => {
         if (!r.tradeList?.length) return null;
-        const matched = r.tradeList.filter((t) =>
-          tradeMatchesChartFilter(
-            scanTradeToTrade(t, r.symbol, report.tradeInstrument),
-            chartFilter
-          )
-        );
+        let matched = r.tradeList;
+        if (dayFilter) {
+          matched = matched.filter((t) => istDayKey(t.entryTime) === dayFilter);
+        }
+        if (chartFilter) {
+          matched = matched.filter((t) =>
+            tradeMatchesChartFilter(
+              scanTradeToTrade(t, r.symbol, report.tradeInstrument),
+              chartFilter
+            )
+          );
+        }
         if (!matched.length) return null;
         const totalPnl = matched.reduce((s, t) => s + t.pnl, 0);
         const wins = matched.filter((t) => t.pnl > 0).length;
@@ -165,17 +174,23 @@ export function ScanReportView({
         } as ScanRow;
       })
       .filter(Boolean) as ScanRow[];
-  }, [report.rows, report.tradeInstrument, filter, chartFilter]);
+  }, [report.rows, report.tradeInstrument, filter, chartFilter, dayFilter]);
 
-  // Auto-expand symbols that match when a chart filter is active
+  // Auto-expand symbols when a chart/day filter is active
   const effectiveExpanded = useMemo(() => {
-    if (!chartFilter) return expanded;
+    if (!chartFilter && !dayFilter) return expanded;
     const next: Record<string, boolean> = { ...expanded };
     for (const r of rows) {
       if (r.tradeList?.length) next[r.symbol] = true;
     }
     return next;
-  }, [chartFilter, rows, expanded]);
+  }, [chartFilter, dayFilter, rows, expanded]);
+
+  function selectDay(date: string) {
+    setDayFilter((cur) => (cur === date ? null : date));
+    // Prefer one visual filter at a time for clarity
+    setChartFilter(null);
+  }
 
   function toggle(symbol: string) {
     setExpanded((prev) => ({ ...prev, [symbol]: !prev[symbol] }));
@@ -354,66 +369,63 @@ export function ScanReportView({
           </div>
         </div>
 
-        {/* Per-day summary — same layout as overall */}
+        {/* Per-day calendar — green profit / red loss boxes by month */}
         {daySummaries.length > 0 && (
           <div className="space-y-3 border-t border-neutral-100 pt-4">
-            <p className="text-[10px] font-medium tracking-wide text-neutral-500 uppercase">
-              Each day
-              <span className="ml-2 font-normal normal-case text-neutral-400">
-                ({daySummaries.length} session day
-                {daySummaries.length === 1 ? "" : "s"} · entry day IST)
-              </span>
-            </p>
-            <div className="space-y-3">
-              {daySummaries.map((d) => (
-                <div
-                  key={d.date}
-                  className="rounded-2xl border border-neutral-200 bg-neutral-50/60 p-3"
-                >
-                  <p className="mb-2 text-sm font-semibold tracking-tight">
-                    {formatIstDate(d.date)}
-                    <span className="ml-2 text-xs font-normal text-neutral-400">
-                      {d.totalTrades} trade{d.totalTrades === 1 ? "" : "s"}
-                    </span>
-                  </p>
-                  <div className="grid grid-cols-2 gap-2 sm:grid-cols-3 lg:grid-cols-5">
-                    <MiniStat
-                      label="Combined P&L"
-                      value={formatMoney(d.combinedPnl)}
-                      strong={d.combinedPnl >= 0}
-                    />
-                    <MiniStat
-                      label="Win %"
-                      value={
-                        d.withTrades ? `${d.winPct.toFixed(0)}%` : "-"
-                      }
-                      sub={`${d.winners}W / ${d.losers}L stocks`}
-                    />
-                    <MiniStat
-                      label="With trades"
-                      value={String(d.withTrades)}
-                    />
-                    <MiniStat label="No trade" value={String(d.noTrade)} />
-                    <MiniStat label="Errors" value={String(d.errors)} />
-                  </div>
-                  <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-3">
-                    <MiniStat
-                      label="Capital used"
-                      value={formatMoney(d.capitalUsed)}
-                    />
-                    <MiniStat
-                      label="Profit made"
-                      value={formatMoney(d.grossProfit)}
-                      strong
-                    />
-                    <MiniStat
-                      label="Loss made"
-                      value={formatMoney(d.grossLoss)}
-                    />
-                  </div>
-                </div>
-              ))}
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <p className="text-[10px] font-medium tracking-wide text-neutral-500 uppercase">
+                Each day
+                <span className="ml-2 font-normal normal-case text-neutral-400">
+                  ({daySummaries.length} session day
+                  {daySummaries.length === 1 ? "" : "s"} · calendar · IST)
+                </span>
+              </p>
+              <p className="text-[10px] text-neutral-400">
+                <span className="mr-2 inline-block h-2.5 w-2.5 rounded-sm bg-emerald-50 ring-1 ring-emerald-200" />
+                Profit day
+                <span className="ml-3 mr-2 inline-block h-2.5 w-2.5 rounded-sm bg-red-50 ring-1 ring-red-200" />
+                Loss day
+              </p>
             </div>
+            <DayResultCalendar
+              mode="scan"
+              selectedDate={dayFilter}
+              onDayClick={selectDay}
+              days={daySummaries.map((d) => ({
+                date: d.date,
+                pnl: d.combinedPnl,
+                trades: d.totalTrades,
+                withTrades: d.withTrades,
+                winners: d.winners,
+                losers: d.losers,
+                winPct: d.winPct,
+                noTrade: d.noTrade,
+                errors: d.errors,
+                capitalUsed: d.capitalUsed,
+                grossProfit: d.grossProfit,
+                grossLoss: d.grossLoss,
+              }))}
+            />
+            {dayFilter && (
+              <div className="mt-2 flex flex-wrap items-center gap-2 rounded-xl border border-neutral-200 bg-neutral-50 px-3 py-2 text-xs text-neutral-600">
+                <span>
+                  Filtering list to trades on{" "}
+                  <strong className="text-neutral-900">
+                    {formatDayLabel(dayFilter)}
+                  </strong>
+                </span>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setDayFilter(null);
+                    setChartFilter(null);
+                  }}
+                  className="rounded-full bg-black px-3 py-1 text-[11px] font-medium text-white hover:bg-neutral-800"
+                >
+                  Clear day filter
+                </button>
+              </div>
+            )}
           </div>
         )}
 
@@ -451,7 +463,12 @@ export function ScanReportView({
         <PerformanceCharts
           trades={combinedTrades}
           title="Combined F&O charts"
-          subtitle={`All symbols with trades · ${combinedTrades.length} total trade(s) · 15-min slots on latest day + hold time · click a bar to filter list below`}
+          subtitle={
+            dayFilter
+              ? `All symbols · ${combinedTrades.length} trade(s) · charts scoped to ${formatDayLabel(dayFilter)} · click a bar to filter list below`
+              : `All symbols with trades · ${combinedTrades.length} total trade(s) · 15-min slots + hold time across all days · click a bar to filter list below`
+          }
+          selectedDay={dayFilter}
           activeFilter={chartFilter}
           onFilterChange={setChartFilter}
         />
@@ -460,8 +477,13 @@ export function ScanReportView({
       {/* Responsive stock list */}
       <div className="border-b border-neutral-100 px-4 py-2 sm:px-6">
         <p className="text-xs text-neutral-500">
-          {chartFilter
-            ? `Showing ${rows.length} symbol(s) matching chart selection`
+          {dayFilter || chartFilter
+            ? `Showing ${rows.length} symbol(s) matching ${[
+                dayFilter ? `day ${formatDayLabel(dayFilter)}` : "",
+                chartFilter ? "chart selection" : "",
+              ]
+                .filter(Boolean)
+                .join(" · ")}`
             : `${rows.length} symbol(s) in list`}
         </p>
       </div>
@@ -753,11 +775,10 @@ function istDayKey(ms: number): string {
   return d.toISOString().slice(0, 10);
 }
 
-function formatIstDate(ymd: string): string {
+function formatDayLabel(ymd: string): string {
   try {
     const [y, m, d] = ymd.split("-").map(Number);
     return new Date(Date.UTC(y, m - 1, d)).toLocaleDateString("en-IN", {
-      weekday: "short",
       day: "2-digit",
       month: "short",
       year: "numeric",
@@ -767,6 +788,7 @@ function formatIstDate(ymd: string): string {
     return ymd;
   }
 }
+
 
 function csvEscape(s: string) {
   if (!s) return "";

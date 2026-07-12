@@ -32,8 +32,13 @@ Open [Firebase Console](https://console.firebase.google.com/) → your **tradepu
 rules_version = '2';
 service cloud.firestore {
   match /databases/{database}/documents {
-    // Each user only reads/writes their own strategies
+    // Saved strategies
     match /users/{userId}/strategies/{strategyId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
+    }
+    // Day-level backtest cache (same strategy + day → skip broker)
+    match /users/{userId}/dayCaches/{docId} {
       allow read, write: if request.auth != null
         && request.auth.uid == userId;
     }
@@ -51,6 +56,14 @@ users/{uid}/strategies/{strategyId}
   strategy: { name, entry[], exit[], ... }
   createdAt: number
   updatedAt: number
+
+users/{uid}/dayCaches/{fingerprint_YYYY-MM-DD}
+  fingerprint: string   // strategy + symbol + settings hash
+  day: string           // YYYY-MM-DD
+  symbol, interval, source
+  trades: Trade[]
+  candles: Candle[]     // that session only (optional/light)
+  savedAt: number
 ```
 
 ### Storage (optional — only if you need files later)

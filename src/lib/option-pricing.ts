@@ -92,8 +92,8 @@ export async function createOptionPricer(opts: {
       if (c) needed.set(c.instrumentKey, c);
     }
 
-    // Cap fetches to avoid rate limits
-    const keys = [...needed.values()].slice(0, 24);
+    // Cap option history fetches — each hits Upstox; model is fine for rest
+    const keys = [...needed.values()].slice(0, 8);
     for (const c of keys) {
       try {
         const oc = await fetchUpstoxCandles({
@@ -108,9 +108,9 @@ export async function createOptionPricer(opts: {
           marketContractsUsed += 1;
         }
       } catch {
-        // fall back to model for this contract
+        // fall back to model for this contract (incl. rate limit)
       }
-      await sleep(80);
+      await sleep(450);
     }
   }
 

@@ -21,6 +21,7 @@ const SESSION_END_MIN = 15 * 60 + 30; // 15:30 IST
 export type ChartBarFilter =
   | {
       chart: "day15m";
+      /** IST YYYY-MM-DD, or "" when slot applies across all days */
       dayKey: string;
       startMin: number;
       label: string;
@@ -46,8 +47,10 @@ export function tradeMatchesChartFilter(
   f: ChartBarFilter
 ): boolean {
   if (f.chart === "day15m") {
-    const day = istDayKey(t.entryTime || t.exitTime);
-    if (day !== f.dayKey) return false;
+    if (f.dayKey) {
+      const day = istDayKey(t.entryTime || t.exitTime);
+      if (day !== f.dayKey) return false;
+    }
     const m = istMinutesFromMidnight(t.entryTime);
     let slotMin = Math.floor(m / 15) * 15;
     if (slotMin < SESSION_START_MIN) slotMin = SESSION_START_MIN;
@@ -77,7 +80,10 @@ export function filterTradesByChart(
 
 export function chartFilterLabel(f: ChartBarFilter): string {
   if (f.chart === "day15m") {
-    return `Latest day · ${f.label} IST entry slot`;
+    if (f.dayKey) {
+      return `${formatDayShort(f.dayKey)} · ${f.label} IST entry slot`;
+    }
+    return `All days · ${f.label} IST entry slot`;
   }
   if (f.mode === "histogram") {
     return `Hold time · ${f.label}`;
@@ -87,8 +93,8 @@ export function chartFilterLabel(f: ChartBarFilter): string {
 
 /**
  * Two charts (single symbol or combined F&O universe):
- * 1) Latest trading day — P&L by 15-minute entry slots
- * 2) Hold time (entry → exit) — P&L by duration bucket / per trade
+ * 1) P&L by 15-minute entry slots — selected calendar day, else all days
+ * 2) Hold time (entry → exit) — same day scope
  *
  * Click a bar to filter the results table below.
  */
@@ -96,6 +102,8 @@ export function PerformanceCharts({
   trades,
   title,
   subtitle,
+  /** IST YYYY-MM-DD from calendar — scopes both charts to that day */
+  selectedDay = null,
   activeFilter = null,
   onFilterChange,
 }: {
@@ -103,14 +111,27 @@ export function PerformanceCharts({
   /** e.g. "Combined F&O" */
   title?: string;
   subtitle?: string;
+  selectedDay?: string | null;
   activeFilter?: ChartBarFilter | null;
   onFilterChange?: (filter: ChartBarFilter | null) => void;
 }) {
   const safeTrades = Array.isArray(trades) ? trades : [];
-  const dayChart = useMemo(() => buildLatestDay15m(safeTrades), [safeTrades]);
+
+  /** Scope both charts to selected day, else all trades in range */
+  const scopedTrades = useMemo(() => {
+    if (!selectedDay) return safeTrades;
+    return safeTrades.filter(
+      (t) => istDayKey(t.entryTime || t.exitTime) === selectedDay
+    );
+  }, [safeTrades, selectedDay]);
+
+  const dayChart = useMemo(
+    () => buildDay15m(scopedTrades, selectedDay),
+    [scopedTrades, selectedDay]
+  );
   const holdChart = useMemo(
-    () => buildHoldTimes(safeTrades, safeTrades.length > 40),
-    [safeTrades]
+    () => buildHoldTimes(scopedTrades, scopedTrades.length > 40),
+    [scopedTrades]
   );
 
   function selectFilter(next: ChartBarFilter) {
@@ -140,7 +161,24 @@ export function PerformanceCharts({
     );
   }
 
+  if (selectedDay && !scopedTrades.length) {
+    return (
+      <div className="rounded-2xl border border-dashed border-neutral-300 bg-neutral-50 px-4 py-10 text-center">
+        <p className="text-sm font-medium text-neutral-700">
+          No trades on {formatDayShort(selectedDay)}
+        </p>
+        <p className="mt-1 text-xs text-neutral-500">
+          Clear the day filter to see all days, or pick another date on the
+          calendar.
+        </p>
+      </div>
+    );
+  }
+
   const clickable = Boolean(onFilterChange);
+  const scopeNote = selectedDay
+    ? formatDayShort(selectedDay)
+    : dayChart.scopeLabel;
 
   return (
     <div className="space-y-4">
@@ -174,22 +212,29 @@ export function PerformanceCharts({
       )}
 
       <div className="grid grid-cols-1 gap-6 lg:grid-cols-2">
-        {/* Chart 1: 15-min slots on latest day */}
+        {/* Chart 1: 15-min slots — selected day or all days */}
         <div className="min-w-0 rounded-2xl border border-neutral-200 bg-white p-4">
           <h3 className="text-sm font-semibold text-neutral-900">
-            Latest day — every 15 min
+            {selectedDay || dayChart.uniqueDays === 1
+              ? "Every 15 min"
+              : "Every 15 min — all days"}
           </h3>
           <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-            {dayChart.dayLabel
-              ? `${dayChart.dayLabel} (IST)`
-              : "Latest session"}
+            {scopeNote}
             {" · "}
             {dayChart.tradeCount} trade
             {dayChart.tradeCount === 1 ? "" : "s"}
+            {dayChart.uniqueDays > 1
+              ? ` · ${dayChart.uniqueDays} session(s)`
+              : ""}
             {dayChart.symbolCount > 1
               ? ` · ${dayChart.symbolCount} symbols`
               : ""}
-            . Combined P&amp;L by entry slot.
+            . Combined P&amp;L by entry slot
+            {dayChart.uniqueDays > 1 && !selectedDay
+              ? " (same clock time summed across days)"
+              : ""}
+            .
             {clickable ? " Click a bar to filter trades below." : ""}
           </p>
           <div className="mt-4 w-full" style={{ height: 280, minHeight: 280 }}>
@@ -253,17 +298,13 @@ export function PerformanceCharts({
                       startMin?: number;
                       count?: number;
                     } | null;
-                    if (
-                      !dayChart.dayKey ||
-                      !row ||
-                      row.startMin == null ||
-                      !row.count
-                    ) {
+                    if (!row || row.startMin == null || !row.count) {
                       return;
                     }
                     selectFilter({
                       chart: "day15m",
-                      dayKey: dayChart.dayKey,
+                      // Pin to selected day when set; else slot across all days
+                      dayKey: selectedDay || "",
                       startMin: row.startMin,
                       label: String(row.label ?? ""),
                     });
@@ -272,7 +313,8 @@ export function PerformanceCharts({
                   {dayChart.slots.map((d, i) => {
                     const selected =
                       activeFilter?.chart === "day15m" &&
-                      activeFilter.startMin === d.startMin;
+                      activeFilter.startMin === d.startMin &&
+                      (activeFilter.dayKey || "") === (selectedDay || "");
                     return (
                       <Cell
                         key={i}
@@ -309,8 +351,13 @@ export function PerformanceCharts({
         <div className="min-w-0 rounded-2xl border border-neutral-200 bg-white p-4">
           <h3 className="text-sm font-semibold text-neutral-900">
             Time between entry &amp; exit
+            {selectedDay || dayChart.uniqueDays === 1
+              ? ""
+              : " — all days"}
           </h3>
           <p className="mt-1 text-xs leading-relaxed text-neutral-500">
+            {scopeNote}
+            {" · "}
             {holdChart.mode === "histogram"
               ? "P&L by hold-time bucket (entry → exit)"
               : "P&L per trade (X = hold duration)"}
@@ -318,7 +365,7 @@ export function PerformanceCharts({
             {holdChart.medianLabel
               ? ` · median ${holdChart.medianLabel}`
               : ""}
-            {` · ${safeTrades.length} trade${safeTrades.length === 1 ? "" : "s"}`}
+            {` · ${scopedTrades.length} trade${scopedTrades.length === 1 ? "" : "s"}`}
             {clickable ? ". Click a bar to filter trades below." : "."}
           </p>
           <div className="mt-4 w-full" style={{ height: 280, minHeight: 280 }}>
@@ -495,6 +542,20 @@ function formatSlotLabel(minutesFromMidnight: number): string {
   return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
 }
 
+function formatDayShort(iso: string): string {
+  try {
+    const [y, mo, da] = iso.split("-").map(Number);
+    return new Date(Date.UTC(y, mo - 1, da)).toLocaleDateString("en-IN", {
+      day: "2-digit",
+      month: "short",
+      year: "numeric",
+      timeZone: "UTC",
+    });
+  } catch {
+    return iso;
+  }
+}
+
 function holdMinutes(t: Trade): number {
   const ms = Math.max(0, (t.exitTime || 0) - (t.entryTime || 0));
   let mins = ms / 60000;
@@ -502,9 +563,17 @@ function holdMinutes(t: Trade): number {
   return Math.max(mins, 0);
 }
 
-function buildLatestDay15m(trades: Trade[]): {
-  dayLabel: string;
-  dayKey: string;
+/**
+ * Aggregate P&L into 15-min entry slots for the scoped trades.
+ * - selectedDay set → that day only
+ * - otherwise → all days, same clock slots summed together
+ */
+function buildDay15m(
+  trades: Trade[],
+  selectedDay: string | null
+): {
+  scopeLabel: string;
+  uniqueDays: number;
   tradeCount: number;
   symbolCount: number;
   slots: {
@@ -517,25 +586,34 @@ function buildLatestDay15m(trades: Trade[]): {
 } {
   if (!trades.length) {
     return {
-      dayLabel: "",
-      dayKey: "",
+      scopeLabel: selectedDay ? formatDayShort(selectedDay) : "No trades",
+      uniqueDays: 0,
       tradeCount: 0,
       symbolCount: 0,
       slots: [],
     };
   }
 
-  let latestDay = "";
+  const dayKeys = new Set<string>();
   for (const t of trades) {
-    const d = istDayKey(t.entryTime || t.exitTime);
-    if (d > latestDay) latestDay = d;
+    dayKeys.add(istDayKey(t.entryTime || t.exitTime));
+  }
+  const sortedDays = [...dayKeys].sort();
+  const uniqueDays = sortedDays.length;
+
+  let scopeLabel: string;
+  if (selectedDay) {
+    scopeLabel = formatDayShort(selectedDay);
+  } else if (uniqueDays === 1) {
+    scopeLabel = formatDayShort(sortedDays[0]);
+  } else if (uniqueDays > 1) {
+    scopeLabel = `${formatDayShort(sortedDays[0])} – ${formatDayShort(sortedDays[uniqueDays - 1])}`;
+  } else {
+    scopeLabel = "All days";
   }
 
-  const dayTrades = trades.filter(
-    (t) => istDayKey(t.entryTime || t.exitTime) === latestDay
-  );
   const symbols = new Set(
-    dayTrades.map((t) => (t as Trade & { _symbol?: string })._symbol || "")
+    trades.map((t) => (t as Trade & { _symbol?: string })._symbol || "")
   );
   symbols.delete("");
 
@@ -558,7 +636,7 @@ function buildLatestDay15m(trades: Trade[]): {
     });
   }
 
-  for (const t of dayTrades) {
+  for (const t of trades) {
     const m = istMinutesFromMidnight(t.entryTime);
     let slotMin = Math.floor(m / 15) * 15;
     if (slotMin < SESSION_START_MIN) slotMin = SESSION_START_MIN;
@@ -578,24 +656,11 @@ function buildLatestDay15m(trades: Trade[]): {
     symbols: _syms.size,
   }));
 
-  let dayLabel = latestDay;
-  try {
-    const [y, mo, da] = latestDay.split("-").map(Number);
-    dayLabel = new Date(Date.UTC(y, mo - 1, da)).toLocaleDateString("en-IN", {
-      day: "2-digit",
-      month: "short",
-      year: "numeric",
-      timeZone: "UTC",
-    });
-  } catch {
-    // keep ISO
-  }
-
   return {
-    dayLabel,
-    dayKey: latestDay,
-    tradeCount: dayTrades.length,
-    symbolCount: symbols.size || (dayTrades.length ? 1 : 0),
+    scopeLabel,
+    uniqueDays,
+    tradeCount: trades.length,
+    symbolCount: symbols.size || (trades.length ? 1 : 0),
     slots: out,
   };
 }
@@ -640,7 +705,7 @@ function buildHoldTimes(
   if (!useHistogram) {
     return {
       mode: "per-trade",
-      bars: minutesList.map((m, i) => ({
+      bars: minutesList.map((m) => ({
         label: formatHoldShort(m.minutes),
         minutes: m.minutes,
         pnl: Number(m.pnl.toFixed(2)),

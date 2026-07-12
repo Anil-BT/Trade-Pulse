@@ -1,6 +1,6 @@
 "use client";
 
-import { useMemo, useState } from "react";
+import { useMemo, useRef, useState } from "react";
 import { ConditionBuilder } from "./ConditionBuilder";
 import { BacktestReport } from "./BacktestReport";
 import {
@@ -13,16 +13,44 @@ import { StrategyLibrary } from "./StrategyLibrary";
 import { TradesTable } from "./TradesTable";
 import { STRATEGY_PRESETS, PRESET_OPENING_RANGE_EMA } from "@/lib/presets";
 import { defaultDateRange, uid } from "@/lib/format";
+import { buildCacheFingerprint } from "@/lib/fingerprint";
+import {
+  chunkDayList,
+  listWeekdays,
+  sleep,
+} from "@/lib/date-chunks";
+import {
+  assembleBacktestResult,
+  filterTradesToDays,
+  groupTradesByIstDay,
+  istDayKey,
+  mergeCandles,
+} from "@/lib/merge-results";
+import {
+  dayCacheAvailable,
+  loadDaysFromCache,
+  saveDayCaches,
+  type DayCacheRecord,
+} from "@/lib/firebase/day-cache";
+import { useAuth } from "@/lib/firebase/auth-context";
 import type {
   BacktestResult,
+  Candle,
   DataSource,
   EntryTimeWindow,
   Interval,
   OptionsTradeSettings,
   ScanReport,
   StrategyConfig,
+  Trade,
   TradeInstrument,
 } from "@/lib/types";
+
+/** Days per API call + pause between chunks to ease broker rate limits */
+const CHUNK_DAYS = 2;
+const CHUNK_PAUSE_MS = 5000;
+/** Extra wait when a chunk hits 429 before retrying that chunk */
+const RATE_LIMIT_CHUNK_RETRIES = 4;
 
 const INTERVALS: { value: Interval; label: string }[] = [
   { value: "1m", label: "1 min" },
@@ -95,14 +123,28 @@ export function BacktestApp() {
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [scanReport, setScanReport] = useState<ScanReport | null>(null);
   const [chartFilter, setChartFilter] = useState<ChartBarFilter | null>(null);
+  /** IST YYYY-MM-DD from calendar day click */
+  const [dayFilter, setDayFilter] = useState<string | null>(null);
   const [showToken, setShowToken] = useState(false);
   const [scanMaxSymbols, setScanMaxSymbols] = useState(50);
   const [scanAllFno, setScanAllFno] = useState(false);
+  const [runProgress, setRunProgress] = useState<string | null>(null);
+  const [saveMsg, setSaveMsg] = useState<string | null>(null);
+  const [saving, setSaving] = useState(false);
+  const { user } = useAuth();
+  /** Days that completed without fetch/backtest errors (safe to upload) */
+  const okDaysRef = useRef<Set<string>>(new Set());
 
-  const filteredTrades = useMemo(
-    () => filterTradesByChart(result?.trades || [], chartFilter),
-    [result?.trades, chartFilter]
-  );
+  const filteredTrades = useMemo(() => {
+    let list = filterTradesByChart(result?.trades || [], chartFilter);
+    if (dayFilter) {
+      list = list.filter((t) => {
+        const d = new Date(t.entryTime + 5.5 * 60 * 60 * 1000);
+        return d.toISOString().slice(0, 10) === dayFilter;
+      });
+    }
+    return list;
+  }, [result?.trades, chartFilter, dayFilter]);
 
   function applyPreset(name: string) {
     const p = STRATEGY_PRESETS.find((x) => x.name === name);
@@ -193,12 +235,105 @@ export function BacktestApp() {
     };
   }
 
+  function cacheSettings() {
+    return {
+      symbol: cleanSymbol(symbol),
+      interval,
+      source,
+      tradeInstrument,
+      strategy,
+      oneTradePerDay,
+      entryTimeWindows: entryTimeWindowsPayload(),
+      maxRiskPerTrade: maxRiskPayload(),
+      options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
+      positionSizePct: equityAllocPct,
+      initialCapital: capital,
+    };
+  }
+
+  async function fetchBacktestChunkOnce(
+    chunkFrom: string,
+    chunkTo: string
+  ): Promise<BacktestResult> {
+    const res = await fetch("/api/backtest", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        symbol: cleanSymbol(symbol),
+        interval,
+        from: chunkFrom,
+        to: chunkTo,
+        source,
+        strategy,
+        initialCapital: capital,
+        positionSizePct: equityAllocPct,
+        oneTradePerDay,
+        entryTimeWindows: entryTimeWindowsPayload(),
+        maxRiskPerTrade: maxRiskPayload(),
+        tradeInstrument,
+        options:
+          tradeInstrument === "options_atm" ? buildOptions() : undefined,
+        ...credentialsPayload(),
+      }),
+    });
+    const rawText = await res.text();
+    let data: { error?: string } & Partial<BacktestResult>;
+    try {
+      data = rawText ? JSON.parse(rawText) : {};
+    } catch {
+      throw new Error(
+        res.status === 504 || res.status === 408
+          ? "Backtest timed out. Try again — shorter chunks help."
+          : `Backtest failed (HTTP ${res.status}). ${rawText.slice(0, 180) || "Invalid response"}`
+      );
+    }
+    if (!res.ok) {
+      throw new Error(data.error || `Backtest failed with status ${res.status}.`);
+    }
+    return data as BacktestResult;
+  }
+
+  /** Retry chunk on 429 with long waits; latency OK for user */
+  async function fetchBacktestChunk(
+    chunkFrom: string,
+    chunkTo: string,
+    onWait?: (msg: string) => void
+  ): Promise<BacktestResult> {
+    let lastErr = "chunk failed";
+    for (let attempt = 0; attempt < RATE_LIMIT_CHUNK_RETRIES; attempt++) {
+      try {
+        return await fetchBacktestChunkOnce(chunkFrom, chunkTo);
+      } catch (e) {
+        lastErr = e instanceof Error ? e.message : String(e);
+        const rateLimited = /429|rate.?limit|1015|being rate.limited/i.test(
+          lastErr
+        );
+        if (!rateLimited || attempt >= RATE_LIMIT_CHUNK_RETRIES - 1) {
+          throw e instanceof Error ? e : new Error(lastErr);
+        }
+        const waitSec = [45, 90, 120, 150][attempt] || 120;
+        onWait?.(
+          `Rate limited (429). Waiting ${waitSec}s then retry ${attempt + 2}/${RATE_LIMIT_CHUNK_RETRIES} for ${chunkFrom}→${chunkTo}…`
+        );
+        await sleep(waitSec * 1000);
+      }
+    }
+    throw new Error(lastErr);
+  }
+
+  /**
+   * Chunked run: few days at a time + pause (rate-limit friendly).
+   * Reuses Firestore day cache when signed in (same strategy + day).
+   */
   async function run() {
     setLoading(true);
     setError(null);
     setResult(null);
     setScanReport(null);
     setChartFilter(null);
+    setDayFilter(null);
+    setRunProgress(null);
+    setSaveMsg(null);
 
     try {
       if (!symbol.trim()) {
@@ -207,51 +342,308 @@ export function BacktestApp() {
       validateCommon();
       validateSourceCredentials();
 
-      const res = await fetch("/api/backtest", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          symbol: cleanSymbol(symbol),
+      const allDays = listWeekdays(from, to);
+      if (!allDays.length) {
+        throw new Error(
+          "No weekdays in this range. Pick a Mon–Fri span for NSE."
+        );
+      }
+
+      const fingerprint = buildCacheFingerprint(cacheSettings());
+      const dayTrades = new Map<string, Trade[]>();
+      const dayCandles = new Map<string, Candle[]>();
+      const okDays = new Set<string>();
+      okDaysRef.current = new Set();
+      let optionsMeta: BacktestResult["optionsMeta"];
+      let lastDiag: BacktestResult["diagnostics"];
+      let resolvedSymbol = cleanSymbol(symbol);
+      let chunkErrors = 0;
+
+      // 1) Load cached days from Firestore (if signed in)
+      let missing = [...allDays];
+      if (user && dayCacheAvailable()) {
+        setRunProgress("Checking cloud day cache…");
+        const cached = await loadDaysFromCache(user.uid, fingerprint, allDays);
+        const still: string[] = [];
+        for (const day of allDays) {
+          const hit = cached.get(day);
+          // Only trust cache entries that were stored as clean (no trade errors)
+          if (hit?.trades && dayTradesAreClean(hit.trades)) {
+            dayTrades.set(day, hit.trades);
+            if (hit.candles?.length) dayCandles.set(day, hit.candles);
+            okDays.add(day);
+          } else {
+            still.push(day);
+          }
+        }
+        missing = still;
+        if (cached.size) {
+          setRunProgress(
+            `Cache hit ${okDays.size} day(s) · ${missing.length} to fetch…`
+          );
+        }
+      }
+
+      // 2) Fetch missing days in small chunks with pause (avoids rate limits)
+      const chunks = chunkDayList(missing, CHUNK_DAYS);
+      for (let ci = 0; ci < chunks.length; ci++) {
+        const chunk = chunks[ci];
+        const cFrom = chunk[0];
+        const cTo = chunk[chunk.length - 1];
+        setRunProgress(
+          `Fetching ${cFrom} → ${cTo} (${ci + 1}/${chunks.length})${
+            chunks.length > 1 ? " · pacing for rate limits…" : ""
+          }`
+        );
+
+        try {
+          const partial = await fetchBacktestChunk(cFrom, cTo, setRunProgress);
+          resolvedSymbol = partial.symbol || resolvedSymbol;
+          optionsMeta = partial.optionsMeta || optionsMeta;
+          lastDiag = partial.diagnostics;
+
+          const chunkDaySet = new Set(chunk);
+          const tradesInChunk = filterTradesToDays(
+            partial.trades || [],
+            chunkDaySet
+          );
+          const byDay = groupTradesByIstDay(tradesInChunk);
+
+          // Candles by IST day for this chunk
+          const candlesByDay = new Map<string, Candle[]>();
+          for (const c of partial.candles || []) {
+            const day = istDayKey(c.time);
+            if (!chunkDaySet.has(day)) continue;
+            const list = candlesByDay.get(day) || [];
+            list.push(c);
+            candlesByDay.set(day, list);
+          }
+
+          // Successful chunk → each day is independently cacheable
+          // (even if other days/chunks fail later)
+          const cleanChunkDays: string[] = [];
+          for (const day of chunk) {
+            const trades = byDay.get(day) || [];
+            const candles = candlesByDay.get(day) || [];
+            if (!dayTradesAreClean(trades)) {
+              chunkErrors += 1;
+              continue;
+            }
+            dayTrades.set(day, trades);
+            if (candles.length) dayCandles.set(day, candles);
+            okDays.add(day);
+            cleanChunkDays.push(day);
+          }
+          okDaysRef.current = new Set(okDays);
+
+          // Auto-save only error-free days as soon as the chunk succeeds
+          if (user && dayCacheAvailable() && cleanChunkDays.length) {
+            try {
+              const records: DayCacheRecord[] = cleanChunkDays.map((day) => ({
+                fingerprint,
+                day,
+                symbol: resolvedSymbol,
+                interval,
+                source,
+                trades: dayTrades.get(day) || [],
+                candles: dayCandles.get(day) || [],
+                savedAt: Date.now(),
+                strategyName: strategy.name,
+              }));
+              const n = await saveDayCaches(user.uid, records);
+              setRunProgress(
+                `Saved ${n} clean day(s) from ${cFrom}→${cTo} · continuing…`
+              );
+            } catch {
+              // non-fatal — user can still Save manually
+            }
+          }
+        } catch (chunkErr) {
+          chunkErrors += chunk.length;
+          const msg =
+            chunkErr instanceof Error ? chunkErr.message : String(chunkErr);
+          setRunProgress(
+            `Chunk ${cFrom}→${cTo} failed — those days not saved; other days kept. ${msg.slice(0, 60)}`
+          );
+          // Failed chunk days stay out of okDays → re-fetched next run
+          await sleep(CHUNK_PAUSE_MS);
+          continue;
+        }
+
+        // Progressive UI
+        const partialTrades = allDays.flatMap((d) => dayTrades.get(d) || []);
+        const partialCandles = mergeCandles(
+          allDays.map((d) => dayCandles.get(d) || [])
+        );
+        setResult(
+          assembleBacktestResult({
+            symbol: resolvedSymbol,
+            interval,
+            source,
+            tradeInstrument,
+            oneTradePerDay,
+            initialCapital: capital,
+            trades: partialTrades,
+            candles: partialCandles,
+            optionsMeta,
+            diagnostics: {
+              equitySignals: lastDiag?.equitySignals ?? partialTrades.length,
+              entriesTaken: partialTrades.length,
+              skippedInsufficientCapital:
+                lastDiag?.skippedInsufficientCapital ?? 0,
+              maxRiskStops: lastDiag?.maxRiskStops,
+              minLotCost: lastDiag?.minLotCost,
+              maxRiskCap: lastDiag?.maxRiskCap,
+              note: `Partial: ${ci + 1}/${chunks.length} chunk(s) · ${okDays.size} clean day(s)${
+                chunkErrors ? ` · ${chunkErrors} issue(s)` : ""
+              }`,
+            },
+          })
+        );
+
+        if (ci < chunks.length - 1) {
+          await sleep(CHUNK_PAUSE_MS);
+        }
+      }
+
+      okDaysRef.current = okDays;
+
+      // 3) Final assemble
+      const allTrades = allDays.flatMap((d) => dayTrades.get(d) || []);
+      const allCandles = mergeCandles(
+        allDays.map((d) => dayCandles.get(d) || [])
+      );
+      const cacheHits = [...okDays].filter((d) => !missing.includes(d)).length;
+      setResult(
+        assembleBacktestResult({
+          symbol: resolvedSymbol,
           interval,
-          from,
-          to,
           source,
-          strategy,
-          initialCapital: capital,
-          positionSizePct: equityAllocPct,
-          oneTradePerDay,
-          entryTimeWindows: entryTimeWindowsPayload(),
-          maxRiskPerTrade: maxRiskPayload(),
           tradeInstrument,
-          options: tradeInstrument === "options_atm" ? buildOptions() : undefined,
-          ...credentialsPayload(),
-        }),
-      });
-
-      let data: { error?: string } & Partial<BacktestResult>;
-      const rawText = await res.text();
-      try {
-        data = rawText ? JSON.parse(rawText) : {};
-      } catch {
-        throw new Error(
-          res.status === 504 || res.status === 408
-            ? "Backtest timed out on the server. Use a shorter date range (e.g. 1–2 weeks) and retry."
-            : `Backtest failed (HTTP ${res.status}). ${rawText.slice(0, 180) || "Invalid response"}`
-        );
-      }
-
-      if (!res.ok) {
-        throw new Error(
-          data.error || `Backtest failed with status ${res.status}.`
-        );
-      }
-
-      setResult(data as BacktestResult);
+          oneTradePerDay,
+          initialCapital: capital,
+          trades: allTrades,
+          candles: allCandles,
+          optionsMeta,
+          diagnostics: {
+            equitySignals: lastDiag?.equitySignals ?? allTrades.length,
+            entriesTaken: allTrades.length,
+            skippedInsufficientCapital:
+              lastDiag?.skippedInsufficientCapital ?? 0,
+            maxRiskStops: lastDiag?.maxRiskStops,
+            minLotCost: lastDiag?.minLotCost,
+            maxRiskCap: lastDiag?.maxRiskCap,
+            note:
+              `Done · ${okDays.size}/${allDays.length} clean day(s)` +
+              (cacheHits ? ` · ${cacheHits} from cloud` : "") +
+              (chunks.length ? ` · ${chunks.length} live chunk(s)` : "") +
+              (chunkErrors
+                ? ` · ${chunkErrors} day/chunk error(s) not saved`
+                : "") +
+              " · paced for rate limits.",
+          },
+        })
+      );
+      setRunProgress(null);
     } catch (e) {
-      setResult(null);
       setError(e instanceof Error ? e.message : "Something went wrong");
+      // keep partial result if any
     } finally {
       setLoading(false);
+      setRunProgress(null);
+    }
+  }
+
+  /**
+   * Save every error-free day independently.
+   * Failed days are skipped so good days never need re-running.
+   */
+  async function saveResultToCloud() {
+    if (!result) {
+      setSaveMsg("Run a backtest first, then save.");
+      return;
+    }
+    if (!user) {
+      setSaveMsg("Sign in (top-right) to save clean days to Firestore.");
+      return;
+    }
+    setSaving(true);
+    setSaveMsg(null);
+    try {
+      const fingerprint = buildCacheFingerprint(cacheSettings());
+      const byDay = groupTradesByIstDay(result.trades || []);
+      const candleByDay = new Map<string, Candle[]>();
+      for (const c of result.candles || []) {
+        const day = istDayKey(c.time);
+        const list = candleByDay.get(day) || [];
+        list.push(c);
+        candleByDay.set(day, list);
+      }
+
+      const ok = okDaysRef.current;
+      // Days we can save = OK days from this run, or any day with clean trades
+      const candidateDays = new Set<string>([
+        ...ok,
+        ...byDay.keys(),
+        ...candleByDay.keys(),
+      ]);
+
+      const records: DayCacheRecord[] = [];
+      let skippedBadTrades = 0;
+
+      for (const day of candidateDays) {
+        const trades = byDay.get(day) || [];
+        if (!dayTradesAreClean(trades)) {
+          skippedBadTrades += 1;
+          continue;
+        }
+        // Save if: marked successful this run, OR has trades/candles (data exists)
+        const hasData =
+          ok.has(day) ||
+          trades.length > 0 ||
+          (candleByDay.get(day)?.length ?? 0) > 0;
+        if (!hasData) continue;
+
+        records.push({
+          fingerprint,
+          day,
+          symbol: result.symbol,
+          interval: result.interval,
+          source: result.source,
+          trades,
+          candles: candleByDay.get(day) || [],
+          savedAt: Date.now(),
+          strategyName: strategy.name,
+        });
+      }
+
+      if (!records.length) {
+        setSaveMsg(
+          skippedBadTrades
+            ? `No clean days to save (${skippedBadTrades} day(s) had invalid trade data).`
+            : "No successful days available to save yet."
+        );
+        return;
+      }
+
+      const n = await saveDayCaches(user.uid, records);
+      const failedLeft = listWeekdays(from, to).filter(
+        (d) => !records.some((r) => r.day === d)
+      ).length;
+      setSaveMsg(
+        `Saved ${n} day(s) without errors.` +
+          (failedLeft
+            ? ` ${failedLeft} day(s) still missing/failed — re-run will only fetch those.`
+            : ` Full range is cached for this strategy.`) +
+          (skippedBadTrades
+            ? ` Skipped ${skippedBadTrades} day(s) with bad trade data.`
+            : "")
+      );
+      setTimeout(() => setSaveMsg(null), 8000);
+    } catch (e) {
+      setSaveMsg(e instanceof Error ? e.message : "Save failed");
+    } finally {
+      setSaving(false);
     }
   }
 
@@ -261,6 +653,7 @@ export function BacktestApp() {
     setResult(null);
     setScanReport(null);
     setChartFilter(null);
+    setDayFilter(null);
 
     try {
       validateCommon();
@@ -980,8 +1373,17 @@ export function BacktestApp() {
             disabled={loading || scanning}
             className="w-full rounded-full bg-black py-3.5 text-sm font-medium text-white transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
           >
-            {loading ? "Running backtest…" : "Run backtest (single symbol)"}
+            {loading
+              ? runProgress
+                ? "Running (chunked)…"
+                : "Running backtest…"
+              : "Run backtest (single symbol)"}
           </button>
+          <p className="text-center text-[11px] text-neutral-400">
+            Long ranges run in {CHUNK_DAYS}-day chunks with pauses. On 429 rate
+            limits we wait and auto-retry (latency is OK). Sign in + Save days
+            to reuse cache and cut Upstox calls.
+          </p>
         </div>
 
         {/* Results below submit — full width for readable tables */}
@@ -990,14 +1392,20 @@ export function BacktestApp() {
             Results
           </h2>
           {(loading || scanning) && (
-            <div className="flex min-h-[320px] items-center justify-center rounded-3xl border border-neutral-200 bg-white">
-              <div className="text-center">
+            <div className="flex min-h-[200px] items-center justify-center rounded-3xl border border-neutral-200 bg-white">
+              <div className="max-w-md px-4 text-center">
                 <div className="mx-auto mb-4 h-8 w-8 animate-spin rounded-full border-2 border-neutral-200 border-t-black" />
                 <p className="text-sm text-neutral-600">
                   {scanning
                     ? "Scanning F&O universe - this can take a few minutes..."
-                    : "Fetching data & running backtest..."}
+                    : runProgress ||
+                      "Fetching data & running backtest..."}
                 </p>
+                {loading && runProgress && (
+                  <p className="mt-2 text-xs text-neutral-400">
+                    Partial results may appear below as chunks finish.
+                  </p>
+                )}
               </div>
             </div>
           )}
@@ -1046,8 +1454,42 @@ export function BacktestApp() {
             />
           )}
 
-          {result && !loading && !scanning && !error && !scanReport && (
+          {result && !scanning && !scanReport && (
             <>
+              {/* Prominent save bar — only clean days are uploaded */}
+              <div className="rounded-3xl border-2 border-neutral-900 bg-white p-4 shadow-[0_1px_2px_rgba(0,0,0,0.04)] sm:p-5">
+                <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+                  <div className="min-w-0">
+                    <p className="text-sm font-semibold tracking-tight text-black">
+                      Save successful days only
+                    </p>
+                    <p className="mt-1 text-xs leading-relaxed text-neutral-500">
+                      Uploads days that finished without errors (even if other
+                      days failed). Next run skips those days and only fetches
+                      the rest. Auto-saves after each good chunk when signed in.
+                      {!user ? " Sign in (top right) to enable." : ""}
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => void saveResultToCloud()}
+                    disabled={saving || loading}
+                    className="shrink-0 rounded-full bg-black px-6 py-3 text-sm font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+                  >
+                    {saving
+                      ? "Saving successful days…"
+                      : !user
+                        ? "Save results (sign in required)"
+                        : "Save results by day (no-error days)"}
+                  </button>
+                </div>
+                {saveMsg && (
+                  <p className="mt-3 rounded-xl bg-neutral-50 px-3 py-2 text-xs text-neutral-700">
+                    {saveMsg}
+                  </p>
+                )}
+              </div>
+
               <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
                 <div className="mb-5">
                   <h2 className="text-lg font-semibold tracking-tight">
@@ -1129,7 +1571,15 @@ export function BacktestApp() {
                     </div>
                   )}
                 </div>
-                <BacktestReport result={result} />
+                <BacktestReport
+                  result={result}
+                  dayFilter={dayFilter}
+                  onDayFilterChange={(d) => {
+                    setDayFilter(d);
+                    // Day scope drives both charts; clear bar filter so it doesn't fight the new day
+                    setChartFilter(null);
+                  }}
+                />
               </section>
 
               {/* Charts always visible after metrics for single-symbol runs */}
@@ -1143,7 +1593,11 @@ export function BacktestApp() {
                       Charts
                     </h2>
                     <p className="mt-1 text-xs text-neutral-500">
-                      (1) Latest day every 15 min · (2) Hold time entry → exit
+                      (1) Every 15 min
+                      {dayFilter
+                        ? ` · selected day ${dayFilter}`
+                        : " · all days in range"}{" "}
+                      · (2) Hold time entry → exit
                       {result.trades?.length
                         ? ` · ${result.trades.length} trade(s)`
                         : " · no trades yet"}
@@ -1152,8 +1606,12 @@ export function BacktestApp() {
                 </div>
                 <PerformanceCharts
                   trades={result.trades || []}
+                  selectedDay={dayFilter}
                   activeFilter={chartFilter}
-                  onFilterChange={setChartFilter}
+                  onFilterChange={(f) => {
+                    setChartFilter(f);
+                    // Slot/hold filter keeps day scope if a day is already selected
+                  }}
                 />
               </section>
 
@@ -1161,14 +1619,18 @@ export function BacktestApp() {
                 <div className="mb-4 flex flex-wrap items-center justify-between gap-2">
                   <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
                     Trades
-                    {chartFilter
+                    {chartFilter || dayFilter
                       ? ` · ${filteredTrades.length} of ${result.trades?.length || 0}`
                       : ""}
+                    {dayFilter ? ` · day ${dayFilter}` : ""}
                   </h2>
-                  {chartFilter && (
+                  {(chartFilter || dayFilter) && (
                     <button
                       type="button"
-                      onClick={() => setChartFilter(null)}
+                      onClick={() => {
+                        setChartFilter(null);
+                        setDayFilter(null);
+                      }}
                       className="rounded-full border border-neutral-300 px-3 py-1 text-xs font-medium hover:border-black"
                     >
                       Show all trades
@@ -1268,4 +1730,22 @@ function cleanSymbol(s: string): string {
     .replace(/\.NS$/i, "")
     .replace(/\.BO$/i, "")
     .replace(/\.BSE$/i, "");
+}
+
+/** True if every trade has valid prices/PnL (safe to cache/upload). */
+function dayTradesAreClean(trades: Trade[]): boolean {
+  for (const t of trades) {
+    if (
+      !Number.isFinite(t.entryTime) ||
+      !Number.isFinite(t.exitTime) ||
+      !Number.isFinite(t.entryPrice) ||
+      !Number.isFinite(t.exitPrice) ||
+      !Number.isFinite(t.pnl) ||
+      t.entryPrice < 0 ||
+      t.exitPrice < 0
+    ) {
+      return false;
+    }
+  }
+  return true;
 }
