@@ -12,10 +12,12 @@ export const dynamic = "force-dynamic";
 export async function POST(req: NextRequest) {
   try {
     const body = await req.json().catch(() => ({}));
-    const idToken =
+    const { cleanIdToken } = await import("@/lib/paper/sanitize");
+    const idToken = cleanIdToken(
       (req.headers.get("authorization") || "").replace(/^Bearer\s+/i, "") ||
-      body.idToken ||
-      "";
+        body.idToken ||
+        ""
+    );
     const user = await verifyUserIdToken(idToken);
     if (!user?.uid) {
       return NextResponse.json({ error: "Sign in required" }, { status: 401 });

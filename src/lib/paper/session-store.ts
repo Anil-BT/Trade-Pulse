@@ -4,6 +4,7 @@
  * - If Admin configured: also Firestore users/{uid}/paperSessions/{id}
  */
 import { getAdminDb } from "../firebase/admin";
+import { cleanForStorage, compactSession } from "./sanitize";
 import type { PaperSessionDoc, PaperSessionStatus } from "./session-types";
 
 const COL = "paperSessions";
@@ -29,24 +30,91 @@ export function memTimers(): Map<string, ReturnType<typeof setInterval>> {
   return x.__paperTimers;
 }
 
-function stripUndefined<T>(v: T): T {
-  return JSON.parse(JSON.stringify(v)) as T;
-}
-
 export async function saveSession(doc: PaperSessionDoc): Promise<void> {
-  const clean = stripUndefined(doc);
-  mem().set(doc.id, clean);
+  // Always keep a memory copy first (survives even if serialize/Firestore fails)
+  mem().set(doc.id, doc);
+
+  let clean: PaperSessionDoc;
+  try {
+    const compacted = compactSession(doc as never) as PaperSessionDoc;
+    clean = cleanForStorage(compacted, false);
+  } catch (e) {
+    console.error(
+      "[paper-session] serialize failed, keeping memory-only:",
+      e instanceof Error ? e.message : e
+    );
+    return;
+  }
+
+  mem().set(doc.id, { ...clean, upstoxAccessToken: doc.upstoxAccessToken });
+
   const db = getAdminDb();
   if (!db) return;
+
   try {
+    // Prefer not to fail start if cloud write fails
+    const payload = {
+      ...clean,
+      upstoxAccessToken: doc.upstoxAccessToken || null,
+    };
     await db
       .collection("users")
       .doc(doc.userId)
       .collection(COL)
       .doc(doc.id)
-      .set(clean, { merge: true });
-  } catch {
-    // non-fatal — memory still holds it
+      .set(payload, { merge: true });
+  } catch (e) {
+    console.error(
+      "[paper-session] Firestore save failed (session still in memory):",
+      e instanceof Error ? e.message : e
+    );
+  }
+}
+
+/** Lightweight status flip — never re-serialize huge reports. */
+export async function markSessionStopped(
+  userId: string,
+  sessionId: string,
+  note: string
+): Promise<void> {
+  const m = mem().get(sessionId);
+  if (m && m.userId === userId) {
+    m.status = "stopped";
+    m.updatedAt = Date.now();
+    m.workerNote = note;
+    const t = memTimers().get(sessionId);
+    if (t) {
+      clearInterval(t);
+      memTimers().delete(sessionId);
+    }
+  }
+  const db = getAdminDb();
+  if (!db) return;
+  try {
+    await db
+      .collection("users")
+      .doc(userId)
+      .collection(COL)
+      .doc(sessionId)
+      .set(
+        {
+          status: "stopped",
+          updatedAt: Date.now(),
+          workerNote: note,
+        },
+        { merge: true }
+      );
+    await db.collection("paperSessionIndex").doc(sessionId).set(
+      {
+        userId,
+        sessionId,
+        status: "stopped",
+        updatedAt: Date.now(),
+      },
+      { merge: true }
+    );
+  } catch (e) {
+    console.error("[paper-session] mark stopped failed:", e);
   }
 }
 
@@ -68,9 +136,16 @@ export async function getSession(
       .get();
     if (!snap.exists) return null;
     const data = snap.data() as PaperSessionDoc;
-    mem().set(sessionId, data);
-    return data;
-  } catch {
+    // Restore memory with cloud data; keep memory token if cloud missing it
+    const existing = mem().get(sessionId);
+    mem().set(sessionId, {
+      ...data,
+      upstoxAccessToken:
+        data.upstoxAccessToken || existing?.upstoxAccessToken || "",
+    });
+    return mem().get(sessionId) || null;
+  } catch (e) {
+    console.error("[paper-session] getSession failed:", e);
     return null;
   }
 }
@@ -78,7 +153,6 @@ export async function getSession(
 export async function getActiveSession(
   userId: string
 ): Promise<PaperSessionDoc | null> {
-  // Memory first
   for (const s of mem().values()) {
     if (s.userId === userId && s.status === "running") return s;
   }
@@ -96,10 +170,16 @@ export async function getActiveSession(
     snap.forEach((d) => {
       const data = d.data() as PaperSessionDoc;
       if (!best || data.startedAt > best.startedAt) best = data;
-      mem().set(data.id, data);
+      const existing = mem().get(data.id);
+      mem().set(data.id, {
+        ...data,
+        upstoxAccessToken:
+          data.upstoxAccessToken || existing?.upstoxAccessToken || "",
+      });
     });
     return best;
-  } catch {
+  } catch (e) {
+    console.error("[paper-session] getActiveSession failed:", e);
     return null;
   }
 }
@@ -112,8 +192,6 @@ export async function listRunningSessions(): Promise<PaperSessionDoc[]> {
   const db = getAdminDb();
   if (db) {
     try {
-      // collection group query needs index — fall back to known user scan via mem only
-      // Prefer loading from a top-level index collection if we write there too
       const idx = await db
         .collection("paperSessionIndex")
         .where("status", "==", "running")
@@ -142,7 +220,6 @@ export async function updateSession(
     base = (await getSession(patch.userId, sessionId)) || undefined;
   }
   if (!base) {
-    // try find in mem by scanning
     for (const s of mem().values()) {
       if (s.id === sessionId) {
         base = s;
@@ -151,36 +228,33 @@ export async function updateSession(
     }
   }
   if (!base) return null;
-  const next: PaperSessionDoc = stripUndefined({
+  const next: PaperSessionDoc = {
     ...base,
     ...patch,
     id: base.id,
     userId: base.userId,
+    upstoxAccessToken: patch.upstoxAccessToken || base.upstoxAccessToken,
     updatedAt: Date.now(),
-  });
+  };
   await saveSession(next);
-  // Index for worker discovery
   const db = getAdminDb();
   if (db) {
     try {
-      await db
-        .collection("paperSessionIndex")
-        .doc(sessionId)
-        .set(
-          {
-            userId: next.userId,
-            sessionId: next.id,
-            status: next.status,
-            updatedAt: next.updatedAt,
-            endsAt: next.endsAt,
-          },
-          { merge: true }
-        );
+      await db.collection("paperSessionIndex").doc(sessionId).set(
+        {
+          userId: next.userId,
+          sessionId: next.id,
+          status: next.status,
+          updatedAt: next.updatedAt,
+          endsAt: next.endsAt,
+        },
+        { merge: true }
+      );
     } catch {
       /* ignore */
     }
   }
-  return next;
+  return mem().get(sessionId) || next;
 }
 
 export async function setSessionStatus(

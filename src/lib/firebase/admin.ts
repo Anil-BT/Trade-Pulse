@@ -14,7 +14,17 @@ function parseServiceAccount(): object | null {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
   if (!raw?.trim()) return null;
   try {
-    return JSON.parse(raw) as object;
+    const sa = JSON.parse(raw) as {
+      private_key?: string;
+      project_id?: string;
+      client_email?: string;
+    };
+    // Env files often store "\n" as two chars — fix PEM before cert()
+    if (typeof sa.private_key === "string") {
+      sa.private_key = sa.private_key.replace(/\\n/g, "\n");
+    }
+    if (!sa.private_key || !sa.client_email) return null;
+    return sa;
   } catch {
     return null;
   }

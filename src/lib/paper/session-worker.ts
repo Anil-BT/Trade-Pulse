@@ -7,10 +7,10 @@ import { fetchUpstoxCandles } from "../data/upstox";
 import { resolveUpstoxInstrumentKey } from "../data/upstox-instruments";
 import { resolveFnoMeta } from "../data/fno-meta";
 import { runBacktest } from "../backtest";
-import { createOptionPricer } from "../option-pricing";
 import { dayBoundsUnix } from "../data/dates";
 import { sanitizeToken } from "../http";
 import { todayIst, isNseSessionOpen } from "./market-hours";
+import { isRateLimitError } from "./sanitize";
 import {
   getSession,
   listRunningSessions,
@@ -300,49 +300,25 @@ export async function processPaperSession(
             };
           }
 
-          let optionPricer;
-          if (cfg.tradeInstrument === "options_atm" && options) {
-            try {
-              optionPricer = await createOptionPricer({
-                symbol,
-                side: options.side || "CE",
-                equityCandles: candles,
-                from: today,
-                to: today,
-                interval: cfg.interval,
-                listedStrikes: options.listedStrikes || [],
-                strikeStep: options.strikeStep || 0,
-                lotSize: options.lotSize || 1,
-                preferredDaysToExpiry: options.daysToExpiry ?? 7,
-                fallbackIv: options.iv ?? 0.18,
-                accessToken: token,
-              });
-            } catch {
-              optionPricer = undefined;
-            }
-          }
-
-          const result = runBacktest(
-            candles,
-            {
-              symbol,
-              interval: cfg.interval,
-              from: today,
-              to: today,
-              source: "upstox",
-              strategy: s.strategy,
-              initialCapital: cfg.initialCapital,
-              positionSizePct: cfg.positionSizePct,
-              oneTradePerDay: cfg.oneTradePerDay,
-              entryTimeWindows: cfg.entryTimeWindows,
-              maxRiskPerTrade: cfg.maxRiskPerTrade,
-              tradeInstrument: cfg.tradeInstrument,
-              options,
-              entryNotBeforeMs,
-              leaveOpenPositions: true,
-            },
-            { optionPricer }
-          );
+          // Paper: model option fills only (no per-symbol option-chain fetch).
+          // Avoids rate limits and "invalid string"/header issues from extra APIs.
+          const result = runBacktest(candles, {
+            symbol,
+            interval: cfg.interval,
+            from: today,
+            to: today,
+            source: "upstox",
+            strategy: s.strategy,
+            initialCapital: cfg.initialCapital,
+            positionSizePct: cfg.positionSizePct,
+            oneTradePerDay: cfg.oneTradePerDay,
+            entryTimeWindows: cfg.entryTimeWindows,
+            maxRiskPerTrade: cfg.maxRiskPerTrade,
+            tradeInstrument: cfg.tradeInstrument,
+            options,
+            entryNotBeforeMs,
+            leaveOpenPositions: true,
+          });
 
           const tag = s.strategy.name || `S${s.slot}`;
           batchRowsBySlot
@@ -366,17 +342,21 @@ export async function processPaperSession(
           }
         }
       } catch (e) {
-        const msg = e instanceof Error ? e.message : "error";
-        const is429 = /429|rate.?limit|1015/i.test(msg);
+        const msg = e instanceof Error ? e.message : String(e);
+        const is429 = isRateLimitError(msg);
         if (is429) {
           rateLimited += 1;
           consecutiveRateLimits += 1;
-          // Brief cool-down before next symbol
           await new Promise((r) => setTimeout(r, 2000));
         } else {
           consecutiveRateLimits = 0;
           errors += 1;
+          console.error(`[paper-worker] ${item.symbol}:`, msg);
         }
+        const short = msg
+          .replace(/[\u2010-\u2015]/g, "-")
+          .replace(/[^\x20-\x7E]/g, " ")
+          .slice(0, 120);
         for (const s of strats) {
           batchRowsBySlot.get(s.slot)!.push({
             symbol: item.symbol,
@@ -387,10 +367,10 @@ export async function processPaperSession(
             totalPnlPct: 0,
             finalEquity: cfg.initialCapital,
             status: "error",
-            error: msg,
+            error: short,
             message: is429
-              ? `${s.strategy.name}: rate limited (will retry next cycle)`
-              : `${s.strategy.name}: ${msg}`,
+              ? `${s.strategy.name}: rate limited (retry next cycle)`
+              : `${s.strategy.name}: ${short}`,
             tradeList: [],
           });
         }

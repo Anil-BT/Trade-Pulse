@@ -31,16 +31,33 @@ export function sanitizeToken(token: string): string {
   return String(token ?? "")
     .replace(/^\uFEFF/, "")
     .replace(/[\u2010-\u2015]/g, "-")
-    .replace(/[^\x21-\x7E]/g, "") // no spaces in tokens
+    .replace(/[\u2018\u2019\u201C\u201D]/g, "")
+    // keep only printable ASCII non-space (tokens must be ByteString-safe)
+    .replace(/[^\x21-\x7E]/g, "")
     .trim();
 }
 
 /** Ensure error messages shown to clients stay ASCII-friendly. */
 export function safeErrorMessage(err: unknown): string {
   const raw = err instanceof Error ? err.message : String(err);
-  return raw
+  const cleaned = raw
+    .normalize("NFKC")
     .replace(/[\u2010-\u2015]/g, "-")
     .replace(/[\u2018\u2019]/g, "'")
     .replace(/[\u201C\u201D]/g, '"')
-    .replace(/\u2026/g, "...");
+    .replace(/\u2026/g, "...")
+    .replace(/[^\x20-\x7E]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 400);
+  if (/bytestring|character at index|greater than 255/i.test(cleaned)) {
+    return `Invalid token/header characters (paste Upstox token as plain ASCII). ${cleaned}`;
+  }
+  if (/invalid string length/i.test(cleaned)) {
+    return "Payload too large to process. Reduce symbols or simplify strategy.";
+  }
+  if (/^invalid string$/i.test(cleaned)) {
+    return "Invalid string (often a bad token, date, or instrument key). Re-paste Upstox token and retry.";
+  }
+  return cleaned || "Unknown error";
 }
