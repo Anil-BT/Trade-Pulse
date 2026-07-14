@@ -37,35 +37,46 @@ export function sanitizeToken(token: string): string {
     .trim();
 }
 
-/** Ensure error messages shown to clients stay ASCII-friendly. */
+/** Ensure error messages shown to clients stay ASCII-friendly. Never throws. */
 export function safeErrorMessage(err: unknown): string {
-  const raw = err instanceof Error ? err.message : String(err);
-  const cleaned = raw
-    .normalize("NFKC")
-    .replace(/[\u2010-\u2015]/g, "-")
-    .replace(/[\u2018\u2019]/g, "'")
-    .replace(/[\u201C\u201D]/g, '"')
-    .replace(/\u2026/g, "...")
-    .replace(/[^\x20-\x7E]/g, " ")
-    .replace(/\s+/g, " ")
-    .trim()
-    .slice(0, 400);
-  if (/bytestring|character at index|greater than 255/i.test(cleaned)) {
-    return `Invalid token/header characters (paste Upstox token as plain ASCII). ${cleaned}`;
+  try {
+    const raw = err instanceof Error ? err.message : String(err);
+    let cleaned = raw;
+    try {
+      cleaned = raw.normalize("NFKC");
+    } catch {
+      cleaned = raw;
+    }
+    cleaned = cleaned
+      .replace(/[\u2010-\u2015]/g, "-")
+      .replace(/[\u2018\u2019]/g, "'")
+      .replace(/[\u201C\u201D]/g, '"')
+      .replace(/\u2026/g, "...")
+      .replace(/[^\x20-\x7E]/g, " ")
+      .replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 400);
+    if (/bytestring|character at index|greater than 255/i.test(cleaned)) {
+      return `Invalid token/header characters (paste Upstox token as plain ASCII). ${cleaned}`;
+    }
+    if (/invalid string length/i.test(cleaned)) {
+      return "Payload too large to process. Reduce symbols or simplify strategy.";
+    }
+    if (/^invalid string$/i.test(cleaned)) {
+      return "Invalid string (often a bad token, date, or instrument key). Re-paste Upstox token and retry.";
+    }
+    if (
+      /did not match the expected pattern|string did not match/i.test(cleaned)
+    ) {
+      return "Request blocked by the browser (often Safari header/time validation). Re-sign in, re-paste Upstox token as plain text, and try again.";
+    }
+    if (/unexpected token|not valid json|DOCTYPE/i.test(cleaned)) {
+      return "Server returned a non-JSON response (page error or timeout). Retry in a moment; if it persists, check deploy/logs.";
+    }
+    return cleaned || "Unknown error";
+  } catch {
+    return "Unknown error";
   }
-  if (/invalid string length/i.test(cleaned)) {
-    return "Payload too large to process. Reduce symbols or simplify strategy.";
-  }
-  if (/^invalid string$/i.test(cleaned)) {
-    return "Invalid string (often a bad token, date, or instrument key). Re-paste Upstox token and retry.";
-  }
-  if (/did not match the expected pattern|string did not match/i.test(cleaned)) {
-    return "Request blocked by the browser (often Safari header/time validation). Re-sign in, re-paste Upstox token as plain text, and try again.";
-  }
-  if (/unexpected token|not valid json|DOCTYPE/i.test(cleaned)) {
-    return "Server returned a non-JSON response (page error or timeout). Retry in a moment; if it persists, check deploy/logs.";
-  }
-  return cleaned || "Unknown error";
 }
 
 /**

@@ -1,14 +1,18 @@
 /**
  * Optional Firebase Admin (server-only) for durable paper sessions.
  * Set FIREBASE_SERVICE_ACCOUNT_JSON to a service-account JSON string.
+ *
+ * firebase-admin is loaded lazily so a missing/broken package never
+ * takes down the whole API route module (HTML 500 on import).
  */
-import { getApps, initializeApp, cert, type App } from "firebase-admin/app";
-import { getAuth, type Auth } from "firebase-admin/auth";
-import { getFirestore, type Firestore } from "firebase-admin/firestore";
+import type { App } from "firebase-admin/app";
+import type { Auth } from "firebase-admin/auth";
+import type { Firestore } from "firebase-admin/firestore";
 
 let app: App | null | undefined;
 let db: Firestore | null | undefined;
 let auth: Auth | null | undefined;
+let adminLoadError: string | null = null;
 
 function parseServiceAccount(): object | null {
   const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
@@ -31,7 +35,39 @@ function parseServiceAccount(): object | null {
 }
 
 export function isAdminConfigured(): boolean {
-  return Boolean(parseServiceAccount() || process.env.FIREBASE_SERVICE_ACCOUNT_JSON);
+  return Boolean(parseServiceAccount());
+}
+
+export function getAdminLoadError(): string | null {
+  return adminLoadError;
+}
+
+function loadAdminModules(): {
+  getApps: typeof import("firebase-admin/app").getApps;
+  initializeApp: typeof import("firebase-admin/app").initializeApp;
+  cert: typeof import("firebase-admin/app").cert;
+  getAuth: typeof import("firebase-admin/auth").getAuth;
+  getFirestore: typeof import("firebase-admin/firestore").getFirestore;
+} | null {
+  try {
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const appMod = require("firebase-admin/app") as typeof import("firebase-admin/app");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const authMod = require("firebase-admin/auth") as typeof import("firebase-admin/auth");
+    // eslint-disable-next-line @typescript-eslint/no-require-imports
+    const fsMod = require("firebase-admin/firestore") as typeof import("firebase-admin/firestore");
+    return {
+      getApps: appMod.getApps,
+      initializeApp: appMod.initializeApp,
+      cert: appMod.cert,
+      getAuth: authMod.getAuth,
+      getFirestore: fsMod.getFirestore,
+    };
+  } catch (e) {
+    adminLoadError =
+      e instanceof Error ? e.message.slice(0, 200) : "firebase-admin load failed";
+    return null;
+  }
 }
 
 export function getAdminApp(): App | null {
@@ -41,17 +77,24 @@ export function getAdminApp(): App | null {
     app = null;
     return null;
   }
+  const mods = loadAdminModules();
+  if (!mods) {
+    app = null;
+    return null;
+  }
   try {
     app =
-      getApps().length > 0
-        ? getApps()[0]!
-        : initializeApp({
-            credential: cert(sa as Parameters<typeof cert>[0]),
+      mods.getApps().length > 0
+        ? mods.getApps()[0]!
+        : mods.initializeApp({
+            credential: mods.cert(sa as Parameters<typeof mods.cert>[0]),
             projectId:
               (sa as { project_id?: string }).project_id ||
               process.env.NEXT_PUBLIC_FIREBASE_PROJECT_ID,
           });
-  } catch {
+  } catch (e) {
+    adminLoadError =
+      e instanceof Error ? e.message.slice(0, 200) : "firebase-admin init failed";
     app = null;
   }
   return app;
@@ -64,7 +107,18 @@ export function getAdminDb(): Firestore | null {
     db = null;
     return null;
   }
-  db = getFirestore(a);
+  try {
+    const mods = loadAdminModules();
+    if (!mods) {
+      db = null;
+      return null;
+    }
+    db = mods.getFirestore(a);
+  } catch (e) {
+    adminLoadError =
+      e instanceof Error ? e.message.slice(0, 200) : "firestore init failed";
+    db = null;
+  }
   return db;
 }
 
@@ -75,7 +129,18 @@ export function getAdminAuth(): Auth | null {
     auth = null;
     return null;
   }
-  auth = getAuth(a);
+  try {
+    const mods = loadAdminModules();
+    if (!mods) {
+      auth = null;
+      return null;
+    }
+    auth = mods.getAuth(a);
+  } catch (e) {
+    adminLoadError =
+      e instanceof Error ? e.message.slice(0, 200) : "auth init failed";
+    auth = null;
+  }
   return auth;
 }
 
@@ -84,16 +149,23 @@ export async function verifyUserIdToken(
   idToken: string
 ): Promise<{ uid: string; email?: string } | null> {
   if (!idToken?.trim()) return null;
-  const adminAuth = getAdminAuth();
-  if (adminAuth) {
-    try {
-      const decoded = await adminAuth.verifyIdToken(idToken);
-      return { uid: decoded.uid, email: decoded.email };
-    } catch {
-      return null;
+
+  // Prefer Admin when configured; never throw out of this function
+  try {
+    const adminAuth = getAdminAuth();
+    if (adminAuth) {
+      try {
+        const decoded = await adminAuth.verifyIdToken(idToken);
+        return { uid: decoded.uid, email: decoded.email };
+      } catch {
+        // fall through to REST — expired/wrong token also fails here
+      }
     }
+  } catch {
+    /* ignore admin path */
   }
-  // Fallback: Google Identity Toolkit
+
+  // Fallback: Google Identity Toolkit (works without service account)
   const apiKey = process.env.NEXT_PUBLIC_FIREBASE_API_KEY;
   if (!apiKey) return null;
   try {

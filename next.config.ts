@@ -1,7 +1,9 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  /* config options here */
+  // firebase-admin must stay external — bundling it breaks paper API routes
+  // on Vercel (HTML 500 before the handler runs).
+  serverExternalPackages: ["firebase-admin"],
 };
 
 export default nextConfig;

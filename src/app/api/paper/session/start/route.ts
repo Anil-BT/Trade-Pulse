@@ -36,29 +36,41 @@ function normalizeWindows(
     .filter((w) => w.start && w.end);
 }
 
+function jsonError(message: string, status = 500) {
+  return NextResponse.json(
+    { error: String(message || "Start failed").slice(0, 500) },
+    { status }
+  );
+}
+
 export async function POST(req: NextRequest) {
   try {
     let body: Record<string, unknown>;
     try {
       body = (await req.json()) as Record<string, unknown>;
     } catch {
-      return NextResponse.json({ error: "Invalid JSON body" }, { status: 400 });
+      return jsonError("Invalid JSON body", 400);
     }
 
     // Firebase JWT — do not run through aggressive token sanitizer
     const rawAuth = req.headers.get("authorization") || "";
     const idToken = cleanIdToken(
-      rawAuth.replace(/^Bearer\s+/i, "") ||
-        String(body.idToken || "")
+      rawAuth.replace(/^Bearer\s+/i, "") || String(body.idToken || "")
     );
-    const user = await verifyUserIdToken(idToken);
+    let user: { uid: string; email?: string } | null = null;
+    try {
+      user = await verifyUserIdToken(idToken);
+    } catch (e) {
+      console.error("[paper-start] verifyUserIdToken:", e);
+      return jsonError(
+        "Auth verification failed. Check Firebase config / re-sign in.",
+        401
+      );
+    }
     if (!user?.uid) {
-      return NextResponse.json(
-        {
-          error:
-            "Sign in required to start a durable paper session (survives browser close).",
-        },
-        { status: 401 }
+      return jsonError(
+        "Sign in required to start a durable paper session (survives browser close).",
+        401
       );
     }
 
@@ -66,12 +78,9 @@ export async function POST(req: NextRequest) {
       String(body.upstoxAccessToken || process.env.UPSTOX_ACCESS_TOKEN || "")
     );
     if (!token) {
-      return NextResponse.json(
-        {
-          error:
-            "Upstox access token required. Paste the same token that works in Backtest.",
-        },
-        { status: 400 }
+      return jsonError(
+        "Upstox access token required. Paste the same token that works in Backtest.",
+        400
       );
     }
 
@@ -80,31 +89,22 @@ export async function POST(req: NextRequest) {
       // Do not ascii-strip strategy strings (indicator names are already ASCII)
       config = cleanForStorage(body.config as PaperSessionConfig, false);
     } catch (e) {
-      return NextResponse.json(
-        {
-          error:
-            e instanceof Error
-              ? e.message
-              : "Strategy config could not be serialized.",
-        },
-        { status: 400 }
+      return jsonError(
+        e instanceof Error
+          ? e.message
+          : "Strategy config could not be serialized.",
+        400
       );
     }
 
     if (!config?.strategy?.entry?.length || !config?.strategy?.exit?.length) {
-      return NextResponse.json(
-        { error: "Strategy 1 entry and exit required" },
-        { status: 400 }
-      );
+      return jsonError("Strategy 1 entry and exit required", 400);
     }
     if (config.strategy2) {
       if (!config.strategy2.entry?.length || !config.strategy2.exit?.length) {
-        return NextResponse.json(
-          {
-            error:
-              "Strategy 2 needs entry and exit conditions (or disable dual strategy).",
-          },
-          { status: 400 }
+        return jsonError(
+          "Strategy 2 needs entry and exit conditions (or disable dual strategy).",
+          400
         );
       }
     }
@@ -187,7 +187,12 @@ export async function POST(req: NextRequest) {
         : "Starting server worker...",
     };
 
-    await saveSession(doc);
+    try {
+      await saveSession(doc);
+    } catch (e) {
+      console.error("[paper-start] saveSession:", e);
+      // Memory may still hold the session; continue so client gets JSON success
+    }
 
     // Lazy-import worker so a worker-module crash never turns this route into HTML 500
     setTimeout(() => {
@@ -212,11 +217,14 @@ export async function POST(req: NextRequest) {
     });
   } catch (e) {
     console.error("[paper-start]", e);
-    const msg = safeErrorMessage(e) || "Start failed";
-    const friendly = /bytestring|character at index|invalid string/i.test(msg)
-      ? `Paper start failed (invalid string/token). Re-paste Upstox token as plain ASCII, sign out/in, and retry. Detail: ${msg}`
-      : msg;
-    // Always JSON — never let Next fall through to an HTML error page
-    return NextResponse.json({ error: friendly }, { status: 500 });
+    try {
+      const msg = safeErrorMessage(e) || "Start failed";
+      const friendly = /bytestring|character at index|invalid string/i.test(msg)
+        ? `Paper start failed (invalid string/token). Re-paste Upstox token as plain ASCII, sign out/in, and retry. Detail: ${msg}`
+        : msg;
+      return jsonError(friendly, 500);
+    } catch {
+      return jsonError("Start failed (unhandled server error)", 500);
+    }
   }
 }
