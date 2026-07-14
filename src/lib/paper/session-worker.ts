@@ -480,10 +480,22 @@ export async function processPaperSession(
   }
 }
 
+/**
+ * Kick a worker tick. On Vercel/serverless, setInterval dies after the response —
+ * only fire one process (cron + status polls drive further ticks).
+ * Locally, keep an interval for continuous paper runs.
+ */
 export function ensureSessionLoop(sessionId: string, everyMs = 60_000) {
   const timers = memTimers();
-  if (timers.has(sessionId)) return;
+  // Always run at least one tick (async, non-blocking for HTTP handlers)
   void processPaperSession(sessionId);
+
+  // Serverless: no long-lived intervals
+  if (process.env.VERCEL || process.env.AWS_LAMBDA_FUNCTION_NAME) {
+    return;
+  }
+
+  if (timers.has(sessionId)) return;
   const t = setInterval(() => {
     void processPaperSession(sessionId);
   }, everyMs);

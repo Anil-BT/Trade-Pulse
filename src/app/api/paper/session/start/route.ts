@@ -1,14 +1,20 @@
-import { NextRequest, NextResponse } from "next/server";
+import { after, NextRequest, NextResponse } from "next/server";
 import { verifyUserIdToken } from "@/lib/firebase/admin";
 import { safeErrorMessage, sanitizeToken } from "@/lib/http";
 import { todayIst } from "@/lib/paper/market-hours";
 import { asciiSafe, cleanForStorage, cleanIdToken } from "@/lib/paper/sanitize";
 import {
+  durableStoreHint,
   getActiveSession,
+  isDurableStoreReady,
   markSessionStopped,
   saveSession,
+  toPublicSession,
 } from "@/lib/paper/session-store";
-import type { PaperSessionConfig, PaperSessionDoc } from "@/lib/paper/session-types";
+import type {
+  PaperSessionConfig,
+  PaperSessionDoc,
+} from "@/lib/paper/session-types";
 import { uid } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
@@ -38,7 +44,7 @@ function normalizeWindows(
 
 function jsonError(message: string, status = 500) {
   return NextResponse.json(
-    { error: String(message || "Start failed").slice(0, 500) },
+    { error: String(message || "Start failed").slice(0, 600) },
     { status }
   );
 }
@@ -50,6 +56,17 @@ export async function POST(req: NextRequest) {
       body = (await req.json()) as Record<string, unknown>;
     } catch {
       return jsonError("Invalid JSON body", 400);
+    }
+
+    // On Vercel, in-memory sessions vanish between requests — require Firestore
+    const requireDurable =
+      Boolean(process.env.VERCEL) || body.requireDurable !== false;
+    if (requireDurable && !isDurableStoreReady()) {
+      return jsonError(
+        `Paper trading needs durable storage on this host. ${durableStoreHint()} ` +
+          "Add FIREBASE_SERVICE_ACCOUNT_JSON in Vercel → Settings → Environment Variables, then redeploy.",
+        503
+      );
     }
 
     // Firebase JWT — do not run through aggressive token sanitizer
@@ -86,7 +103,6 @@ export async function POST(req: NextRequest) {
 
     let config: PaperSessionConfig;
     try {
-      // Do not ascii-strip strategy strings (indicator names are already ASCII)
       config = cleanForStorage(body.config as PaperSessionConfig, false);
     } catch (e) {
       return jsonError(
@@ -187,33 +203,39 @@ export async function POST(req: NextRequest) {
         : "Starting server worker...",
     };
 
-    try {
-      await saveSession(doc);
-    } catch (e) {
-      console.error("[paper-start] saveSession:", e);
-      // Memory may still hold the session; continue so client gets JSON success
+    const saved = await saveSession(doc);
+    if (requireDurable && !saved.durable) {
+      return jsonError(
+        `Could not save paper session to Firestore. ${saved.error || durableStoreHint()} ` +
+          "Without this, status will stay empty on Vercel.",
+        503
+      );
+    }
+    if (!saved.ok) {
+      return jsonError(saved.error || "Failed to save session", 500);
     }
 
-    // Lazy-import worker so a worker-module crash never turns this route into HTML 500
-    setTimeout(() => {
-      void import("@/lib/paper/session-worker")
-        .then(({ ensureSessionLoop }) => {
-          try {
-            ensureSessionLoop(id, 60_000);
-          } catch (e) {
-            console.error("[paper-start] ensureSessionLoop:", e);
-          }
-        })
-        .catch((e) => {
-          console.error("[paper-start] worker import:", e);
-        });
-    }, 500);
+    // Keep working after the HTTP response (Vercel/serverless-safe)
+    after(async () => {
+      try {
+        const { processPaperSession } = await import(
+          "@/lib/paper/session-worker"
+        );
+        await processPaperSession(id, user.uid);
+      } catch (e) {
+        console.error("[paper-start] first tick:", e);
+      }
+    });
 
     return NextResponse.json({
       sessionId: id,
       status: "running",
       endsAt,
-      note: "Paper session is running on the server. Close browser or log out — reopen Paper trading while signed in to view progress.",
+      durable: saved.durable,
+      session: toPublicSession(doc),
+      note: saved.durable
+        ? "Paper session saved. Status updates on Refresh / poll; first tick runs in background."
+        : "Session is memory-only (not durable across instances).",
     });
   } catch (e) {
     console.error("[paper-start]", e);

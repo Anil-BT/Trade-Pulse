@@ -122,10 +122,29 @@ export function PaperTradingApp() {
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [session, setSession] = useState<SafeSession | null>(null);
+  /** Last known session id (survives a null status poll briefly) */
+  const [knownSessionId, setKnownSessionId] = useState<string | null>(() => {
+    if (typeof window === "undefined") return null;
+    try {
+      return localStorage.getItem("tp_paper_session_id");
+    } catch {
+      return null;
+    }
+  });
   const [statusLine, setStatusLine] = useState(sessionStatus().label);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
   const running = session?.status === "running";
+
+  function rememberSessionId(id: string | null) {
+    setKnownSessionId(id);
+    try {
+      if (id) localStorage.setItem("tp_paper_session_id", id);
+      else localStorage.removeItem("tp_paper_session_id");
+    } catch {
+      /* ignore */
+    }
+  }
 
   async function idToken(): Promise<string | null> {
     if (!user) return null;
@@ -138,26 +157,55 @@ export function PaperTradingApp() {
     }
   }
 
-  const refreshStatus = useCallback(async () => {
-    const token = await idToken();
-    if (!token) return;
-    try {
-      // POST body carries auth — avoids Safari header / long-query issues
-      const res = await paperFetch("/api/paper/session/status", {
-        method: "POST",
-        token,
-        body: {},
-      });
-      const data = await parseApiJson<{
-        session?: SafeSession | null;
-        error?: string;
-      }>(res);
-      if (!res.ok) return;
-      setSession(data.session || null);
-    } catch {
-      /* ignore poll noise */
-    }
-  }, [user]);
+  const refreshStatus = useCallback(
+    async (sessionIdOverride?: string | null) => {
+      const token = await idToken();
+      if (!token) return;
+      try {
+        const sid =
+          sessionIdOverride ||
+          knownSessionId ||
+          (typeof window !== "undefined"
+            ? localStorage.getItem("tp_paper_session_id")
+            : null);
+        // POST body carries auth — avoids Safari header / long-query issues
+        const res = await paperFetch("/api/paper/session/status", {
+          method: "POST",
+          token,
+          body: sid ? { sessionId: sid } : {},
+        });
+        const data = await parseApiJson<{
+          session?: SafeSession | null;
+          error?: string;
+          durableReady?: boolean;
+          hint?: string;
+        }>(res);
+        if (!res.ok) {
+          if (data.error) setError(data.error);
+          return;
+        }
+        if (data.session) {
+          setSession(data.session);
+          if (data.session.id) rememberSessionId(data.session.id);
+          setError(null);
+        } else {
+          // Don't wipe optimistic UI immediately if we just started
+          setSession((prev) => {
+            if (prev?.status === "running" && prev.id && sid === prev.id) {
+              return prev;
+            }
+            return null;
+          });
+          if (data.hint) {
+            setError(data.hint);
+          }
+        }
+      } catch {
+        /* ignore poll noise */
+      }
+    },
+    [user, knownSessionId]
+  );
 
   // Load active session on mount / when user signs in
   useEffect(() => {
@@ -170,7 +218,7 @@ export function PaperTradingApp() {
 
   // Poll status while session running (UI only — work is on server)
   useEffect(() => {
-    if (!running || !user) {
+    if ((!running && !knownSessionId) || !user) {
       if (pollRef.current) clearInterval(pollRef.current);
       pollRef.current = null;
       return;
@@ -181,7 +229,7 @@ export function PaperTradingApp() {
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
-  }, [running, user, refreshStatus]);
+  }, [running, knownSessionId, user, refreshStatus]);
 
   useEffect(() => {
     const t = setInterval(() => setStatusLine(sessionStatus().label), 30_000);
@@ -308,11 +356,35 @@ export function PaperTradingApp() {
           },
         },
       });
-      const data = await parseApiJson<{ error?: string; sessionId?: string }>(
-        res
-      );
+      const data = await parseApiJson<{
+        error?: string;
+        sessionId?: string;
+        status?: string;
+        endsAt?: number;
+        durable?: boolean;
+        session?: SafeSession;
+        note?: string;
+      }>(res);
       if (!res.ok) throw new Error(data.error || `Start failed (${res.status})`);
-      await refreshStatus();
+
+      // Show status immediately from start response (don't wait for next poll)
+      if (data.sessionId) rememberSessionId(data.sessionId);
+      if (data.session) {
+        setSession(data.session);
+      } else if (data.sessionId) {
+        setSession({
+          id: data.sessionId,
+          status: data.status || "running",
+          sessionDay: "",
+          startedAt: Date.now(),
+          endsAt: data.endsAt || Date.now() + 6 * 3600_000,
+          updatedAt: Date.now(),
+          workerNote: data.note || "Session started…",
+          tickCount: 0,
+        });
+      }
+      // Pull latest from server by sessionId (state update is async)
+      await refreshStatus(data.sessionId || null);
     } catch (e) {
       setError(safeErrorMessage(e) || "Start failed");
     } finally {
@@ -339,6 +411,7 @@ export function PaperTradingApp() {
       });
       const data = await parseApiJson<{ error?: string }>(res);
       if (!res.ok) throw new Error(data.error || `Stop failed (${res.status})`);
+      rememberSessionId(null);
       await refreshStatus();
     } catch (e) {
       setError(safeErrorMessage(e) || "Stop failed");
@@ -396,6 +469,11 @@ export function PaperTradingApp() {
                         ? "Session stopped"
                         : "No active session"}
                 </p>
+                {session?.id && (
+                  <p className="mt-0.5 text-[10px] font-mono text-neutral-400">
+                    id {session.id.slice(0, 12)}…
+                  </p>
+                )}
                 <p className="mt-1 text-xs text-neutral-500">{statusLine}</p>
                 {session?.workerNote && (
                   <p className="mt-0.5 text-[11px] text-neutral-600">

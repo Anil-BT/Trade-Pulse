@@ -1,14 +1,18 @@
-import { NextRequest, NextResponse } from "next/server";
+import { after, NextRequest, NextResponse } from "next/server";
 import { verifyUserIdToken } from "@/lib/firebase/admin";
 import { safeErrorMessage } from "@/lib/http";
-import { cleanIdToken, compactSession } from "@/lib/paper/sanitize";
+import { cleanIdToken } from "@/lib/paper/sanitize";
 import {
+  durableStoreHint,
   getActiveSession,
   getSession,
+  isDurableStoreReady,
+  toPublicSession,
 } from "@/lib/paper/session-store";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
+export const maxDuration = 60;
 
 async function handleStatus(
   req: NextRequest,
@@ -29,48 +33,49 @@ async function handleStatus(
     (typeof body.sessionId === "string" && body.sessionId) ||
     req.nextUrl.searchParams.get("sessionId") ||
     "";
-  const doc = sessionId
+  let doc = sessionId
     ? await getSession(user.uid, sessionId)
     : await getActiveSession(user.uid);
 
+  // Drive paper work from status polls (Hobby cron is only daily)
   if (doc?.status === "running") {
-    void import("@/lib/paper/session-worker")
-      .then(({ ensureSessionLoop }) => {
+    const sid = doc.id;
+    const uid = user.uid;
+    const last = doc.lastWorkerAt || 0;
+    // At most one background tick per ~45s per session (avoid overlap)
+    if (Date.now() - last > 45_000) {
+      after(async () => {
         try {
-          ensureSessionLoop(doc.id, 60_000);
+          const { processPaperSession } = await import(
+            "@/lib/paper/session-worker"
+          );
+          await processPaperSession(sid, uid);
         } catch (e) {
-          console.error("[paper-status] ensureSessionLoop:", e);
+          console.error("[paper-status] tick:", e);
         }
-      })
-      .catch((e) => console.error("[paper-status] worker import:", e));
+      });
+    }
   }
 
   if (!doc) {
-    return NextResponse.json({ session: null });
+    return NextResponse.json({
+      session: null,
+      durableReady: isDurableStoreReady(),
+      hint: !isDurableStoreReady() ? durableStoreHint() : undefined,
+    });
   }
 
-  // Never send token; compact so response never hits string-length limits
-  const { upstoxAccessToken: _t, ...rest } = doc;
-  let safe: Record<string, unknown> = rest as Record<string, unknown>;
-  try {
-    safe = compactSession(rest as never) as Record<string, unknown>;
-  } catch {
-    safe = {
-      id: doc.id,
-      status: doc.status,
-      sessionDay: doc.sessionDay,
-      startedAt: doc.startedAt,
-      endsAt: doc.endsAt,
-      updatedAt: doc.updatedAt,
-      workerNote: doc.workerNote,
-      lastError: doc.lastError,
-      tickCount: doc.tickCount,
-      lastBatch: doc.lastBatch,
-      eventLog: (doc.eventLog || []).slice(0, 10),
-    };
+  // Re-read after optional work is scheduled (returns current Firestore state)
+  if (sessionId) {
+    doc = (await getSession(user.uid, sessionId)) || doc;
+  } else {
+    doc = (await getActiveSession(user.uid)) || doc;
   }
 
-  return NextResponse.json({ session: safe });
+  return NextResponse.json({
+    session: toPublicSession(doc),
+    durableReady: isDurableStoreReady(),
+  });
 }
 
 export async function GET(req: NextRequest) {
