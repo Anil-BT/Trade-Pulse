@@ -58,16 +58,36 @@ service cloud.firestore {
 }
 ```
 
-For **durable paper trading** (keeps running after browser close on multi-instance / Vercel), also set:
+### Durable paper trading (required on Vercel)
 
-```bash
-FIREBASE_SERVICE_ACCOUNT_JSON='{"type":"service_account",...}'
-CRON_SECRET=some-long-random-string
-```
+`NEXT_PUBLIC_FIREBASE_*` only powers **browser** auth. Paper sessions are saved by the **server**, which needs a service account:
 
-Vercel Cron hits `/api/paper/session/worker` every minute (see `vercel.json`).
+1. Firebase Console → ⚙️ **Project settings** → **Service accounts**
+2. **Generate new private key** → download the JSON file
+3. Open the file; it looks like:
+   ```json
+   {
+     "type": "service_account",
+     "project_id": "your-project",
+     "private_key_id": "...",
+     "private_key": "-----BEGIN PRIVATE KEY-----\n...\n-----END PRIVATE KEY-----\n",
+     "client_email": "firebase-adminsdk-...@....iam.gserviceaccount.com",
+     ...
+   }
+   ```
+4. **Vercel** → your TradePulse project → **Settings** → **Environment Variables**
+   - Name: `FIREBASE_SERVICE_ACCOUNT_JSON`
+   - Value: paste the **entire JSON** as one value (Vercel multi-line is OK)
+   - Environments: Production (and Preview if you test previews)
+5. **Redeploy** Production (Deployments → … → Redeploy) so the new env is picked up
+6. Optional: `CRON_SECRET=some-long-random-string` to protect the paper worker route
 
-5. **Publish**
+If `private_key` newlines were flattened in the env UI, the app rewrites `\\n` → real newlines automatically.
+
+Without this variable you will see:  
+*“Set FIREBASE_SERVICE_ACCOUNT_JSON in Vercel env…”*
+
+5. **Publish** Firestore rules (section above) if not already done.
 
 Data shape:
 
