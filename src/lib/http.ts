@@ -59,5 +59,55 @@ export function safeErrorMessage(err: unknown): string {
   if (/^invalid string$/i.test(cleaned)) {
     return "Invalid string (often a bad token, date, or instrument key). Re-paste Upstox token and retry.";
   }
+  if (/did not match the expected pattern|string did not match/i.test(cleaned)) {
+    return "Request blocked by the browser (often Safari header/time validation). Re-sign in, re-paste Upstox token as plain text, and try again.";
+  }
+  if (/unexpected token|not valid json|DOCTYPE/i.test(cleaned)) {
+    return "Server returned a non-JSON response (page error or timeout). Retry in a moment; if it persists, check deploy/logs.";
+  }
   return cleaned || "Unknown error";
+}
+
+/**
+ * Parse fetch Response as JSON without throwing on HTML error pages
+ * (e.g. Vercel/Next 500 HTML → "Unexpected token '<' ... is not valid JSON").
+ */
+export async function parseApiJson<T = Record<string, unknown>>(
+  res: Response
+): Promise<T> {
+  const text = await res.text();
+  const trimmed = (text || "").trim();
+  if (!trimmed) {
+    throw new Error(
+      res.ok
+        ? "Empty response from server"
+        : `Server error ${res.status} (empty body)`
+    );
+  }
+  if (trimmed.startsWith("<") || /^<!DOCTYPE/i.test(trimmed)) {
+    throw new Error(
+      `Server returned HTML instead of JSON (HTTP ${res.status}). ` +
+        "Usually a deploy error, timeout, or missing API route — retry or check server logs."
+    );
+  }
+  try {
+    return JSON.parse(trimmed) as T;
+  } catch {
+    const snippet = trimmed.slice(0, 120).replace(/\s+/g, " ");
+    throw new Error(
+      `Invalid JSON from server (HTTP ${res.status}): ${snippet}`
+    );
+  }
+}
+
+/**
+ * Firebase JWT for Authorization / body — strip BOM/whitespace only.
+ * Safe for Safari Headers (must be printable ASCII without spaces).
+ */
+export function cleanClientIdToken(token: string): string {
+  return String(token ?? "")
+    .replace(/^\uFEFF/, "")
+    .replace(/\s+/g, "")
+    .replace(/[^\x21-\x7E]/g, "")
+    .trim();
 }

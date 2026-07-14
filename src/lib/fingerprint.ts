@@ -61,6 +61,13 @@ export function buildCacheFingerprint(s: CacheSettings): string {
       name: s.strategy.name,
       entryLogic: s.strategy.entryLogic ?? "and",
       exitLogic: s.strategy.exitLogic ?? "and",
+      trailStopToCost: s.strategy.trailStopToCost?.enabled
+        ? {
+            enabled: true,
+            profitPctOfCapital:
+              s.strategy.trailStopToCost.profitPctOfCapital ?? 20,
+          }
+        : null,
       entry: s.strategy.entry.map((c) => ({
         left: c.left,
         op: c.op,

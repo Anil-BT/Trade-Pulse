@@ -26,6 +26,8 @@ export type IndicatorType =
   | "EMA"
   | "SMA"
   | "RSI"
+  /** Average Directional Index (Wilder), default period 14 */
+  | "ADX"
   /** Session VWAP (resets each IST trading day) */
   | "VWAP"
   | "OPENING_RANGE_HIGH"
@@ -76,6 +78,15 @@ export interface StrategyConfig {
   /** All entry conditions must be true (AND). Default true. */
   entryLogic?: "and" | "or";
   exitLogic?: "and" | "or";
+  /**
+   * Trail stop to entry (breakeven) once unrealized profit ≥ this % of initial capital.
+   * Example: profitPctOfCapital = 20 → arm when uPnL ≥ 20% of capital, then exit at cost if price returns.
+   */
+  trailStopToCost?: {
+    enabled: boolean;
+    /** % of initial capital (default 20) */
+    profitPctOfCapital?: number;
+  };
 }
 
 export interface OptionsTradeSettings {
@@ -172,8 +183,8 @@ export interface Trade {
   pnl: number;
   pnlPct: number;
   barsHeld: number;
-  /** Why the trade closed (strategy signal vs max-risk stop) */
-  exitReason?: "signal" | "max_risk" | "eod";
+  /** Why the trade closed (strategy signal vs max-risk / trail-to-cost stop) */
+  exitReason?: "signal" | "max_risk" | "trail_cost" | "eod";
   /** Equity underlying spot used for signals at entry/exit */
   underlyingEntry?: number;
   underlyingExit?: number;
@@ -306,8 +317,12 @@ export interface BacktestResult {
     skippedInsufficientCapital: number;
     /** Trades closed because unrealized loss hit max risk */
     maxRiskStops?: number;
+    /** Trades closed on trail-to-cost (breakeven) stop */
+    trailCostStops?: number;
     minLotCost?: number;
     maxRiskCap?: number;
+    /** ₹ profit level that arms trail-to-cost */
+    trailProfitThreshold?: number;
     note?: string;
     /** Bars used for indicators / signals */
     candleCount?: number;

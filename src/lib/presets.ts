@@ -222,6 +222,124 @@ export const PRESET_OR_EMA20_FIB_S3_PDL: StrategyConfig = {
   ],
 };
 
+/**
+ * VWAP Bull — trend-following long bias
+ * Entry: EMA9 > EMA21, close > VWAP, RSI 50–70, close > SMA20, ADX > 20
+ * Exit:  close < EMA21
+ * Trail: move SL to cost when unrealized profit ≥ 20% of capital
+ */
+export const PRESET_VWAP_BULL: StrategyConfig = {
+  name: "VWAP Bull",
+  entryLogic: "and",
+  exitLogic: "and",
+  trailStopToCost: { enabled: true, profitPctOfCapital: 20 },
+  entry: [
+    {
+      id: "e1",
+      left: { indicator: "EMA", period: 9 },
+      op: "gt",
+      right: { indicator: "EMA", period: 21 },
+    },
+    {
+      id: "e2",
+      left: "close",
+      op: "gt",
+      right: { indicator: "VWAP", period: 1 },
+    },
+    {
+      id: "e3",
+      left: { indicator: "RSI", period: 14 },
+      op: "gt",
+      right: 50,
+    },
+    {
+      id: "e4",
+      left: { indicator: "RSI", period: 14 },
+      op: "lt",
+      right: 70,
+    },
+    {
+      id: "e5",
+      left: "close",
+      op: "gt",
+      right: { indicator: "SMA", period: 20 },
+    },
+    {
+      id: "e6",
+      left: { indicator: "ADX", period: 14 },
+      op: "gt",
+      right: 20,
+    },
+  ],
+  exit: [
+    {
+      id: "x1",
+      left: "close",
+      op: "lt",
+      right: { indicator: "EMA", period: 21 },
+    },
+  ],
+};
+
+/**
+ * VWAP Bear — short-bias conditions (use PE in options mode)
+ * Entry: EMA9 < EMA21, close < VWAP, RSI 30–50, close > SMA20, ADX < 20
+ * Exit:  close > EMA21
+ * Trail: move SL to cost when unrealized profit ≥ 20% of capital
+ */
+export const PRESET_VWAP_BEAR: StrategyConfig = {
+  name: "VWAP Bear",
+  entryLogic: "and",
+  exitLogic: "and",
+  trailStopToCost: { enabled: true, profitPctOfCapital: 20 },
+  entry: [
+    {
+      id: "e1",
+      left: { indicator: "EMA", period: 9 },
+      op: "lt",
+      right: { indicator: "EMA", period: 21 },
+    },
+    {
+      id: "e2",
+      left: "close",
+      op: "lt",
+      right: { indicator: "VWAP", period: 1 },
+    },
+    {
+      id: "e3",
+      left: { indicator: "RSI", period: 14 },
+      op: "lt",
+      right: 50,
+    },
+    {
+      id: "e4",
+      left: { indicator: "RSI", period: 14 },
+      op: "gt",
+      right: 30,
+    },
+    {
+      id: "e5",
+      left: "close",
+      op: "gt",
+      right: { indicator: "SMA", period: 20 },
+    },
+    {
+      id: "e6",
+      left: { indicator: "ADX", period: 14 },
+      op: "lt",
+      right: 20,
+    },
+  ],
+  exit: [
+    {
+      id: "x1",
+      left: "close",
+      op: "gt",
+      right: { indicator: "EMA", period: 21 },
+    },
+  ],
+};
+
 export const STRATEGY_PRESETS: StrategyConfig[] = [
   PRESET_OPENING_RANGE_EMA,
   PRESET_OR_EMA20_FIB_R3,
@@ -229,4 +347,6 @@ export const STRATEGY_PRESETS: StrategyConfig[] = [
   PRESET_OR_EMA20_FIB_S3_PDL,
   PRESET_EMA_CROSS,
   PRESET_RSI_MEAN_REVERSION,
+  PRESET_VWAP_BULL,
+  PRESET_VWAP_BEAR,
 ];

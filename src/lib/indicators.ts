@@ -195,6 +195,92 @@ function calcFibLevels(H: number, L: number, C: number) {
 }
 
 /**
+ * Average Directional Index (Wilder).
+ * Uses high/low/close; period default 14.
+ * Returns null until enough bars for a stable ADX seed.
+ */
+export function adx(candles: Candle[], period = 14): (number | null)[] {
+  const n = candles.length;
+  const out: (number | null)[] = new Array(n).fill(null);
+  if (period <= 0 || n < period * 2) return out;
+
+  const tr: number[] = new Array(n).fill(0);
+  const plusDM: number[] = new Array(n).fill(0);
+  const minusDM: number[] = new Array(n).fill(0);
+
+  for (let i = 1; i < n; i++) {
+    const h = candles[i].high;
+    const l = candles[i].low;
+    const prevH = candles[i - 1].high;
+    const prevL = candles[i - 1].low;
+    const prevC = candles[i - 1].close;
+    tr[i] = Math.max(h - l, Math.abs(h - prevC), Math.abs(l - prevC));
+    const up = h - prevH;
+    const down = prevL - l;
+    plusDM[i] = up > down && up > 0 ? up : 0;
+    minusDM[i] = down > up && down > 0 ? down : 0;
+  }
+
+  // Wilder smooth TR / +DM / -DM
+  let atr = 0;
+  let smoothPlus = 0;
+  let smoothMinus = 0;
+  for (let i = 1; i <= period; i++) {
+    atr += tr[i];
+    smoothPlus += plusDM[i];
+    smoothMinus += minusDM[i];
+  }
+
+  const dx: (number | null)[] = new Array(n).fill(null);
+  const di = (p: number, m: number, t: number) => {
+    if (t <= 0) return { plus: 0, minus: 0, dx: 0 };
+    const plusDI = (100 * p) / t;
+    const minusDI = (100 * m) / t;
+    const sum = plusDI + minusDI;
+    return {
+      plus: plusDI,
+      minus: minusDI,
+      dx: sum === 0 ? 0 : (100 * Math.abs(plusDI - minusDI)) / sum,
+    };
+  };
+
+  let first = di(smoothPlus, smoothMinus, atr);
+  dx[period] = first.dx;
+
+  for (let i = period + 1; i < n; i++) {
+    atr = atr - atr / period + tr[i];
+    smoothPlus = smoothPlus - smoothPlus / period + plusDM[i];
+    smoothMinus = smoothMinus - smoothMinus / period + minusDM[i];
+    first = di(smoothPlus, smoothMinus, atr);
+    dx[i] = first.dx;
+  }
+
+  // ADX = Wilder smooth of DX; first ADX at index 2*period - 1
+  let adxSum = 0;
+  let seeded = false;
+  let prevAdx = 0;
+  let count = 0;
+  for (let i = period; i < n; i++) {
+    const dxi = dx[i];
+    if (dxi == null) continue;
+    if (!seeded) {
+      adxSum += dxi;
+      count += 1;
+      if (count === period) {
+        prevAdx = adxSum / period;
+        out[i] = prevAdx;
+        seeded = true;
+      }
+      continue;
+    }
+    prevAdx = (prevAdx * (period - 1) + dxi) / period;
+    out[i] = prevAdx;
+  }
+
+  return out;
+}
+
+/**
  * Session VWAP — resets each IST trading day.
  * Typical price = (H + L + C) / 3; VWAP = Σ(TP × V) / Σ(V).
  * Period is ignored (always session-based).
@@ -281,6 +367,8 @@ export function computeIndicator(
       return sma(closes, period);
     case "RSI":
       return rsi(closes, period);
+    case "ADX":
+      return adx(candles, period || 14);
     case "VWAP":
       return sessionVwap(candles);
     case "OPENING_RANGE_HIGH": {
@@ -369,6 +457,7 @@ export function indicatorKey(type: IndicatorType, period?: number): string {
   if (type === "BREAKOUT_HIGH") return `BOH_${period ?? 1}`;
   if (type === "BREAKOUT_LOW") return `BOL_${period ?? 1}`;
   if (type === "VWAP") return "VWAP";
+  if (type === "ADX") return `ADX_${period ?? 14}`;
   if (type.startsWith("FIB_PIVOT")) return type;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return type;
   return `${type}_${period ?? 9}`;

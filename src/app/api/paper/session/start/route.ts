@@ -8,11 +8,11 @@ import {
   markSessionStopped,
   saveSession,
 } from "@/lib/paper/session-store";
-import { ensureSessionLoop } from "@/lib/paper/session-worker";
 import type { PaperSessionConfig, PaperSessionDoc } from "@/lib/paper/session-types";
 import { uid } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
+export const runtime = "nodejs";
 export const maxDuration = 60;
 
 function sessionEndsAtMs(): number {
@@ -189,13 +189,19 @@ export async function POST(req: NextRequest) {
 
     await saveSession(doc);
 
-    // Defer first worker tick so HTTP response is not blocked / oversized
+    // Lazy-import worker so a worker-module crash never turns this route into HTML 500
     setTimeout(() => {
-      try {
-        ensureSessionLoop(id, 60_000);
-      } catch (e) {
-        console.error("[paper-start] ensureSessionLoop:", e);
-      }
+      void import("@/lib/paper/session-worker")
+        .then(({ ensureSessionLoop }) => {
+          try {
+            ensureSessionLoop(id, 60_000);
+          } catch (e) {
+            console.error("[paper-start] ensureSessionLoop:", e);
+          }
+        })
+        .catch((e) => {
+          console.error("[paper-start] worker import:", e);
+        });
     }, 500);
 
     return NextResponse.json({
@@ -210,6 +216,7 @@ export async function POST(req: NextRequest) {
     const friendly = /bytestring|character at index|invalid string/i.test(msg)
       ? `Paper start failed (invalid string/token). Re-paste Upstox token as plain ASCII, sign out/in, and retry. Detail: ${msg}`
       : msg;
+    // Always JSON — never let Next fall through to an HTML error page
     return NextResponse.json({ error: friendly }, { status: 500 });
   }
 }

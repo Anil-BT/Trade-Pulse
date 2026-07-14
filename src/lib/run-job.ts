@@ -291,7 +291,7 @@ function collect(
   if (typeof op === "string") return;
   const period =
     op.period ??
-    (op.indicator === "RSI"
+    (op.indicator === "RSI" || op.indicator === "ADX"
       ? 14
       : op.indicator === "VWAP" ||
           op.indicator.startsWith("FIB") ||
@@ -342,7 +342,7 @@ function val(
   if (typeof operand === "string") return map.get(operand)?.[i] ?? null;
   const period =
     operand.period ??
-    (operand.indicator === "RSI"
+    (operand.indicator === "RSI" || operand.indicator === "ADX"
       ? 14
       : operand.indicator === "VWAP" ||
           operand.indicator.startsWith("FIB") ||

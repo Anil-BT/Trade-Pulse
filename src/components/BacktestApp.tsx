@@ -1263,9 +1263,52 @@ export function BacktestApp() {
                 onChange={(e) =>
                   setStrategy((s) => ({ ...s, name: e.target.value }))
                 }
-                className="field-input mb-6"
+                className="field-input mb-4"
               />
             </Field>
+
+            <label className="mb-6 flex flex-wrap items-center gap-3 text-sm text-neutral-700">
+              <input
+                type="checkbox"
+                checked={Boolean(strategy.trailStopToCost?.enabled)}
+                onChange={(e) =>
+                  setStrategy((s) => ({
+                    ...s,
+                    trailStopToCost: {
+                      enabled: e.target.checked,
+                      profitPctOfCapital:
+                        s.trailStopToCost?.profitPctOfCapital ?? 20,
+                    },
+                  }))
+                }
+                className="h-4 w-4 rounded border-neutral-300"
+              />
+              <span>
+                Trail SL to cost when profit ≥{" "}
+                <input
+                  type="number"
+                  min={1}
+                  max={100}
+                  step={1}
+                  disabled={!strategy.trailStopToCost?.enabled}
+                  value={strategy.trailStopToCost?.profitPctOfCapital ?? 20}
+                  onChange={(e) =>
+                    setStrategy((s) => ({
+                      ...s,
+                      trailStopToCost: {
+                        enabled: true,
+                        profitPctOfCapital: Math.max(
+                          1,
+                          Math.min(100, Number(e.target.value) || 20)
+                        ),
+                      },
+                    }))
+                  }
+                  className="mx-1 w-14 rounded border border-neutral-300 px-1.5 py-0.5 text-center tabular-nums disabled:opacity-40"
+                />
+                % of capital
+              </span>
+            </label>
 
             <div className="space-y-8">
               <ConditionBuilder
@@ -1555,6 +1598,12 @@ export function BacktestApp() {
                           : ""}
                         {result.diagnostics.maxRiskCap
                           ? ` · stop −₹${Math.round(result.diagnostics.maxRiskCap).toLocaleString("en-IN")}`
+                          : ""}
+                        {result.diagnostics.trailCostStops
+                          ? ` · trail-to-cost: ${result.diagnostics.trailCostStops}`
+                          : ""}
+                        {result.diagnostics.trailProfitThreshold
+                          ? ` · trail arms +₹${Math.round(result.diagnostics.trailProfitThreshold).toLocaleString("en-IN")}`
                           : ""}
                         {result.diagnostics.minLotCost
                           ? ` · ~₹${Math.ceil(result.diagnostics.minLotCost).toLocaleString("en-IN")}/lot`

@@ -113,9 +113,11 @@ export function TradesTable({ trades }: { trades: Trade[] }) {
                 <td className="px-3 py-3 text-xs whitespace-nowrap text-neutral-500">
                   {t.exitReason === "max_risk"
                     ? "Max risk stop"
-                    : t.exitReason === "eod"
-                      ? "End of data"
-                      : "Strategy"}
+                    : t.exitReason === "trail_cost"
+                      ? "Trail to cost"
+                      : t.exitReason === "eod"
+                        ? "End of data"
+                        : "Strategy"}
                 </td>
               </tr>
             );

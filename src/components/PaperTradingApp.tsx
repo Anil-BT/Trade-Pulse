@@ -10,6 +10,12 @@ import {
   PRESET_OR_EMA20_FIB_S3_PDL,
 } from "@/lib/presets";
 import { formatMoney, uid } from "@/lib/format";
+import {
+  cleanClientIdToken,
+  parseApiJson,
+  safeErrorMessage,
+  sanitizeToken,
+} from "@/lib/http";
 import { sessionStatus } from "@/lib/paper/market-hours";
 import { useAuth } from "@/lib/firebase/auth-context";
 import type {
@@ -124,7 +130,9 @@ export function PaperTradingApp() {
   async function idToken(): Promise<string | null> {
     if (!user) return null;
     try {
-      return await user.getIdToken();
+      const raw = await user.getIdToken();
+      const clean = cleanClientIdToken(raw);
+      return clean || null;
     } catch {
       return null;
     }
@@ -134,14 +142,20 @@ export function PaperTradingApp() {
     const token = await idToken();
     if (!token) return;
     try {
-      const res = await fetch("/api/paper/session/status", {
-        headers: { Authorization: `Bearer ${token}` },
+      // POST body carries auth — avoids Safari header / long-query issues
+      const res = await paperFetch("/api/paper/session/status", {
+        method: "POST",
+        token,
+        body: {},
       });
-      const data = await res.json();
+      const data = await parseApiJson<{
+        session?: SafeSession | null;
+        error?: string;
+      }>(res);
       if (!res.ok) return;
       setSession(data.session || null);
     } catch {
-      /* ignore */
+      /* ignore poll noise */
     }
   }, [user]);
 
@@ -214,12 +228,14 @@ export function PaperTradingApp() {
   async function start() {
     setError(null);
     if (!user) {
-      setError("Sign in (top right) so the session can keep running after you close the browser.");
+      setError(
+        "Sign in (top right) so the session can keep running after you close the browser."
+      );
       return;
     }
     const token = await idToken();
     if (!token) {
-      setError("Could not get auth token — try signing in again.");
+      setError("Could not get auth token — try signing out and in again.");
       return;
     }
     if (!strategy.entry.length || !strategy.exit.length) {
@@ -228,21 +244,23 @@ export function PaperTradingApp() {
     }
     if (dualStrategy) {
       if (!strategy2.entry.length || !strategy2.exit.length) {
-        setError("Strategy 2 needs entry and exit conditions (or turn dual off).");
+        setError(
+          "Strategy 2 needs entry and exit conditions (or turn dual off)."
+        );
         return;
       }
     }
 
+    const upstox = sanitizeToken(upstoxToken);
     setBusy(true);
     try {
-      const res = await fetch("/api/paper/session/start", {
+      // Auth via body idToken (Safari-safe). Optional Authorization if accepted.
+      const res = await paperFetch("/api/paper/session/start", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
-        },
-        body: JSON.stringify({
-          upstoxAccessToken: upstoxToken || undefined,
+        token,
+        body: {
+          idToken: token,
+          upstoxAccessToken: upstox || undefined,
           config: {
             strategy,
             strategy2: dualStrategy ? strategy2 : undefined,
@@ -251,18 +269,33 @@ export function PaperTradingApp() {
                 ? buildOptions(optionSide2)
                 : undefined,
             interval: barInterval,
-            initialCapital: capital,
-            positionSizePct: equityAllocPct,
+            initialCapital: Number(capital) || 100000,
+            positionSizePct: Number(equityAllocPct) || 25,
             oneTradePerDay,
             entryTimeWindows: limitEntryTimes
-              ? [entryWindow1, entryWindow2]
+              ? [
+                  {
+                    ...entryWindow1,
+                    start: normalizeHm(entryWindow1.start) || "09:15",
+                    end: normalizeHm(entryWindow1.end) || "11:00",
+                  },
+                  {
+                    ...entryWindow2,
+                    start: normalizeHm(entryWindow2.start) || "13:15",
+                    end: normalizeHm(entryWindow2.end) || "15:15",
+                  },
+                ]
               : undefined,
             maxRiskPerTrade: maxRiskEnabled
               ? {
                   enabled: true,
                   mode: maxRiskMode,
-                  pct: maxRiskMode === "pct" ? maxRiskPct : undefined,
-                  amount: maxRiskMode === "amount" ? maxRiskAmount : undefined,
+                  pct:
+                    maxRiskMode === "pct" ? Number(maxRiskPct) || 2 : undefined,
+                  amount:
+                    maxRiskMode === "amount"
+                      ? Number(maxRiskAmount) || 5000
+                      : undefined,
                 }
               : undefined,
             tradeInstrument,
@@ -270,16 +303,18 @@ export function PaperTradingApp() {
               tradeInstrument === "options_atm"
                 ? buildOptions(optionSide)
                 : undefined,
-            maxSymbols: scanMaxSymbols,
+            maxSymbols: Number(scanMaxSymbols) || 40,
             scanAll: scanAllFno,
           },
-        }),
+        },
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Start failed");
+      const data = await parseApiJson<{ error?: string; sessionId?: string }>(
+        res
+      );
+      if (!res.ok) throw new Error(data.error || `Start failed (${res.status})`);
       await refreshStatus();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Start failed");
+      setError(safeErrorMessage(e) || "Start failed");
     } finally {
       setBusy(false);
     }
@@ -294,19 +329,19 @@ export function PaperTradingApp() {
     }
     setBusy(true);
     try {
-      const res = await fetch("/api/paper/session/stop", {
+      const res = await paperFetch("/api/paper/session/stop", {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Authorization: `Bearer ${token}`,
+        token,
+        body: {
+          idToken: token,
+          sessionId: session?.id,
         },
-        body: JSON.stringify({ sessionId: session?.id }),
       });
-      const data = await res.json();
-      if (!res.ok) throw new Error(data.error || "Stop failed");
+      const data = await parseApiJson<{ error?: string }>(res);
+      if (!res.ok) throw new Error(data.error || `Stop failed (${res.status})`);
       await refreshStatus();
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Stop failed");
+      setError(safeErrorMessage(e) || "Stop failed");
     } finally {
       setBusy(false);
     }
@@ -730,9 +765,16 @@ export function PaperTradingApp() {
                   onChange={(e) =>
                     setStrategy((s) => ({ ...s, name: e.target.value }))
                   }
-                  className="field-input mb-4"
+                  className="field-input mb-3"
                 />
               </Field>
+              {strategy.trailStopToCost?.enabled ? (
+                <p className="mb-4 text-xs text-neutral-500">
+                  Trail SL to cost when profit ≥{" "}
+                  {strategy.trailStopToCost.profitPctOfCapital ?? 20}% of
+                  capital
+                </p>
+              ) : null}
               <div className="space-y-6">
                 <ConditionBuilder
                   title="Entry when"
@@ -812,9 +854,16 @@ export function PaperTradingApp() {
                     onChange={(e) =>
                       setStrategy2((s) => ({ ...s, name: e.target.value }))
                     }
-                    className="field-input mb-4"
+                    className="field-input mb-3"
                   />
                 </Field>
+                {strategy2.trailStopToCost?.enabled ? (
+                  <p className="mb-4 text-xs text-neutral-500">
+                    Trail SL to cost when profit ≥{" "}
+                    {strategy2.trailStopToCost.profitPctOfCapital ?? 20}% of
+                    capital
+                  </p>
+                ) : null}
                 <div className="space-y-6">
                   <ConditionBuilder
                     title="Entry when"
@@ -942,6 +991,69 @@ function Field({
   );
 }
 
+/**
+ * Safari-safe fetch for paper APIs.
+ * Auth is always in JSON body (`idToken`). Authorization header is best-effort —
+ * some mobile browsers throw "The string did not match the expected pattern"
+ * when building Bearer headers with long JWTs.
+ */
+async function paperFetch(
+  url: string,
+  opts: {
+    method?: string;
+    token: string;
+    body?: Record<string, unknown>;
+  }
+): Promise<Response> {
+  const method = opts.method || "POST";
+  const payload = {
+    ...(opts.body || {}),
+    idToken: opts.token,
+  };
+  const baseHeaders: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+
+  // Try with Authorization first (desktop / most browsers)
+  try {
+    return await fetch(url, {
+      method,
+      headers: {
+        ...baseHeaders,
+        Authorization: `Bearer ${opts.token}`,
+      },
+      body: JSON.stringify(payload),
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // Retry without Authorization if browser rejected the header
+    if (
+      /expected pattern|bytestring|invalid character|failed to (execute|construct)|header/i.test(
+        msg
+      )
+    ) {
+      return fetch(url, {
+        method,
+        headers: baseHeaders,
+        body: JSON.stringify(payload),
+      });
+    }
+    throw e;
+  }
+}
+
+/** Normalize to HH:mm for Safari (rejects incomplete / unpadded time values). */
+function normalizeHm(raw: string): string {
+  const s = String(raw ?? "").trim();
+  const m = /^(\d{1,2}):(\d{2})(?::\d{2})?$/.exec(s);
+  if (!m) return "";
+  const h = Math.min(23, Math.max(0, Number(m[1])));
+  const min = Math.min(59, Math.max(0, Number(m[2])));
+  if (!Number.isFinite(h) || !Number.isFinite(min)) return "";
+  return `${String(h).padStart(2, "0")}:${String(min).padStart(2, "0")}`;
+}
+
 function TimeWindowRow({
   label,
   window,
@@ -953,6 +1065,10 @@ function TimeWindowRow({
   onChange: (w: EntryTimeWindow) => void;
   disabled?: boolean;
 }) {
+  // type=text avoids mobile Safari "string did not match the expected pattern"
+  // on type=time with incomplete values; still accept HH:mm.
+  const start = normalizeHm(window.start) || window.start || "09:15";
+  const end = normalizeHm(window.end) || window.end || "15:30";
   return (
     <div className="flex flex-wrap items-center gap-2 text-sm">
       <input
@@ -964,19 +1080,43 @@ function TimeWindowRow({
       />
       <span className="w-8 text-xs text-neutral-500">{label}</span>
       <input
-        type="time"
-        value={window.start}
+        type="text"
+        inputMode="numeric"
+        placeholder="09:15"
+        autoComplete="off"
+        value={start}
         disabled={disabled || !window.enabled}
-        onChange={(e) => onChange({ ...window, start: e.target.value })}
-        className="rounded-lg border px-2 py-1"
+        onChange={(e) =>
+          onChange({
+            ...window,
+            start: e.target.value,
+          })
+        }
+        onBlur={() => {
+          const n = normalizeHm(window.start);
+          if (n) onChange({ ...window, start: n });
+        }}
+        className="w-[5.5rem] rounded-lg border px-2 py-1 tabular-nums"
       />
       <span>–</span>
       <input
-        type="time"
-        value={window.end}
+        type="text"
+        inputMode="numeric"
+        placeholder="15:30"
+        autoComplete="off"
+        value={end}
         disabled={disabled || !window.enabled}
-        onChange={(e) => onChange({ ...window, end: e.target.value })}
-        className="rounded-lg border px-2 py-1"
+        onChange={(e) =>
+          onChange({
+            ...window,
+            end: e.target.value,
+          })
+        }
+        onBlur={() => {
+          const n = normalizeHm(window.end);
+          if (n) onChange({ ...window, end: n });
+        }}
+        className="w-[5.5rem] rounded-lg border px-2 py-1 tabular-nums"
       />
     </div>
   );

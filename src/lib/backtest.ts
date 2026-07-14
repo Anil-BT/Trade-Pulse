@@ -20,6 +20,7 @@ import type {
   EquityPoint,
   IndicatorType,
   OptionsTradeSettings,
+  StrategyConfig,
   Trade,
   TradeInstrument,
 } from "./types";
@@ -109,6 +110,12 @@ export function runBacktest(
   const entryNotBeforeMs = req.entryNotBeforeMs ?? 0;
   const entryWindows = req.entryTimeWindows;
   const maxRiskCap = resolveMaxRiskCap(req.maxRiskPerTrade, initialCapital);
+  const trailCfg = req.strategy.trailStopToCost;
+  const trailEnabled = Boolean(trailCfg?.enabled);
+  const trailProfitThreshold = resolveTrailProfitThreshold(
+    trailCfg,
+    initialCapital
+  );
 
   let cash = initialCapital;
   let positionQty = 0;
@@ -120,12 +127,15 @@ export function runBacktest(
   let entryLots = 0;
   let entryLabel = "";
   let entryPremiumSource: "market" | "model" | undefined;
+  /** Once true, stop is at entry (breakeven) until exit */
+  let trailToCostArmed = false;
   let tradesOnDay = 0;
   let currentDay = "";
 
   let equitySignals = 0;
   let skippedInsufficientCapital = 0;
   let maxRiskStops = 0;
+  let trailCostStops = 0;
   let minLotCost = Infinity;
   let marketFills = 0;
   let modelFills = 0;
@@ -150,8 +160,21 @@ export function runBacktest(
         : 0;
     equityCurve.push({ time: c.time, equity: cash + positionQty * markUnit });
 
-    // EXIT — max risk stop first (fill at stop, not worse close), then strategy
+    // EXIT — max risk first, then trail-to-cost, then strategy signal
     if (positionQty > 0 && i > entryBar) {
+      // Arm trail-to-cost when unrealized profit ≥ threshold
+      if (
+        trailEnabled &&
+        trailProfitThreshold != null &&
+        !trailToCostArmed &&
+        positionQty > 0
+      ) {
+        const unrealized = (markUnit - entryPrice) * positionQty;
+        if (unrealized >= trailProfitThreshold) {
+          trailToCostArmed = true;
+        }
+      }
+
       const stop = maxRiskStopHit(
         c,
         tradeInstrument,
@@ -163,8 +186,21 @@ export function runBacktest(
       if (stop.hit) {
         maxRiskStops += 1;
         closePosition(i, c, "max_risk", stop.exitPx);
-      } else if (evalConditions(req.strategy.exit, exitLogic, i, seriesMap)) {
-        closePosition(i, c, "signal");
+      } else {
+        const trail = trailToCostHit(
+          c,
+          tradeInstrument,
+          entryPrice,
+          positionQty,
+          trailToCostArmed,
+          markUnit
+        );
+        if (trail.hit) {
+          trailCostStops += 1;
+          closePosition(i, c, "trail_cost", trail.exitPx);
+        } else if (evalConditions(req.strategy.exit, exitLogic, i, seriesMap)) {
+          closePosition(i, c, "signal");
+        }
       }
     } else if (positionQty > 0) {
       // entry bar: strategy exit only (no same-bar stop after close entry)
@@ -225,8 +261,10 @@ export function runBacktest(
     entriesTaken: trades.length,
     skippedInsufficientCapital,
     maxRiskStops,
+    trailCostStops,
     minLotCost: Number.isFinite(minLotCost) ? minLotCost : undefined,
     maxRiskCap: maxRiskCap ?? undefined,
+    trailProfitThreshold: trailProfitThreshold ?? undefined,
     tradeInstrument,
     oneTradePerDay,
     lotSize: optCfg.lotSize,
@@ -331,6 +369,7 @@ export function runBacktest(
           entryStrike,
           optCfg.side
         );
+      trailToCostArmed = false;
       tradesOnDay += 1;
       return;
     }
@@ -353,14 +392,15 @@ export function runBacktest(
     entryLots = 0;
     entryLabel = "";
     entryPremiumSource = undefined;
+    trailToCostArmed = false;
     tradesOnDay += 1;
   }
 
   function closePosition(
     i: number,
     c: Candle,
-    exitReason: "signal" | "max_risk" | "eod" = "signal",
-    /** When set (max-risk stop), fill at this unit price so loss ≈ cap */
+    exitReason: "signal" | "max_risk" | "trail_cost" | "eod" = "signal",
+    /** When set (max-risk / trail-to-cost stop), fill at this unit price */
     forcedExitPx?: number
   ) {
     const spot = c.close;
@@ -450,6 +490,7 @@ export function runBacktest(
     trades.push(trade);
     cash += positionQty * exitPx;
     positionQty = 0;
+    trailToCostArmed = false;
   }
 }
 
@@ -520,6 +561,48 @@ function maxRiskStopHit(
   return { hit: false };
 }
 
+/**
+ * Once trail-to-cost is armed, exit at entry (breakeven) if price returns to cost.
+ * Equity long: bar low ≤ entry → fill at entry (or open if gap below).
+ * Options long: mark premium ≤ entry → fill at entry premium.
+ */
+function trailToCostHit(
+  c: Candle,
+  instrument: TradeInstrument,
+  entryPrice: number,
+  qty: number,
+  armed: boolean,
+  markUnit: number
+): { hit: boolean; exitPx?: number } {
+  if (!armed || qty <= 0 || entryPrice <= 0) {
+    return { hit: false };
+  }
+
+  if (instrument !== "options_atm") {
+    if (c.low <= entryPrice || c.close <= entryPrice) {
+      const fill =
+        c.open < entryPrice ? Math.max(0, c.open) : Math.max(0, entryPrice);
+      return { hit: true, exitPx: fill };
+    }
+    return { hit: false };
+  }
+
+  if (markUnit <= entryPrice) {
+    return { hit: true, exitPx: entryPrice };
+  }
+  return { hit: false };
+}
+
+function resolveTrailProfitThreshold(
+  cfg: StrategyConfig["trailStopToCost"] | undefined,
+  initialCapital: number
+): number | null {
+  if (!cfg?.enabled) return null;
+  const pct = Number(cfg.profitPctOfCapital);
+  const usePct = Number.isFinite(pct) && pct > 0 ? pct : 20;
+  return (initialCapital * Math.min(100, usePct)) / 100;
+}
+
 function mergeOptions(
   settings: OptionsTradeSettings | undefined,
   enabled: boolean
@@ -556,8 +639,10 @@ function buildDiagnostics(d: {
   entriesTaken: number;
   skippedInsufficientCapital: number;
   maxRiskStops?: number;
+  trailCostStops?: number;
   minLotCost?: number;
   maxRiskCap?: number;
+  trailProfitThreshold?: number;
   tradeInstrument: TradeInstrument;
   oneTradePerDay: boolean;
   lotSize: number;
@@ -581,6 +666,10 @@ function buildDiagnostics(d: {
     d.maxRiskCap != null
       ? ` Stop when loss >= Rs ${Math.round(d.maxRiskCap).toLocaleString("en-IN")}.`
       : "";
+  const trailNote =
+    d.trailProfitThreshold != null
+      ? ` Trail-to-cost arms at +Rs ${Math.round(d.trailProfitThreshold).toLocaleString("en-IN")} profit.`
+      : "";
 
   if (d.entriesTaken === 0 && d.equitySignals === 0) {
     note =
@@ -599,6 +688,8 @@ function buildDiagnostics(d: {
     note = `Equity signals fired ${d.equitySignals}x but no trades were opened. Check capital.`;
   } else if ((d.maxRiskStops || 0) > 0) {
     note = `${d.maxRiskStops} trade(s) exited on max-risk stop.${riskCapNote}`;
+  } else if ((d.trailCostStops || 0) > 0) {
+    note = `${d.trailCostStops} trade(s) exited on trail-to-cost (breakeven).${trailNote}`;
   } else if (d.skippedInsufficientCapital > 0) {
     note = `${d.skippedInsufficientCapital} signal(s) skipped - not enough free cash for the next 1-lot trade.`;
   } else if (d.tradeInstrument === "options_atm" && d.marketFills + d.modelFills > 0) {
@@ -619,10 +710,12 @@ function buildDiagnostics(d: {
     entriesTaken: d.entriesTaken,
     skippedInsufficientCapital: d.skippedInsufficientCapital,
     maxRiskStops: d.maxRiskStops || 0,
+    trailCostStops: d.trailCostStops || 0,
     candleCount: d.candleCount,
     firstBarTime: d.firstBarTime,
     lastBarTime: d.lastBarTime,
     maxRiskCap: d.maxRiskCap,
+    trailProfitThreshold: d.trailProfitThreshold,
     minLotCost:
       d.minLotCost && Number.isFinite(d.minLotCost) ? d.minLotCost : undefined,
     note,
@@ -682,7 +775,7 @@ function collectOperand(
 }
 
 function defaultPeriod(type: IndicatorType): number {
-  if (type === "RSI") return 14;
+  if (type === "RSI" || type === "ADX") return 14;
   if (type === "VWAP") return 1;
   if (type === "OPENING_RANGE_HIGH" || type === "OPENING_RANGE_LOW") return 1;
   if (type === "BREAKOUT_HIGH" || type === "BREAKOUT_LOW") return 1;
@@ -789,7 +882,12 @@ export function buildDaySummaries(trades: Trade[]): DaySummary[] {
     row.pnl += t.pnl;
     row.capitalUsed += t.capitalUsed ?? t.entryPrice * t.qty;
     if (t.exitReason === "max_risk") row.maxRiskStops += 1;
-    else if (t.exitReason === "signal" || !t.exitReason) row.signalExits += 1;
+    else if (
+      t.exitReason === "signal" ||
+      t.exitReason === "trail_cost" ||
+      !t.exitReason
+    )
+      row.signalExits += 1;
     row.bestTrade = Math.max(row.bestTrade, t.pnl);
     row.worstTrade = Math.min(row.worstTrade, t.pnl);
   }

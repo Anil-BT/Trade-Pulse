@@ -14,6 +14,7 @@ const INDICATORS: { value: IndicatorType; label: string; defaultPeriod: number }
   { value: "EMA", label: "EMA", defaultPeriod: 9 },
   { value: "SMA", label: "SMA", defaultPeriod: 20 },
   { value: "RSI", label: "RSI", defaultPeriod: 14 },
+  { value: "ADX", label: "ADX", defaultPeriod: 14 },
   { value: "VWAP", label: "VWAP (session)", defaultPeriod: 1 },
   {
     value: "OPENING_RANGE_HIGH",
