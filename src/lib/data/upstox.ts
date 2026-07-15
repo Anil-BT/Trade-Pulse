@@ -7,6 +7,7 @@ import {
   filterCandlesByRange,
   parseMarketTime,
 } from "./dates";
+import { todayIst } from "../paper/market-hours";
 import {
   isUpstoxRateLimitError,
   noteUpstoxRateLimited,
@@ -91,10 +92,33 @@ export async function fetchUpstoxCandles(opts: {
     }
   }
 
+  // Historical V3 often omits / lags the *current* session. Merge Intraday V3
+  // when the range includes today so paper/live signals match the chart.
+  const today = todayIst();
+  if (
+    to >= today &&
+    (map.unit === "minutes" || map.unit === "hours")
+  ) {
+    try {
+      const intra = await fetchUpstoxIntradayCandles({
+        instrumentKey: instrumentKey.trim(),
+        interval,
+        accessToken,
+      });
+      all.push(...intra);
+    } catch (e) {
+      // Keep historical-only; paper will surface empty/partial day if needed
+      console.warn(
+        "[upstox] intraday merge failed:",
+        e instanceof Error ? e.message : e
+      );
+    }
+  }
+
   const byTime = new Map<number, Candle>();
   for (const c of all) {
     if (Number.isFinite(c.time) && Number.isFinite(c.close)) {
-      byTime.set(c.time, c);
+      byTime.set(c.time, c); // later (intraday) overwrites same timestamp
     }
   }
   let sorted = Array.from(byTime.values()).sort((a, b) => a.time - b.time);
@@ -103,6 +127,86 @@ export async function fetchUpstoxCandles(opts: {
   sorted = filterCandlesByRange(sorted, startMs, endMs);
 
   return sorted;
+}
+
+/**
+ * Current-session candles (Upstox Intraday Candle V3).
+ * Required for reliable *today* OHLC — historical endpoint is often empty/stale for today.
+ * GET /v3/historical-candle/intraday/{instrument_key}/{unit}/{interval}
+ */
+export async function fetchUpstoxIntradayCandles(opts: {
+  instrumentKey: string;
+  interval: Interval;
+  accessToken: string;
+}): Promise<Candle[]> {
+  const accessToken = sanitizeToken(opts.accessToken);
+  if (!accessToken) {
+    throw new Error("Upstox access token is required for intraday candles.");
+  }
+  const map = INTERVAL_MAP[opts.interval];
+  if (!map || (map.unit !== "minutes" && map.unit !== "hours")) {
+    return [];
+  }
+
+  await waitForUpstoxSlot();
+
+  const encoded = encodeURIComponent(opts.instrumentKey.trim());
+  const url = `https://api.upstox.com/v3/historical-candle/intraday/${encoded}/${map.unit}/${map.interval}`;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 25_000);
+
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: asciiHeaders({
+        Accept: "application/json",
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${accessToken}`,
+        "Api-Version": "2.0",
+      }),
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+  } catch (e) {
+    clearTimeout(timer);
+    const msg = e instanceof Error ? e.message : String(e);
+    if (/abort/i.test(msg)) {
+      throw new Error("Upstox intraday request timed out.");
+    }
+    throw new Error(`Upstox intraday network error: ${msg}`);
+  }
+  clearTimeout(timer);
+
+  if (!res.ok) {
+    const text = await res.text();
+    const snippet = text.slice(0, 200).replace(/[^\x20-\x7E]/g, " ");
+    if (res.status === 429 || /1015|rate.limit/i.test(text)) {
+      noteUpstoxRateLimited();
+      throw new Error(`Upstox rate limit (429) on intraday. ${snippet.slice(0, 80)}`);
+    }
+    throw new Error(
+      safeErrorMessage(`Upstox intraday error ${res.status}: ${snippet}`)
+    );
+  }
+
+  noteUpstoxSuccess();
+  const json = await res.json();
+  const raw: unknown[][] = json?.data?.candles || [];
+
+  return raw
+    .map((row) => {
+      const time = parseMarketTime(row[0] as string | number);
+      return {
+        time,
+        open: Number(row[1]),
+        high: Number(row[2]),
+        low: Number(row[3]),
+        close: Number(row[4]),
+        volume: Number(row[5] ?? 0),
+      } satisfies Candle;
+    })
+    .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close));
 }
 
 async function fetchUpstoxChunkWithRetry(opts: {

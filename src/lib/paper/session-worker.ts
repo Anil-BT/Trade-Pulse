@@ -33,7 +33,8 @@ import type {
   StrategyConfig,
 } from "../types";
 
-const MAX_SYMBOLS_HARD = 80;
+/** Max symbols per worker tick. Smaller on Vercel so the tick finishes and saves. */
+const MAX_SYMBOLS_HARD = process.env.VERCEL ? 25 : 80;
 
 function findSessionInMem(sessionId: string): PaperSessionDoc | null {
   const g = globalThis as { __paperSessions?: Map<string, PaperSessionDoc> };
@@ -108,6 +109,8 @@ function rowFromResult(
   const totalPnl = tradeList.reduce((s, t) => s + t.pnl, 0);
   const winners = tradeList.filter((t) => t.pnl > 0).length;
   const displaySym = `${result.symbol || sym}`;
+  const d = result.diagnostics;
+  const bars = d?.candleCount ?? result.candles?.length ?? 0;
 
   if (tradeList.length > 0 || result.openPosition) {
     return {
@@ -121,22 +124,51 @@ function rowFromResult(
       finalEquity: initialCapital + totalPnl,
       status: "ok",
       message: result.openPosition
-        ? `${strategyTag}: ${tradeList.length} closed · open`
-        : `${strategyTag}: ${tradeList.length} paper trade(s)`,
+        ? `${strategyTag}: ${tradeList.length} closed · OPEN · ${bars} bars`
+        : `${strategyTag}: ${tradeList.length} paper trade(s) · ${bars} bars`,
       tradeList,
+      equitySignals: d?.equitySignals,
     };
   }
+
+  // Explain *why* no fill — “conditions true on chart” often = not yet scanned,
+  // no today bars, capital skip, or 1-trade/day already used then exited.
+  const why: string[] = [];
+  if (bars < 5) why.push(`only ${bars} bars (need today+warmup)`);
+  else why.push(`${bars} bars`);
+  if (d?.equitySignals != null) {
+    if (d.equitySignals === 0) why.push("0 entry signals on server data");
+    else why.push(`${d.equitySignals} signal(s)`);
+  }
+  if (d?.skippedInsufficientCapital) {
+    why.push(
+      `capital skip ×${d.skippedInsufficientCapital}` +
+        (d.minLotCost
+          ? ` (need ~₹${Math.ceil(d.minLotCost).toLocaleString("en-IN")}/lot)`
+          : "")
+    );
+  }
+  if (
+    (d?.equitySignals || 0) > 0 &&
+    !d?.skippedInsufficientCapital &&
+    tradeList.length === 0
+  ) {
+    why.push("entered then exited (or 1-trade/day used)");
+  }
+  if (d?.note) why.push(d.note.slice(0, 90));
+
   return {
     symbol: displaySym,
-    lotSize,
+    lotSize: result.optionsMeta?.lotSize ?? lotSize,
     trades: 0,
     winRate: 0,
     totalPnl: 0,
     totalPnlPct: 0,
     finalEquity: initialCapital,
     status: "no_trades",
-    message: `${strategyTag}: no signal yet`,
+    message: `${strategyTag}: ${why.join(" · ") || "no signal yet"}`,
     tradeList: [],
+    equitySignals: d?.equitySignals,
   };
 }
 
@@ -216,7 +248,13 @@ export async function processPaperSession(
         : 0;
 
     const token = sanitizeToken(doc.upstoxAccessToken);
-    const { startMs: entryNotBeforeMs } = dayBoundsUnix(today, today);
+    // Block entries before cash open (warmup bars still used for indicators)
+    const entryNotBeforeMs = Date.parse(`${today}T09:15:00+05:30`);
+    // Fallback if parse fails
+    const entryFloor =
+      Number.isFinite(entryNotBeforeMs) && entryNotBeforeMs > 0
+        ? entryNotBeforeMs
+        : dayBoundsUnix(today, today).startMs;
 
     // Batch accumulators (this tick only)
     const batchRowsBySlot = new Map<1 | 2, ScanRow[]>();
@@ -332,7 +370,7 @@ export async function processPaperSession(
             maxRiskPerTrade: cfg.maxRiskPerTrade,
             tradeInstrument: cfg.tradeInstrument,
             options,
-            entryNotBeforeMs,
+            entryNotBeforeMs: entryFloor,
             leaveOpenPositions: true,
           });
 
@@ -442,11 +480,21 @@ export async function processPaperSession(
     const cycles =
       fullList.length > 0 ? Math.ceil(fullList.length / batchSize) : 1;
 
+    const openCount = allOpen.length;
+    const signalSum = strategyResults.reduce(
+      (s, r) =>
+        s +
+        (r.report.rows || []).reduce(
+          (ss, row) => ss + (Number(row.equitySignals) || 0),
+          0
+        ),
+      0
+    );
     const logLine =
       `${new Date().toLocaleTimeString("en-IN")} · Tick #${(doc.tickCount || 0) + 1} · ` +
       `batch ${offset + 1}–${Math.min(offset + list.length, fullList.length)} of ${fullList.length}` +
-      ` (${list.length} this min) · covered ${covered}/${fullList.length} · ` +
-      `~${cycles} min/full cycle · trades ${tradeSum}` +
+      ` (${list.length} this tick) · covered ${covered}/${fullList.length} · ` +
+      `~${cycles} min/full cycle · trades ${tradeSum} · open ${openCount} · signals ${signalSum}` +
       (rateLimited ? ` · ${rateLimited} rate-limit` : "") +
       (errors ? ` · ${errors} other err` : "");
 
