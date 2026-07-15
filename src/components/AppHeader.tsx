@@ -6,6 +6,7 @@ import { AuthBar } from "./AuthBar";
 
 const NAV = [
   { href: "/backtest", label: "Backtest" },
+  { href: "/watch", label: "Market watch" },
   { href: "/paper", label: "Paper trading" },
 ] as const;
 

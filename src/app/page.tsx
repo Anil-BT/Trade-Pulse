@@ -42,6 +42,23 @@ export default function Home() {
             </Link>
 
             <Link
+              href="/watch"
+              className="group rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition hover:border-neutral-400"
+            >
+              <p className="text-xs font-medium tracking-wide text-neutral-500 uppercase">
+                Menu
+              </p>
+              <h2 className="mt-2 text-xl font-semibold tracking-tight text-black group-hover:underline">
+                Market watch
+              </h2>
+              <p className="mt-2 text-sm leading-relaxed text-neutral-600">
+                Multi-strategy F&amp;O scanner — list names where entry
+                conditions match on the latest bar.
+              </p>
+              <p className="mt-4 text-sm font-medium text-black">Open →</p>
+            </Link>
+
+            <Link
               href="/paper"
               className="group rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)] transition hover:border-neutral-400"
             >
