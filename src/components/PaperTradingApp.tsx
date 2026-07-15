@@ -133,6 +133,9 @@ export function PaperTradingApp() {
   });
   const [statusLine, setStatusLine] = useState(sessionStatus().label);
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  /** After user clicks Stop, ignore auto-reattach of "running" for a short window */
+  const userStoppedAtRef = useRef<number>(0);
+  const userStartedIdRef = useRef<string | null>(null);
 
   const running = session?.status === "running";
 
@@ -187,20 +190,55 @@ export function PaperTradingApp() {
           return;
         }
         if (data.session) {
+          const st = data.session.status;
+          const stoppedRecently =
+            userStoppedAtRef.current > 0 &&
+            Date.now() - userStoppedAtRef.current < 90_000;
+
+          // After Stop, do not re-attach a different/old running session
+          if (
+            st === "running" &&
+            stoppedRecently &&
+            data.session.id !== userStartedIdRef.current
+          ) {
+            setSession((prev) =>
+              prev?.status === "stopped"
+                ? prev
+                : {
+                    id: data.session!.id || prev?.id || "",
+                    status: "stopped",
+                    sessionDay: prev?.sessionDay || data.session!.sessionDay || "",
+                    startedAt: prev?.startedAt || data.session!.startedAt || Date.now(),
+                    endsAt: prev?.endsAt || data.session!.endsAt || Date.now(),
+                    updatedAt: Date.now(),
+                    workerNote: "Stopped by user",
+                  }
+            );
+            rememberSessionId(null);
+            return;
+          }
+
+          // Active UI only cares about running; show stopped/ended briefly
           setSession(data.session);
-          // Only remember id while still running
-          if (data.session.id && data.session.status === "running") {
+          if (data.session.id && st === "running") {
             rememberSessionId(data.session.id);
-          } else if (data.session.status !== "running") {
+            userStoppedAtRef.current = 0;
+          } else {
             rememberSessionId(null);
           }
           setError(null);
         } else {
-          // Don't wipe optimistic UI immediately if we just started
+          // No active session — clear unless we just started (race)
           setSession((prev) => {
-            if (prev?.status === "running" && prev.id && sid === prev.id) {
+            if (
+              prev?.status === "running" &&
+              prev.id &&
+              sid === prev.id &&
+              userStoppedAtRef.current === 0
+            ) {
               return prev;
             }
+            if (prev?.status === "stopped") return prev;
             return null;
           });
           if (data.hint) {
@@ -282,6 +320,8 @@ export function PaperTradingApp() {
 
   async function start() {
     setError(null);
+    userStoppedAtRef.current = 0;
+    userStartedIdRef.current = null;
     if (!user) {
       setError(
         "Sign in (top right) so the session can keep running after you close the browser."
@@ -375,7 +415,11 @@ export function PaperTradingApp() {
       if (!res.ok) throw new Error(data.error || `Start failed (${res.status})`);
 
       // Show status immediately from start response (don't wait for next poll)
-      if (data.sessionId) rememberSessionId(data.sessionId);
+      if (data.sessionId) {
+        rememberSessionId(data.sessionId);
+        userStartedIdRef.current = data.sessionId;
+        userStoppedAtRef.current = 0;
+      }
       if (data.session) {
         setSession(data.session);
       } else if (data.sessionId) {
@@ -419,6 +463,8 @@ export function PaperTradingApp() {
       pollRef.current = null;
     }
     rememberSessionId(null);
+    userStoppedAtRef.current = Date.now();
+    userStartedIdRef.current = null;
 
     setBusy(true);
     try {
@@ -434,34 +480,30 @@ export function PaperTradingApp() {
         error?: string;
         status?: string;
         sessionId?: string;
+        stoppedIds?: string[];
         session?: SafeSession | null;
         note?: string;
       }>(res);
       if (!res.ok) throw new Error(data.error || `Stop failed (${res.status})`);
 
-      // Force stopped UI from response (or clear if already gone)
-      if (data.session && typeof data.session === "object") {
-        setSession({
-          ...data.session,
-          status: data.session.status || "stopped",
-          workerNote:
-            data.session.workerNote || "Stopped by user",
-        } as SafeSession);
-      } else if (session || sid) {
-        setSession((prev) =>
-          prev
-            ? {
-                ...prev,
-                status: "stopped",
-                workerNote: "Stopped by user",
-                updatedAt: Date.now(),
-              }
-            : null
-        );
-      } else {
-        setSession(null);
-      }
+      // Force stopped UI — never leave "running" after a successful stop
+      setSession((prev) => ({
+        id: data.sessionId || sid || prev?.id || "stopped",
+        status: "stopped",
+        sessionDay: prev?.sessionDay || data.session?.sessionDay || "",
+        startedAt: prev?.startedAt || data.session?.startedAt || Date.now(),
+        endsAt: prev?.endsAt || data.session?.endsAt || Date.now(),
+        updatedAt: Date.now(),
+        workerNote:
+          data.note ||
+          data.session?.workerNote ||
+          (data.stoppedIds && data.stoppedIds.length > 1
+            ? `Stopped ${data.stoppedIds.length} sessions`
+            : "Stopped by user"),
+        tickCount: prev?.tickCount,
+      }));
       rememberSessionId(null);
+      userStoppedAtRef.current = Date.now();
     } catch (e) {
       setError(safeErrorMessage(e) || "Stop failed");
       // Restore id so user can retry stop

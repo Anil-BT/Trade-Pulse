@@ -3,9 +3,9 @@ import { verifyUserIdToken } from "@/lib/firebase/admin";
 import { safeErrorMessage } from "@/lib/http";
 import { cleanIdToken } from "@/lib/paper/sanitize";
 import {
-  getActiveSession,
   getSession,
   markSessionStopped,
+  stopAllRunningSessions,
   toPublicSession,
 } from "@/lib/paper/session-store";
 
@@ -13,8 +13,8 @@ export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
 
 /**
- * Stop must only patch status fields (markSessionStopped).
- * Worker ticks re-check cloud status so they cannot revive a stopped session.
+ * Stop all running paper sessions for the user.
+ * Stops zombies that otherwise reappear after a single-id stop.
  */
 export async function POST(req: NextRequest) {
   try {
@@ -37,87 +37,56 @@ export async function POST(req: NextRequest) {
     const sessionId =
       (typeof body.sessionId === "string" && body.sessionId.trim()) || "";
 
-    // Prefer explicit id; also stop any active running session for this user
-    let doc = sessionId
-      ? await getSession(user.uid, sessionId, { preferCloud: true })
-      : null;
-    if (!doc || doc.userId !== user.uid) {
-      doc = await getActiveSession(user.uid);
+    // Always stop every running session for this user (prevents "starts again")
+    const all = await stopAllRunningSessions(user.uid, "Stopped by user");
+
+    // Also force-stop the id the client knows about (even if query missed it)
+    if (sessionId) {
+      const r = await markSessionStopped(user.uid, sessionId, "Stopped by user");
+      if (r.ok && !all.stoppedIds.includes(sessionId)) {
+        all.stoppedIds.push(sessionId);
+      }
+      if (!r.ok && r.error) all.errors.push(r.error);
     }
 
-    if (!doc || doc.userId !== user.uid) {
-      // Already stopped / nothing running — treat as success for UI
-      return NextResponse.json({
-        ok: true,
-        status: "stopped",
-        session: null,
-        note: "No running session found (already stopped).",
-      });
-    }
-
-    // If already terminal, just return
-    if (doc.status === "stopped" || doc.status === "ended") {
-      return NextResponse.json({
-        ok: true,
-        sessionId: doc.id,
-        status: doc.status,
-        session: toPublicSession(doc),
-      });
-    }
-
-    const result = await markSessionStopped(
-      user.uid,
-      doc.id,
-      "Stopped by user"
-    );
-    if (!result.ok) {
+    if (all.stoppedIds.length === 0 && all.errors.length > 0) {
       return NextResponse.json(
         {
           error:
-            result.error ||
+            all.errors[0] ||
             "Could not write stop to storage. Check FIREBASE_SERVICE_ACCOUNT_JSON.",
         },
         { status: 500 }
       );
     }
 
-    // Force cloud re-read for verification
-    const after = await getSession(user.uid, doc.id, { preferCloud: true });
-    const status = after?.status || "stopped";
-    if (after && after.status === "running") {
-      // One more hard write
-      const retry = await markSessionStopped(
-        user.uid,
-        doc.id,
-        "Stopped by user (retry)"
-      );
-      const after2 = await getSession(user.uid, doc.id, { preferCloud: true });
-      if (after2?.status === "running" || !retry.ok) {
-        return NextResponse.json(
-          {
-            error:
-              "Stop write did not stick (worker may still be mid-tick). Click Stop again in a few seconds.",
-          },
-          { status: 500 }
-        );
-      }
-      return NextResponse.json({
-        ok: true,
-        sessionId: doc.id,
-        status: after2?.status || "stopped",
-        session: after2 ? toPublicSession(after2) : null,
-      });
-    }
+    const primaryId = sessionId || all.stoppedIds[0];
+    const after = primaryId
+      ? await getSession(user.uid, primaryId, { preferCloud: true })
+      : null;
 
     return NextResponse.json({
       ok: true,
-      sessionId: doc.id,
-      status,
-      session: after ? toPublicSession(after) : {
-        id: doc.id,
-        status: "stopped",
-        workerNote: "Stopped by user",
-      },
+      status: "stopped",
+      sessionId: primaryId || null,
+      stoppedIds: all.stoppedIds,
+      session: after
+        ? toPublicSession({
+            ...after,
+            status: "stopped",
+            workerNote: after.workerNote || "Stopped by user",
+          })
+        : primaryId
+          ? {
+              id: primaryId,
+              status: "stopped",
+              workerNote: "Stopped by user",
+            }
+          : null,
+      note:
+        all.stoppedIds.length > 1
+          ? `Stopped ${all.stoppedIds.length} session(s).`
+          : "Session stopped.",
     });
   } catch (e) {
     console.error("[paper-stop]", e);

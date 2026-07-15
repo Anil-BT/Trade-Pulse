@@ -371,11 +371,25 @@ export async function getSession(
   return m && m.userId === userId ? m : null;
 }
 
+/**
+ * Active = status running in **cloud** (or verified cloud).
+ * Never trust in-memory alone — that revives stopped sessions on warm Vercel instances.
+ */
 export async function getActiveSession(
   userId: string
 ): Promise<PaperSessionDoc | null> {
+  // Clear stale in-memory "running" that cloud already stopped
   for (const s of mem().values()) {
-    if (s.userId === userId && s.status === "running") return s;
+    if (s.userId === userId && s.status === "running") {
+      const cloud = await getSession(userId, s.id, { preferCloud: true });
+      if (!cloud || cloud.status !== "running") {
+        if (cloud) mem().set(s.id, cloud);
+        else {
+          s.status = "stopped";
+          s.workerNote = s.workerNote || "Stopped (stale memory cleared)";
+        }
+      }
+    }
   }
 
   const db = await getAdminDbAsync();
@@ -389,11 +403,13 @@ export async function getActiveSession(
           .collection(COL)
           .where("status", "==", "running")
           .orderBy("startedAt", "desc")
-          .limit(3)
+          .limit(5)
           .get();
         snap.forEach((d) => {
           const data = d.data() as PaperSessionDoc;
-          if (!best) best = { ...data, id: data.id || d.id };
+          if (!best || (data.startedAt || 0) > (best.startedAt || 0)) {
+            best = { ...data, id: data.id || d.id };
+          }
         });
       } catch {
         const snap = await db
@@ -413,6 +429,10 @@ export async function getActiveSession(
       if (best) {
         const b = best as PaperSessionDoc;
         const existing = mem().get(b.id);
+        // Never return if memory already terminal for this id
+        if (isTerminalStatus(existing?.status)) {
+          return null;
+        }
         mem().set(b.id, {
           ...b,
           upstoxAccessToken:
@@ -420,6 +440,7 @@ export async function getActiveSession(
         });
         return mem().get(b.id) || b;
       }
+      return null;
     } catch (e) {
       console.error("[paper-session] getActiveSession admin failed:", e);
     }
@@ -443,6 +464,7 @@ export async function getActiveSession(
     }
     if (best) {
       const existing = mem().get(best.id);
+      if (isTerminalStatus(existing?.status)) return null;
       mem().set(best.id, {
         ...best,
         userId: best.userId || userId,
@@ -456,10 +478,77 @@ export async function getActiveSession(
   return null;
 }
 
+/** Stop every running session for this user (zombies from prior failed stops). */
+export async function stopAllRunningSessions(
+  userId: string,
+  note = "Stopped by user"
+): Promise<{ stoppedIds: string[]; errors: string[] }> {
+  const stoppedIds: string[] = [];
+  const errors: string[] = [];
+  const seen = new Set<string>();
+
+  // From memory
+  for (const s of mem().values()) {
+    if (s.userId === userId && s.status === "running" && s.id) {
+      seen.add(s.id);
+    }
+  }
+
+  // From cloud active list (may include ids not in mem)
+  try {
+    const active = await getActiveSession(userId);
+    if (active?.id) seen.add(active.id);
+  } catch {
+    /* ignore */
+  }
+
+  // Query more running ids if possible
+  const db = await getAdminDbAsync();
+  if (db) {
+    try {
+      const snap = await db
+        .collection("users")
+        .doc(userId)
+        .collection(COL)
+        .where("status", "==", "running")
+        .limit(20)
+        .get();
+      snap.forEach((d) => seen.add(d.id));
+    } catch {
+      /* ignore */
+    }
+  } else if (await canUseRest()) {
+    const rows = await firestoreRestQuery(
+      `users/${userId}`,
+      COL,
+      "status",
+      "EQUAL",
+      "running",
+      20
+    );
+    for (const r of rows) {
+      const id = String(r.id || "");
+      if (id) seen.add(id);
+    }
+  }
+
+  for (const id of seen) {
+    const r = await markSessionStopped(userId, id, note);
+    if (r.ok) stoppedIds.push(id);
+    else errors.push(r.error || id);
+  }
+
+  return { stoppedIds, errors };
+}
+
 export async function listRunningSessions(): Promise<PaperSessionDoc[]> {
   const out = new Map<string, PaperSessionDoc>();
+  const candidates: { userId: string; sessionId: string }[] = [];
+
   for (const s of mem().values()) {
-    if (s.status === "running") out.set(s.id, s);
+    if (s.status === "running" && s.userId && s.id) {
+      candidates.push({ userId: s.userId, sessionId: s.id });
+    }
   }
 
   const db = await getAdminDbAsync();
@@ -473,8 +562,7 @@ export async function listRunningSessions(): Promise<PaperSessionDoc[]> {
       for (const d of idx.docs) {
         const ref = d.data() as { userId: string; sessionId: string };
         if (!ref.userId || !ref.sessionId) continue;
-        const full = await getSession(ref.userId, ref.sessionId);
-        if (full?.status === "running") out.set(full.id, full);
+        candidates.push({ userId: ref.userId, sessionId: ref.sessionId });
       }
     } catch {
       /* ignore */
@@ -491,9 +579,15 @@ export async function listRunningSessions(): Promise<PaperSessionDoc[]> {
     for (const row of rows) {
       const ref = row as { userId?: string; sessionId?: string };
       if (!ref.userId || !ref.sessionId) continue;
-      const full = await getSession(ref.userId, ref.sessionId);
-      if (full?.status === "running") out.set(full.id, full);
+      candidates.push({ userId: ref.userId, sessionId: ref.sessionId });
     }
+  }
+
+  // Only include sessions still running in cloud
+  for (const c of candidates) {
+    if (out.has(c.sessionId)) continue;
+    const full = await getSession(c.userId, c.sessionId, { preferCloud: true });
+    if (full?.status === "running") out.set(full.id, full);
   }
 
   return [...out.values()];

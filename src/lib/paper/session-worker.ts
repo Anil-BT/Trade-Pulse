@@ -144,15 +144,31 @@ export async function processPaperSession(
   sessionId: string,
   userIdHint?: string
 ): Promise<PaperSessionDoc | null> {
-  let doc =
-    findSessionInMem(sessionId) ||
-    (await listRunningSessions()).find((s) => s.id === sessionId) ||
-    null;
-
-  if (!doc && userIdHint) {
-    doc = await getSession(userIdHint, sessionId);
+  // Always prefer cloud status — warm mem often still says "running" after Stop
+  let doc: PaperSessionDoc | null = null;
+  if (userIdHint) {
+    doc = await getSession(userIdHint, sessionId, { preferCloud: true });
   }
-  if (!doc || doc.status !== "running") return doc;
+  if (!doc) {
+    const fromList = (await listRunningSessions()).find((s) => s.id === sessionId);
+    if (fromList?.userId) {
+      doc = await getSession(fromList.userId, sessionId, { preferCloud: true });
+    }
+  }
+  if (!doc) {
+    const memDoc = findSessionInMem(sessionId);
+    if (memDoc?.userId) {
+      doc = await getSession(memDoc.userId, sessionId, { preferCloud: true });
+    }
+  }
+  if (!doc || doc.status !== "running") {
+    // Sync mem if cloud says stopped
+    if (doc && findSessionInMem(sessionId)) {
+      const m = findSessionInMem(sessionId);
+      if (m) m.status = doc.status;
+    }
+    return doc;
+  }
 
   const now = Date.now();
   if (now > doc.endsAt) {

@@ -33,27 +33,44 @@ async function handleStatus(
     (typeof body.sessionId === "string" && body.sessionId) ||
     req.nextUrl.searchParams.get("sessionId") ||
     "";
+
+  // Active view (no id): only a *running* session
+  // Explicit id: return that doc (may be stopped) but never auto-revive work
   let doc = sessionId
-    ? await getSession(user.uid, sessionId)
+    ? await getSession(user.uid, sessionId, { preferCloud: true })
     : await getActiveSession(user.uid);
 
-  // Drive paper work from status polls (Hobby cron is only daily)
+  // If client asked by id but that session is not running, fall back to any
+  // true active session only when they are polling without a "stopped" intent.
+  // For active-only UI we return null when not running (unless sessionId set
+  // and status is stopped/ended so UI can show "Session stopped").
+  if (doc && !sessionId && doc.status !== "running") {
+    doc = null;
+  }
+
+  // Drive paper work only for confirmed running sessions
   if (doc?.status === "running") {
-    const sid = doc.id;
-    const uid = user.uid;
-    const last = doc.lastWorkerAt || 0;
-    // At most one background tick per ~45s per session (avoid overlap)
-    if (Date.now() - last > 45_000) {
-      after(async () => {
-        try {
-          const { processPaperSession } = await import(
-            "@/lib/paper/session-worker"
-          );
-          await processPaperSession(sid, uid);
-        } catch (e) {
-          console.error("[paper-status] tick:", e);
-        }
-      });
+    // Double-check cloud before scheduling a long tick
+    const fresh = await getSession(user.uid, doc.id, { preferCloud: true });
+    if (!fresh || fresh.status !== "running") {
+      doc = fresh;
+    } else {
+      doc = fresh;
+      const sid = doc.id;
+      const uid = user.uid;
+      const last = doc.lastWorkerAt || 0;
+      if (Date.now() - last > 45_000) {
+        after(async () => {
+          try {
+            const { processPaperSession } = await import(
+              "@/lib/paper/session-worker"
+            );
+            await processPaperSession(sid, uid);
+          } catch (e) {
+            console.error("[paper-status] tick:", e);
+          }
+        });
+      }
     }
   }
 
@@ -67,11 +84,13 @@ async function handleStatus(
     });
   }
 
-  // Re-read after optional work is scheduled (returns current Firestore state)
-  if (sessionId) {
-    doc = (await getSession(user.uid, sessionId)) || doc;
-  } else {
-    doc = (await getActiveSession(user.uid)) || doc;
+  // For default status polls (no sessionId), hide non-running sessions so UI
+  // does not re-attach after Stop
+  if (!sessionId && doc.status !== "running") {
+    return NextResponse.json({
+      session: null,
+      durableReady,
+    });
   }
 
   return NextResponse.json({
@@ -92,7 +111,6 @@ export async function GET(req: NextRequest) {
   }
 }
 
-/** Mobile-safe: idToken in JSON body (avoids Authorization header issues). */
 export async function POST(req: NextRequest) {
   try {
     let body: Record<string, unknown> = {};
