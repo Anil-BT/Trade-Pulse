@@ -127,6 +127,7 @@ export function runBacktest(
   let entryLots = 0;
   let entryLabel = "";
   let entryPremiumSource: "market" | "model" | undefined;
+  let entryInstrumentKey = "";
   /** Once true, stop is at entry (breakeven) until exit */
   let trailToCostArmed = false;
   let tradesOnDay = 0;
@@ -232,10 +233,26 @@ export function runBacktest(
     if (req.leaveOpenPositions) {
       // Mark in *same units as entry*: equity = stock ₹, options = premium ₹
       // (Never use underlying close as option mark — that inflated uP&L massively.)
-      const mark = markUnitPrice(last, tradeInstrument, optCfg, pricer, {
+      let mark = markUnitPrice(last, tradeInstrument, optCfg, pricer, {
         entryTime,
         entryStrike,
       });
+      let markSource: "market" | "model" | "ltp" | undefined =
+        tradeInstrument === "options_atm"
+          ? pricer
+            ? // Infer from quote path
+              (() => {
+                const q = pricer.quote({
+                  timeMs: last.time,
+                  spot: last.close,
+                  strike: entryStrike,
+                  heldFromMs: entryTime,
+                });
+                mark = q.premium;
+                return q.source;
+              })()
+            : "model"
+          : undefined;
       const unrealized = (mark - entryPrice) * positionQty;
       equityCurve[equityCurve.length - 1] = {
         time: last.time,
@@ -256,6 +273,9 @@ export function runBacktest(
         markPrice: mark,
         unrealizedPnl: unrealized,
         symbol: req.symbol,
+        instrumentKey: entryInstrumentKey || undefined,
+        premiumSource: entryPremiumSource,
+        markSource,
       };
     } else {
       closePosition(candles.length - 1, last, "eod");
@@ -369,6 +389,10 @@ export function runBacktest(
       entryStrike = q.strike || strike;
       entryLots = lots;
       entryPremiumSource = q.source;
+      entryInstrumentKey =
+        ("instrumentKey" in q && typeof q.instrumentKey === "string"
+          ? q.instrumentKey
+          : "") || "";
       entryLabel =
         q.contractLabel ||
         formatOptionLabel(
@@ -399,6 +423,7 @@ export function runBacktest(
     entryLots = 0;
     entryLabel = "";
     entryPremiumSource = undefined;
+    entryInstrumentKey = "";
     trailToCostArmed = false;
     tradesOnDay += 1;
   }

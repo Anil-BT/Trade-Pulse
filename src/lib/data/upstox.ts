@@ -334,6 +334,77 @@ async function fetchUpstoxChunk(opts: {
     .filter((c) => Number.isFinite(c.time) && Number.isFinite(c.close));
 }
 
+/**
+ * Last traded price for one or more instruments (equity or F&O).
+ * GET /v3/market-quote/ltp?instrument_key=...
+ */
+export async function fetchUpstoxLtp(opts: {
+  instrumentKeys: string[];
+  accessToken: string;
+}): Promise<Map<string, number>> {
+  const out = new Map<string, number>();
+  const token = sanitizeToken(opts.accessToken);
+  const keys = [...new Set(opts.instrumentKeys.map((k) => k.trim()).filter(Boolean))];
+  if (!token || !keys.length) return out;
+
+  await waitForUpstoxSlot();
+
+  // API accepts comma-separated keys; keep batches modest
+  const batch = keys.slice(0, 50);
+  const q = batch.map(encodeURIComponent).join(",");
+  const url = `https://api.upstox.com/v3/market-quote/ltp?instrument_key=${q}`;
+
+  const ctrl = new AbortController();
+  const timer = setTimeout(() => ctrl.abort(), 15_000);
+  let res: Response;
+  try {
+    res = await fetch(url, {
+      headers: asciiHeaders({
+        Accept: "application/json",
+        Authorization: `Bearer ${token}`,
+      }),
+      cache: "no-store",
+      signal: ctrl.signal,
+    });
+  } catch {
+    clearTimeout(timer);
+    return out;
+  }
+  clearTimeout(timer);
+
+  if (!res.ok) {
+    if (res.status === 429) noteUpstoxRateLimited();
+    return out;
+  }
+  noteUpstoxSuccess();
+
+  try {
+    const json = (await res.json()) as {
+      data?: Record<string, { last_price?: number; ltp?: number } | number>;
+    };
+    const data = json?.data || {};
+    for (const [k, v] of Object.entries(data)) {
+      let px = 0;
+      if (typeof v === "number") px = v;
+      else if (v && typeof v === "object") {
+        px = Number(v.last_price ?? v.ltp ?? 0);
+      }
+      if (px > 0) {
+        // Keys may be returned as instrument_key or trading symbol form
+        out.set(k, px);
+        // Also index by matching request key if formats differ slightly
+        const match = batch.find(
+          (b) => b === k || k.includes(b) || b.includes(k)
+        );
+        if (match) out.set(match, px);
+      }
+    }
+  } catch {
+    /* ignore parse */
+  }
+  return out;
+}
+
 function sleep(ms: number) {
   return new Promise((r) => setTimeout(r, ms));
 }

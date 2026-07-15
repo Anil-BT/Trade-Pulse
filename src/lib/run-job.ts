@@ -227,7 +227,7 @@ export async function runBacktestJob(
 }
 
 /** Quick dry-run of entry conditions to know which ATM contracts to prefetch. */
-function previewEntrySignals(
+export function previewEntrySignals(
   candles: import("./types").Candle[],
   entry: Condition[],
   logic: "and" | "or",

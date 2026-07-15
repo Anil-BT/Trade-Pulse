@@ -60,6 +60,8 @@ export async function createOptionPricer(opts: {
   accessToken?: string;
   /** Dry-run trades: {time, spot} to prefetch market contracts */
   signalTimes?: { timeMs: number; spot: number }[];
+  /** Cap option history fetches (paper uses 2 to stay under rate limits) */
+  maxMarketContracts?: number;
 }): Promise<OptionPricer> {
   const side = opts.side;
   const strikes = opts.listedStrikes;
@@ -93,7 +95,8 @@ export async function createOptionPricer(opts: {
     }
 
     // Cap option history fetches — each hits Upstox; model is fine for rest
-    const keys = [...needed.values()].slice(0, 8);
+    const cap = Math.max(1, Math.min(12, opts.maxMarketContracts ?? 8));
+    const keys = [...needed.values()].slice(0, cap);
     for (const c of keys) {
       try {
         const oc = await fetchUpstoxCandles({
@@ -102,6 +105,8 @@ export async function createOptionPricer(opts: {
           from: opts.from,
           to: opts.to,
           accessToken: token,
+          // Include lookback so entry bars resolve; intraday merge covers today
+          lookbackDays: 5,
         });
         if (oc.length) {
           marketSeries.set(c.instrumentKey, oc);
@@ -110,7 +115,7 @@ export async function createOptionPricer(opts: {
       } catch {
         // fall back to model for this contract (incl. rate limit)
       }
-      await sleep(450);
+      await sleep(opts.maxMarketContracts != null && opts.maxMarketContracts <= 2 ? 200 : 450);
     }
   }
 

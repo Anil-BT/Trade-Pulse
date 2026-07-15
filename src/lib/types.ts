@@ -291,6 +291,12 @@ export interface OpenPosition {
   unrealizedPnl: number;
   symbol?: string;
   label?: string;
+  /** Option instrument key when market-priced */
+  instrumentKey?: string;
+  /** Entry premium source */
+  premiumSource?: "market" | "model";
+  /** Mark premium source */
+  markSource?: "market" | "model" | "ltp";
 }
 
 export interface BacktestResult {

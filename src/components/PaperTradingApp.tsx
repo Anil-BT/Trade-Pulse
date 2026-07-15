@@ -1092,10 +1092,11 @@ export function PaperTradingApp() {
               Open paper positions (all strategies)
             </h2>
             <p className="mb-4 text-xs text-neutral-500">
-              <strong>uP&amp;L</strong> = unrealized profit &amp; loss (mark − entry)
-              × qty. In options mode Entry/Mark are{" "}
-              <em>option premiums</em> (model), not the stock price. Spot is
-              shown under each row when available.
+              <strong>uP&amp;L</strong> = unrealized P&amp;L (mark − entry) × qty.
+              Options: Entry/Mark are <em>premiums</em> (not stock). Prefer{" "}
+              <strong>mkt</strong> (option candle) / <strong>LTP</strong> (live
+              Upstox quote); <strong>model</strong> = Black–Scholes estimate when
+              market data is missing.
             </p>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[720px] text-sm">
@@ -1151,7 +1152,7 @@ export function PaperTradingApp() {
                           <div>{p.entryPrice.toFixed(2)}</div>
                           {isOpt && (
                             <div className="text-[10px] text-neutral-400">
-                              prem
+                              {p.premiumSource === "market" ? "mkt prem" : "model prem"}
                             </div>
                           )}
                         </td>
@@ -1159,7 +1160,11 @@ export function PaperTradingApp() {
                           <div>{p.markPrice.toFixed(2)}</div>
                           {isOpt && (
                             <div className="text-[10px] text-neutral-400">
-                              prem
+                              {p.markSource === "ltp"
+                                ? "LTP"
+                                : p.markSource === "market"
+                                  ? "mkt prem"
+                                  : "model prem"}
                             </div>
                           )}
                         </td>

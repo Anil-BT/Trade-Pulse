@@ -3,11 +3,13 @@
  * then evaluate 1–2 strategies on the same bars (no duplicate market calls).
  */
 import { listFnoEquitySymbols } from "../data/fno-meta";
-import { fetchUpstoxCandles } from "../data/upstox";
+import { fetchUpstoxCandles, fetchUpstoxLtp } from "../data/upstox";
 import { resolveUpstoxInstrumentKey } from "../data/upstox-instruments";
 import { resolveFnoMeta } from "../data/fno-meta";
 import { runBacktest } from "../backtest";
 import { dayBoundsUnix } from "../data/dates";
+import { createOptionPricer } from "../option-pricing";
+import { previewEntrySignals } from "../run-job";
 import { sanitizeToken } from "../http";
 import { todayIst, isNseSessionOpen } from "./market-hours";
 import { isRateLimitError } from "./sanitize";
@@ -354,25 +356,105 @@ export async function processPaperSession(
             };
           }
 
-          // Paper: model option fills only (no per-symbol option-chain fetch).
-          // Avoids rate limits and "invalid string"/header issues from extra APIs.
-          const result = runBacktest(candles, {
-            symbol,
-            interval: cfg.interval,
-            from: today,
-            to: today,
-            source: "upstox",
-            strategy: s.strategy,
-            initialCapital: cfg.initialCapital,
-            positionSizePct: cfg.positionSizePct,
-            oneTradePerDay: cfg.oneTradePerDay,
-            entryTimeWindows: cfg.entryTimeWindows,
-            maxRiskPerTrade: cfg.maxRiskPerTrade,
-            tradeInstrument: cfg.tradeInstrument,
-            options,
-            entryNotBeforeMs: entryFloor,
-            leaveOpenPositions: true,
-          });
+          // Prefer Upstox market option OHLC (+ live LTP for open mark) over BS model
+          let optionPricer;
+          if (cfg.tradeInstrument === "options_atm" && options) {
+            try {
+              const signalTimes = previewEntrySignals(
+                candles,
+                s.strategy.entry,
+                s.strategy.entryLogic ?? "and",
+                Boolean(cfg.oneTradePerDay)
+              );
+              // Always include last bar so open-leg mark can resolve market prem
+              const last = candles[candles.length - 1];
+              if (last) {
+                signalTimes.push({ timeMs: last.time, spot: last.close });
+              }
+              if (signalTimes.length > 0) {
+                optionPricer = await createOptionPricer({
+                  symbol,
+                  side: options.side || "CE",
+                  equityCandles: candles,
+                  from: today,
+                  to: today,
+                  interval: cfg.interval,
+                  listedStrikes: options.listedStrikes || [],
+                  strikeStep: options.strikeStep || 0,
+                  lotSize: options.lotSize,
+                  preferredDaysToExpiry: options.daysToExpiry ?? 7,
+                  fallbackIv: options.iv ?? 0.18,
+                  accessToken: token,
+                  signalTimes,
+                  maxMarketContracts: 2,
+                });
+              }
+            } catch (e) {
+              console.warn(
+                `[paper-worker] option pricer ${symbol}:`,
+                e instanceof Error ? e.message : e
+              );
+            }
+          }
+
+          const result = runBacktest(
+            candles,
+            {
+              symbol,
+              interval: cfg.interval,
+              from: today,
+              to: today,
+              source: "upstox",
+              strategy: s.strategy,
+              initialCapital: cfg.initialCapital,
+              positionSizePct: cfg.positionSizePct,
+              oneTradePerDay: cfg.oneTradePerDay,
+              entryTimeWindows: cfg.entryTimeWindows,
+              maxRiskPerTrade: cfg.maxRiskPerTrade,
+              tradeInstrument: cfg.tradeInstrument,
+              options,
+              entryNotBeforeMs: entryFloor,
+              leaveOpenPositions: true,
+            },
+            { optionPricer }
+          );
+
+          // Live LTP mark for open options (closest to Upstox app price)
+          if (
+            result.openPosition &&
+            result.openPosition.instrumentKey &&
+            token
+          ) {
+            try {
+              const ltps = await fetchUpstoxLtp({
+                instrumentKeys: [result.openPosition.instrumentKey],
+                accessToken: token,
+              });
+              const key = result.openPosition.instrumentKey;
+              let ltp =
+                ltps.get(key) ||
+                [...ltps.values()].find((v) => v > 0) ||
+                0;
+              if (!(ltp > 0)) {
+                // try any key in map (Upstox sometimes returns trading-symbol keys)
+                for (const [, v] of ltps) {
+                  if (v > 0) {
+                    ltp = v;
+                    break;
+                  }
+                }
+              }
+              if (ltp > 0) {
+                const entry = result.openPosition.entryPrice;
+                const qty = result.openPosition.qty;
+                result.openPosition.markPrice = ltp;
+                result.openPosition.unrealizedPnl = (ltp - entry) * qty;
+                result.openPosition.markSource = "ltp";
+              }
+            } catch {
+              /* keep candle/model mark */
+            }
+          }
 
           const tag = s.strategy.name || `S${s.slot}`;
           batchRowsBySlot
@@ -388,10 +470,16 @@ export async function processPaperSession(
             );
 
           if (result.openPosition) {
+            const src =
+              result.openPosition.premiumSource ||
+              result.openPosition.markSource ||
+              "model";
             batchOpensBySlot.get(s.slot)!.push({
               ...result.openPosition,
               symbol,
-              label: `${tag} · ${symbol}`,
+              label: `${tag} · ${symbol}${
+                src === "model" ? " · model" : src === "ltp" ? " · LTP" : " · mkt"
+              }`,
             });
           }
         }
