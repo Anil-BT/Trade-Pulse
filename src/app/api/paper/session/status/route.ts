@@ -57,11 +57,13 @@ async function handleStatus(
     }
   }
 
+  const durableReady = await isDurableStoreReady();
+
   if (!doc) {
     return NextResponse.json({
       session: null,
-      durableReady: isDurableStoreReady(),
-      hint: !isDurableStoreReady() ? durableStoreHint() : undefined,
+      durableReady,
+      hint: !durableReady ? durableStoreHint() : undefined,
     });
   }
 
@@ -74,7 +76,7 @@ async function handleStatus(
 
   return NextResponse.json({
     session: toPublicSession(doc),
-    durableReady: isDurableStoreReady(),
+    durableReady,
   });
 }
 

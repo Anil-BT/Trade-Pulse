@@ -1,9 +1,16 @@
 import type { NextConfig } from "next";
 
 const nextConfig: NextConfig = {
-  // firebase-admin must stay external — bundling it breaks paper API routes
-  // on Vercel (HTML 500 before the handler runs).
-  serverExternalPackages: ["firebase-admin"],
+  // Keep firebase-admin (and ESM deps) external so Next doesn't force require()
+  // of jose webapi (ERR_REQUIRE_ESM on Vercel).
+  serverExternalPackages: [
+    "firebase-admin",
+    "@google-cloud/firestore",
+    "@google-cloud/storage",
+    "google-gax",
+    "jose",
+    "jwks-rsa",
+  ],
 };
 
 export default nextConfig;

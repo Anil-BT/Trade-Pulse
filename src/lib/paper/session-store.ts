@@ -1,9 +1,20 @@
 /**
  * Durable paper-session store:
  * - In-process Map (dev / same serverless instance only)
- * - Firestore users/{uid}/paperSessions/{id} + paperSessionIndex (required on Vercel)
+ * - Firestore via Admin SDK, or REST fallback (no ERR_REQUIRE_ESM)
  */
-import { getAdminDb, getAdminLoadError, isAdminConfigured } from "../firebase/admin";
+import {
+  durableAdminHint,
+  firestoreRestGet,
+  firestoreRestQuery,
+  firestoreRestSet,
+  getAdminDbAsync,
+  getAdminLoadError,
+  getGoogleAccessToken,
+  isAdminConfigured,
+  isDurableStoreReadyAsync,
+  parseServiceAccount,
+} from "../firebase/admin";
 import { cleanForStorage, compactSession } from "./sanitize";
 import type { PaperSessionDoc, PaperSessionStatus } from "./session-types";
 
@@ -36,9 +47,8 @@ export type SaveSessionResult = {
   error?: string;
 };
 
-/** True when Admin Firestore is available for multi-instance durability. */
-export function isDurableStoreReady(): boolean {
-  return Boolean(getAdminDb());
+export async function isDurableStoreReady(): Promise<boolean> {
+  return isDurableStoreReadyAsync();
 }
 
 export function durableStoreHint(): string {
@@ -46,15 +56,17 @@ export function durableStoreHint(): string {
     return "Set FIREBASE_SERVICE_ACCOUNT_JSON in Vercel env (service account JSON). Client Firebase alone is not enough for paper status.";
   }
   const err = getAdminLoadError();
-  if (err) return `Firebase Admin failed: ${err}`;
-  if (!getAdminDb()) {
-    return "Firestore Admin not ready. Check FIREBASE_SERVICE_ACCOUNT_JSON private_key and project_id.";
-  }
-  return "";
+  if (err) return durableAdminHint() || `Firebase Admin failed: ${err}`;
+  return durableAdminHint();
+}
+
+async function canUseRest(): Promise<boolean> {
+  if (!parseServiceAccount()) return false;
+  const t = await getGoogleAccessToken();
+  return Boolean(t);
 }
 
 export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResult> {
-  // Always keep a memory copy first
   mem().set(doc.id, doc);
 
   let clean: PaperSessionDoc;
@@ -62,40 +74,57 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
     const compacted = compactSession(doc as never) as PaperSessionDoc;
     clean = cleanForStorage(compacted, false);
   } catch (e) {
-    const msg =
-      e instanceof Error
-        ? e.message
-        : "Session serialize failed";
+    const msg = e instanceof Error ? e.message : "Session serialize failed";
     console.error("[paper-session] serialize failed:", msg);
     return { ok: false, durable: false, error: msg };
   }
 
   mem().set(doc.id, { ...clean, upstoxAccessToken: doc.upstoxAccessToken });
 
-  const db = getAdminDb();
-  if (!db) {
-    // Local/dev: memory-only is OK; Vercel callers must check durable
-    return {
-      ok: true,
-      durable: false,
-      error: durableStoreHint() || "No Firestore Admin",
-    };
+  const payload = {
+    ...clean,
+    upstoxAccessToken: doc.upstoxAccessToken || null,
+  };
+
+  // Prefer Admin SDK
+  const db = await getAdminDbAsync();
+  if (db) {
+    try {
+      await db
+        .collection("users")
+        .doc(doc.userId)
+        .collection(COL)
+        .doc(doc.id)
+        .set(payload, { merge: true });
+      await db.collection("paperSessionIndex").doc(doc.id).set(
+        {
+          userId: doc.userId,
+          sessionId: doc.id,
+          status: doc.status,
+          updatedAt: doc.updatedAt || Date.now(),
+          endsAt: doc.endsAt || null,
+          sessionDay: doc.sessionDay || null,
+        },
+        { merge: true }
+      );
+      return { ok: true, durable: true };
+    } catch (e) {
+      console.error(
+        "[paper-session] Admin write failed, trying REST:",
+        e instanceof Error ? e.message : e
+      );
+    }
   }
 
-  try {
-    const payload = {
-      ...clean,
-      upstoxAccessToken: doc.upstoxAccessToken || null,
-    };
-    await db
-      .collection("users")
-      .doc(doc.userId)
-      .collection(COL)
-      .doc(doc.id)
-      .set(payload, { merge: true });
-
-    // Index for worker discovery across instances
-    await db.collection("paperSessionIndex").doc(doc.id).set(
+  // REST fallback (no firebase-admin / jose)
+  if (await canUseRest()) {
+    const ok1 = await firestoreRestSet(
+      `users/${doc.userId}/${COL}/${doc.id}`,
+      payload as Record<string, unknown>,
+      true
+    );
+    const ok2 = await firestoreRestSet(
+      `paperSessionIndex/${doc.id}`,
       {
         userId: doc.userId,
         sessionId: doc.id,
@@ -104,18 +133,23 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
         endsAt: doc.endsAt || null,
         sessionDay: doc.sessionDay || null,
       },
-      { merge: true }
+      true
     );
-
-    return { ok: true, durable: true };
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : "Firestore save failed";
-    console.error("[paper-session] Firestore save failed:", msg);
-    return { ok: false, durable: false, error: msg };
+    if (ok1 && ok2) return { ok: true, durable: true };
+    return {
+      ok: false,
+      durable: false,
+      error: getAdminLoadError() || "Firestore REST save failed",
+    };
   }
+
+  return {
+    ok: true,
+    durable: false,
+    error: durableStoreHint() || "No Firestore backend",
+  };
 }
 
-/** Lightweight status flip — never re-serialize huge reports. */
 export async function markSessionStopped(
   userId: string,
   sessionId: string,
@@ -132,33 +166,44 @@ export async function markSessionStopped(
       memTimers().delete(sessionId);
     }
   }
-  const db = getAdminDb();
-  if (!db) return;
-  try {
-    await db
-      .collection("users")
-      .doc(userId)
-      .collection(COL)
-      .doc(sessionId)
-      .set(
+
+  const patch = {
+    status: "stopped",
+    updatedAt: Date.now(),
+    workerNote: note,
+  };
+
+  const db = await getAdminDbAsync();
+  if (db) {
+    try {
+      await db
+        .collection("users")
+        .doc(userId)
+        .collection(COL)
+        .doc(sessionId)
+        .set(patch, { merge: true });
+      await db.collection("paperSessionIndex").doc(sessionId).set(
         {
+          userId,
+          sessionId,
           status: "stopped",
           updatedAt: Date.now(),
-          workerNote: note,
         },
         { merge: true }
       );
-    await db.collection("paperSessionIndex").doc(sessionId).set(
-      {
-        userId,
-        sessionId,
-        status: "stopped",
-        updatedAt: Date.now(),
-      },
-      { merge: true }
+      return;
+    } catch (e) {
+      console.error("[paper-session] mark stopped admin failed:", e);
+    }
+  }
+
+  if (await canUseRest()) {
+    await firestoreRestSet(`users/${userId}/${COL}/${sessionId}`, patch, true);
+    await firestoreRestSet(
+      `paperSessionIndex/${sessionId}`,
+      { userId, sessionId, status: "stopped", updatedAt: Date.now() },
+      true
     );
-  } catch (e) {
-    console.error("[paper-session] mark stopped failed:", e);
   }
 }
 
@@ -169,30 +214,53 @@ export async function getSession(
   const m = mem().get(sessionId);
   if (m && m.userId === userId) return m;
 
-  const db = getAdminDb();
-  if (!db) return m && m.userId === userId ? m : null;
-  try {
-    const snap = await db
-      .collection("users")
-      .doc(userId)
-      .collection(COL)
-      .doc(sessionId)
-      .get();
-    if (!snap.exists) return null;
-    const data = snap.data() as PaperSessionDoc;
-    const existing = mem().get(sessionId);
-    mem().set(sessionId, {
-      ...data,
-      id: data.id || sessionId,
-      userId: data.userId || userId,
-      upstoxAccessToken:
-        data.upstoxAccessToken || existing?.upstoxAccessToken || "",
-    });
-    return mem().get(sessionId) || null;
-  } catch (e) {
-    console.error("[paper-session] getSession failed:", e);
-    return null;
+  const db = await getAdminDbAsync();
+  if (db) {
+    try {
+      const snap = await db
+        .collection("users")
+        .doc(userId)
+        .collection(COL)
+        .doc(sessionId)
+        .get();
+      if (snap.exists) {
+        const data = snap.data() as PaperSessionDoc;
+        const existing = mem().get(sessionId);
+        mem().set(sessionId, {
+          ...data,
+          id: data.id || sessionId,
+          userId: data.userId || userId,
+          upstoxAccessToken:
+            data.upstoxAccessToken || existing?.upstoxAccessToken || "",
+        });
+        return mem().get(sessionId) || null;
+      }
+    } catch (e) {
+      console.error("[paper-session] getSession admin failed:", e);
+    }
   }
+
+  if (await canUseRest()) {
+    const data = await firestoreRestGet(
+      `users/${userId}/${COL}/${sessionId}`
+    );
+    if (data) {
+      const existing = mem().get(sessionId);
+      const doc = {
+        ...(data as unknown as PaperSessionDoc),
+        id: (data.id as string) || sessionId,
+        userId: (data.userId as string) || userId,
+        upstoxAccessToken:
+          (data.upstoxAccessToken as string) ||
+          existing?.upstoxAccessToken ||
+          "",
+      };
+      mem().set(sessionId, doc);
+      return doc;
+    }
+  }
+
+  return m && m.userId === userId ? m : null;
 }
 
 export async function getActiveSession(
@@ -201,53 +269,83 @@ export async function getActiveSession(
   for (const s of mem().values()) {
     if (s.userId === userId && s.status === "running") return s;
   }
-  const db = getAdminDb();
-  if (!db) return null;
-  try {
-    // Prefer ordered query; fall back if index missing
-    let best: PaperSessionDoc | null = null;
-    try {
-      const snap = await db
-        .collection("users")
-        .doc(userId)
-        .collection(COL)
-        .where("status", "==", "running")
-        .orderBy("startedAt", "desc")
-        .limit(3)
-        .get();
-      snap.forEach((d) => {
-        const data = d.data() as PaperSessionDoc;
-        if (!best) best = { ...data, id: data.id || d.id };
-      });
-    } catch {
-      const snap = await db
-        .collection("users")
-        .doc(userId)
-        .collection(COL)
-        .where("status", "==", "running")
-        .limit(5)
-        .get();
-      snap.forEach((d) => {
-        const data = { ...(d.data() as PaperSessionDoc), id: d.id };
-        if (!best || (data.startedAt || 0) > (best.startedAt || 0)) best = data;
-      });
-    }
 
-    if (best) {
-      const b = best as PaperSessionDoc;
-      const existing = mem().get(b.id);
-      mem().set(b.id, {
-        ...b,
-        upstoxAccessToken:
-          b.upstoxAccessToken || existing?.upstoxAccessToken || "",
-      });
-      return mem().get(b.id) || b;
+  const db = await getAdminDbAsync();
+  if (db) {
+    try {
+      let best: PaperSessionDoc | null = null;
+      try {
+        const snap = await db
+          .collection("users")
+          .doc(userId)
+          .collection(COL)
+          .where("status", "==", "running")
+          .orderBy("startedAt", "desc")
+          .limit(3)
+          .get();
+        snap.forEach((d) => {
+          const data = d.data() as PaperSessionDoc;
+          if (!best) best = { ...data, id: data.id || d.id };
+        });
+      } catch {
+        const snap = await db
+          .collection("users")
+          .doc(userId)
+          .collection(COL)
+          .where("status", "==", "running")
+          .limit(5)
+          .get();
+        snap.forEach((d) => {
+          const data = { ...(d.data() as PaperSessionDoc), id: d.id };
+          if (!best || (data.startedAt || 0) > (best.startedAt || 0)) {
+            best = data;
+          }
+        });
+      }
+      if (best) {
+        const b = best as PaperSessionDoc;
+        const existing = mem().get(b.id);
+        mem().set(b.id, {
+          ...b,
+          upstoxAccessToken:
+            b.upstoxAccessToken || existing?.upstoxAccessToken || "",
+        });
+        return mem().get(b.id) || b;
+      }
+    } catch (e) {
+      console.error("[paper-session] getActiveSession admin failed:", e);
     }
-    return null;
-  } catch (e) {
-    console.error("[paper-session] getActiveSession failed:", e);
-    return null;
   }
+
+  if (await canUseRest()) {
+    const rows = await firestoreRestQuery(
+      `users/${userId}`,
+      COL,
+      "status",
+      "EQUAL",
+      "running",
+      5
+    );
+    let best: PaperSessionDoc | null = null;
+    for (const row of rows) {
+      const data = row as unknown as PaperSessionDoc;
+      if (!best || (data.startedAt || 0) > (best.startedAt || 0)) {
+        best = { ...data, id: data.id || (row.id as string) };
+      }
+    }
+    if (best) {
+      const existing = mem().get(best.id);
+      mem().set(best.id, {
+        ...best,
+        userId: best.userId || userId,
+        upstoxAccessToken:
+          best.upstoxAccessToken || existing?.upstoxAccessToken || "",
+      });
+      return mem().get(best.id) || best;
+    }
+  }
+
+  return null;
 }
 
 export async function listRunningSessions(): Promise<PaperSessionDoc[]> {
@@ -255,7 +353,8 @@ export async function listRunningSessions(): Promise<PaperSessionDoc[]> {
   for (const s of mem().values()) {
     if (s.status === "running") out.set(s.id, s);
   }
-  const db = getAdminDb();
+
+  const db = await getAdminDbAsync();
   if (db) {
     try {
       const idx = await db
@@ -270,9 +369,25 @@ export async function listRunningSessions(): Promise<PaperSessionDoc[]> {
         if (full?.status === "running") out.set(full.id, full);
       }
     } catch {
-      /* index query may fail without composite index — ignore */
+      /* ignore */
+    }
+  } else if (await canUseRest()) {
+    const rows = await firestoreRestQuery(
+      "",
+      "paperSessionIndex",
+      "status",
+      "EQUAL",
+      "running",
+      50
+    );
+    for (const row of rows) {
+      const ref = row as { userId?: string; sessionId?: string };
+      if (!ref.userId || !ref.sessionId) continue;
+      const full = await getSession(ref.userId, ref.sessionId);
+      if (full?.status === "running") out.set(full.id, full);
     }
   }
+
   return [...out.values()];
 }
 
@@ -293,12 +408,14 @@ export async function updateSession(
       }
     }
   }
-  // Last resort: load from index
   if (!base) {
-    const db = getAdminDb();
+    const db = await getAdminDbAsync();
     if (db) {
       try {
-        const idx = await db.collection("paperSessionIndex").doc(sessionId).get();
+        const idx = await db
+          .collection("paperSessionIndex")
+          .doc(sessionId)
+          .get();
         if (idx.exists) {
           const ref = idx.data() as { userId?: string };
           if (ref.userId) {
@@ -307,6 +424,12 @@ export async function updateSession(
         }
       } catch {
         /* ignore */
+      }
+    } else if (await canUseRest()) {
+      const idx = await firestoreRestGet(`paperSessionIndex/${sessionId}`);
+      if (idx?.userId) {
+        base =
+          (await getSession(String(idx.userId), sessionId)) || undefined;
       }
     }
   }

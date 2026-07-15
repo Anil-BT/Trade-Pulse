@@ -61,7 +61,7 @@ export async function POST(req: NextRequest) {
     // On Vercel, in-memory sessions vanish between requests — require Firestore
     const requireDurable =
       Boolean(process.env.VERCEL) || body.requireDurable !== false;
-    if (requireDurable && !isDurableStoreReady()) {
+    if (requireDurable && !(await isDurableStoreReady())) {
       return jsonError(
         `Paper trading needs durable storage on this host. ${durableStoreHint()} ` +
           "Add FIREBASE_SERVICE_ACCOUNT_JSON in Vercel → Settings → Environment Variables, then redeploy.",
