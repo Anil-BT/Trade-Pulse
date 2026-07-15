@@ -412,10 +412,14 @@ export function PaperTradingApp() {
       (typeof window !== "undefined"
         ? localStorage.getItem("tp_paper_session_id")
         : null);
-    if (!sid && !session) {
-      setError("No session id to stop. Try Refresh, then Stop again.");
-      return;
+
+    // Stop polling immediately so status ticks don't fight the stop
+    if (pollRef.current) {
+      clearInterval(pollRef.current);
+      pollRef.current = null;
     }
+    rememberSessionId(null);
+
     setBusy(true);
     try {
       const res = await paperFetch("/api/paper/session/stop", {
@@ -430,36 +434,38 @@ export function PaperTradingApp() {
         error?: string;
         status?: string;
         sessionId?: string;
-        session?: Partial<SafeSession>;
+        session?: SafeSession | null;
+        note?: string;
       }>(res);
       if (!res.ok) throw new Error(data.error || `Stop failed (${res.status})`);
 
-      // Optimistically clear running UI even before next poll
-      rememberSessionId(null);
-      setSession((prev) =>
-        prev
-          ? {
-              ...prev,
-              status: "stopped",
-              workerNote: data.session?.workerNote || "Stopped by user",
-              updatedAt: Date.now(),
-            }
-          : data.session
-            ? ({
-                id: data.sessionId || sid || "",
+      // Force stopped UI from response (or clear if already gone)
+      if (data.session && typeof data.session === "object") {
+        setSession({
+          ...data.session,
+          status: data.session.status || "stopped",
+          workerNote:
+            data.session.workerNote || "Stopped by user",
+        } as SafeSession);
+      } else if (session || sid) {
+        setSession((prev) =>
+          prev
+            ? {
+                ...prev,
                 status: "stopped",
-                sessionDay: data.session.sessionDay || "",
-                startedAt: data.session.startedAt || Date.now(),
-                endsAt: data.session.endsAt || Date.now(),
+                workerNote: "Stopped by user",
                 updatedAt: Date.now(),
-                workerNote: data.session.workerNote || "Stopped by user",
-              } as SafeSession)
+              }
             : null
-      );
-      // Confirm from server without re-attaching a stopped id as active
-      await refreshStatus(null);
+        );
+      } else {
+        setSession(null);
+      }
+      rememberSessionId(null);
     } catch (e) {
       setError(safeErrorMessage(e) || "Stop failed");
+      // Restore id so user can retry stop
+      if (sid) rememberSessionId(sid);
     } finally {
       setBusy(false);
     }

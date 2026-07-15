@@ -444,7 +444,16 @@ export async function processPaperSession(
           (offset + batchSymbols.length) % fullList.length
         : nextOffset;
 
+    // User may have clicked Stop while this tick was running — do not revive
+    const latest = await getSession(doc.userId, sessionId, {
+      preferCloud: true,
+    });
+    if (!latest || latest.status !== "running") {
+      return latest;
+    }
+
     return await updateSession(sessionId, {
+      userId: doc.userId,
       report: primary?.report ?? null,
       openPositions: allOpen,
       strategyResults,
@@ -472,7 +481,12 @@ export async function processPaperSession(
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "worker failed";
+    const latest = await getSession(doc.userId, sessionId, {
+      preferCloud: true,
+    });
+    if (latest && latest.status !== "running") return latest;
     return await updateSession(sessionId, {
+      userId: doc.userId,
       lastWorkerAt: Date.now(),
       lastError: msg,
       workerNote: msg,

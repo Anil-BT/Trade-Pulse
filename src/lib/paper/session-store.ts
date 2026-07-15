@@ -47,6 +47,10 @@ export type SaveSessionResult = {
   error?: string;
 };
 
+function isTerminalStatus(status: string | undefined | null): boolean {
+  return status === "stopped" || status === "ended";
+}
+
 export async function isDurableStoreReady(): Promise<boolean> {
   return isDurableStoreReadyAsync();
 }
@@ -79,10 +83,24 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
     return { ok: false, durable: false, error: msg };
   }
 
-  mem().set(doc.id, { ...clean, upstoxAccessToken: doc.upstoxAccessToken });
+  // If memory already terminal, never write a resurrected "running" payload
+  const memNow = mem().get(doc.id);
+  let toWrite = clean;
+  if (
+    isTerminalStatus(memNow?.status) &&
+    !isTerminalStatus(clean.status)
+  ) {
+    toWrite = {
+      ...clean,
+      status: memNow!.status,
+      workerNote: memNow!.workerNote || clean.workerNote,
+    };
+  }
+
+  mem().set(doc.id, { ...toWrite, upstoxAccessToken: doc.upstoxAccessToken });
 
   const payload = {
-    ...clean,
+    ...toWrite,
     upstoxAccessToken: doc.upstoxAccessToken || null,
   };
 
@@ -90,6 +108,21 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
   const db = await getAdminDbAsync();
   if (db) {
     try {
+      // Guard: if cloud is already stopped, only allow terminal writes
+      if (!isTerminalStatus(toWrite.status)) {
+        const existing = await db
+          .collection("users")
+          .doc(doc.userId)
+          .collection(COL)
+          .doc(doc.id)
+          .get();
+        if (existing.exists) {
+          const cur = existing.data() as { status?: string };
+          if (isTerminalStatus(cur?.status)) {
+            return { ok: true, durable: true }; // refuse to revive
+          }
+        }
+      }
       await db
         .collection("users")
         .doc(doc.userId)
@@ -100,10 +133,10 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
         {
           userId: doc.userId,
           sessionId: doc.id,
-          status: doc.status,
-          updatedAt: doc.updatedAt || Date.now(),
-          endsAt: doc.endsAt || null,
-          sessionDay: doc.sessionDay || null,
+          status: toWrite.status,
+          updatedAt: toWrite.updatedAt || Date.now(),
+          endsAt: toWrite.endsAt || null,
+          sessionDay: toWrite.sessionDay || null,
         },
         { merge: true }
       );
@@ -118,6 +151,14 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
 
   // REST fallback (no firebase-admin / jose)
   if (await canUseRest()) {
+    if (!isTerminalStatus(toWrite.status)) {
+      const existing = await firestoreRestGet(
+        `users/${doc.userId}/${COL}/${doc.id}`
+      );
+      if (existing && isTerminalStatus(String(existing.status || ""))) {
+        return { ok: true, durable: true };
+      }
+    }
     const ok1 = await firestoreRestSet(
       `users/${doc.userId}/${COL}/${doc.id}`,
       payload as Record<string, unknown>,
@@ -128,10 +169,10 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
       {
         userId: doc.userId,
         sessionId: doc.id,
-        status: doc.status,
-        updatedAt: doc.updatedAt || Date.now(),
-        endsAt: doc.endsAt || null,
-        sessionDay: doc.sessionDay || null,
+        status: toWrite.status,
+        updatedAt: toWrite.updatedAt || Date.now(),
+        endsAt: toWrite.endsAt || null,
+        sessionDay: toWrite.sessionDay || null,
       },
       true
     );
@@ -150,26 +191,43 @@ export async function saveSession(doc: PaperSessionDoc): Promise<SaveSessionResu
   };
 }
 
+/**
+ * Patch status to stopped and update index.
+ * Returns whether a durable write succeeded (Admin and/or REST).
+ */
 export async function markSessionStopped(
   userId: string,
   sessionId: string,
   note: string
-): Promise<void> {
+): Promise<{ ok: boolean; durable: boolean; error?: string }> {
   const now = Date.now();
+  // Always update memory first so same-instance worker/status see stop
   const m = mem().get(sessionId);
-  if (m && m.userId === userId) {
+  if (m && (!m.userId || m.userId === userId)) {
     m.status = "stopped";
     m.updatedAt = now;
     m.workerNote = note;
     m.lastWorkerAt = now;
+    m.userId = userId;
   } else {
-    // Ensure mem has a stopped stub so same-instance getActiveSession skips it
-    const existing = m;
-    if (existing) {
-      existing.status = "stopped";
-      existing.updatedAt = now;
-      existing.workerNote = note;
-    }
+    mem().set(sessionId, {
+      id: sessionId,
+      userId,
+      status: "stopped",
+      upstoxAccessToken: m?.upstoxAccessToken || "",
+      config: m?.config || ({} as PaperSessionDoc["config"]),
+      sessionDay: m?.sessionDay || "",
+      startedAt: m?.startedAt || now,
+      updatedAt: now,
+      endsAt: m?.endsAt || now,
+      workerNote: note,
+      lastWorkerAt: now,
+      tickCount: m?.tickCount || 0,
+      report: m?.report ?? null,
+      openPositions: m?.openPositions || [],
+      strategyResults: m?.strategyResults || [],
+      eventLog: m?.eventLog || [],
+    });
   }
   const t = memTimers().get(sessionId);
   if (t) {
@@ -185,6 +243,7 @@ export async function markSessionStopped(
   };
 
   let wrote = false;
+  let lastErr = "";
   const db = await getAdminDbAsync();
   if (db) {
     try {
@@ -205,39 +264,46 @@ export async function markSessionStopped(
       );
       wrote = true;
     } catch (e) {
+      lastErr = e instanceof Error ? e.message : "admin stop write failed";
       console.error("[paper-session] mark stopped admin failed:", e);
     }
   }
 
-  if (!wrote && (await canUseRest())) {
-    const ok1 = await firestoreRestSet(
-      `users/${userId}/${COL}/${sessionId}`,
-      patch,
-      true
-    );
-    const ok2 = await firestoreRestSet(
-      `paperSessionIndex/${sessionId}`,
-      { userId, sessionId, status: "stopped", updatedAt: now },
-      true
-    );
-    wrote = ok1 && ok2;
+  // Always try REST as well when Admin missing OR as second path if Admin failed
+  if (!wrote) {
+    if (await canUseRest()) {
+      const ok1 = await firestoreRestSet(
+        `users/${userId}/${COL}/${sessionId}`,
+        patch,
+        true
+      );
+      const ok2 = await firestoreRestSet(
+        `paperSessionIndex/${sessionId}`,
+        { userId, sessionId, status: "stopped", updatedAt: now },
+        true
+      );
+      wrote = ok1 && ok2;
+      if (!wrote) lastErr = "Firestore REST stop write failed";
+    } else if (!db) {
+      lastErr = durableStoreHint() || "No durable store for stop";
+    }
   }
 
   if (!wrote) {
-    // Still mark memory so local status is correct; surface for callers that re-read cloud
-    console.error(
-      "[paper-session] mark stopped: durable write failed",
-      sessionId
-    );
+    console.error("[paper-session] mark stopped durable failed", sessionId, lastErr);
+    return { ok: false, durable: false, error: lastErr || "Stop write failed" };
   }
+  return { ok: true, durable: true };
 }
 
 export async function getSession(
   userId: string,
-  sessionId: string
+  sessionId: string,
+  opts?: { preferCloud?: boolean }
 ): Promise<PaperSessionDoc | null> {
   const m = mem().get(sessionId);
-  if (m && m.userId === userId) return m;
+  // Memory hit only when not forcing cloud re-read
+  if (!opts?.preferCloud && m && m.userId === userId) return m;
 
   const db = await getAdminDbAsync();
   if (db) {
@@ -251,13 +317,23 @@ export async function getSession(
       if (snap.exists) {
         const data = snap.data() as PaperSessionDoc;
         const existing = mem().get(sessionId);
-        mem().set(sessionId, {
+        // Prefer terminal status from cloud over stale mem running
+        const merged: PaperSessionDoc = {
           ...data,
           id: data.id || sessionId,
           userId: data.userId || userId,
           upstoxAccessToken:
             data.upstoxAccessToken || existing?.upstoxAccessToken || "",
-        });
+        };
+        if (
+          isTerminalStatus(existing?.status) &&
+          !isTerminalStatus(merged.status)
+        ) {
+          // Local stop already applied; keep terminal until cloud catches up
+          merged.status = existing!.status;
+          merged.workerNote = existing!.workerNote || merged.workerNote;
+        }
+        mem().set(sessionId, merged);
         return mem().get(sessionId) || null;
       }
     } catch (e) {
@@ -271,7 +347,7 @@ export async function getSession(
     );
     if (data) {
       const existing = mem().get(sessionId);
-      const doc = {
+      const doc: PaperSessionDoc = {
         ...(data as unknown as PaperSessionDoc),
         id: (data.id as string) || sessionId,
         userId: (data.userId as string) || userId,
@@ -280,6 +356,13 @@ export async function getSession(
           existing?.upstoxAccessToken ||
           "",
       };
+      if (
+        isTerminalStatus(existing?.status) &&
+        !isTerminalStatus(doc.status)
+      ) {
+        doc.status = existing!.status;
+        doc.workerNote = existing!.workerNote || doc.workerNote;
+      }
       mem().set(sessionId, doc);
       return doc;
     }
@@ -459,14 +542,41 @@ export async function updateSession(
     }
   }
   if (!base) return null;
+
+  // Critical: re-read cloud so a concurrent Stop cannot be overwritten by a worker tick
+  const cloud = await getSession(base.userId, sessionId, { preferCloud: true });
+  const liveStatus = cloud?.status || base.status || mem().get(sessionId)?.status;
+  if (isTerminalStatus(liveStatus)) {
+    // Only allow explicit terminal patches; drop worker report updates
+    if (!isTerminalStatus(patch.status)) {
+      const terminal = cloud || mem().get(sessionId) || base;
+      return {
+        ...terminal,
+        status: liveStatus as PaperSessionStatus,
+      };
+    }
+  }
+
   const next: PaperSessionDoc = {
-    ...base,
+    ...(cloud || base),
     ...patch,
     id: base.id,
     userId: base.userId,
-    upstoxAccessToken: patch.upstoxAccessToken || base.upstoxAccessToken,
+    upstoxAccessToken:
+      patch.upstoxAccessToken ||
+      cloud?.upstoxAccessToken ||
+      base.upstoxAccessToken,
     updatedAt: Date.now(),
   };
+
+  // Never resurrect a stopped session as running
+  if (
+    isTerminalStatus(liveStatus) &&
+    !isTerminalStatus(next.status)
+  ) {
+    next.status = liveStatus as PaperSessionStatus;
+  }
+
   await saveSession(next);
   return mem().get(sessionId) || next;
 }
