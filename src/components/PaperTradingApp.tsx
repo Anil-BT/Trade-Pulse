@@ -760,25 +760,6 @@ export function PaperTradingApp() {
                     drives ticks). Check Upstox token and Server log for errors.
                   </p>
                 )}
-                {running && (
-                  <button
-                    type="button"
-                    disabled={busy || tickBusy}
-                    onClick={() => {
-                      const sid =
-                        session?.id ||
-                        knownSessionId ||
-                        (typeof window !== "undefined"
-                          ? localStorage.getItem("tp_paper_session_id")
-                          : null);
-                      if (sid) void runPaperTick(sid);
-                      else pushClientLog("No session id — start again");
-                    }}
-                    className="mt-2 rounded-full border border-neutral-300 px-3 py-1 text-[11px] font-medium hover:border-black disabled:opacity-50"
-                  >
-                    {tickBusy ? "Tick running…" : "Run tick now"}
-                  </button>
-                )}
                 {session?.lastBatch && session.lastBatch.universeSize > 0 && (
                   <p className="mt-1 text-[11px] text-neutral-600">
                     Rotating universe: batch index {session.lastBatch.fromIndex}{" "}
@@ -822,6 +803,30 @@ export function PaperTradingApp() {
                     Stop server session
                   </button>
                 )}
+                <button
+                  type="button"
+                  disabled={busy || tickBusy || !user}
+                  onClick={() => {
+                    const sid =
+                      session?.id ||
+                      knownSessionId ||
+                      (typeof window !== "undefined"
+                        ? localStorage.getItem("tp_paper_session_id")
+                        : null);
+                    if (sid) void runPaperTick(sid);
+                    else {
+                      pushClientLog(
+                        "No session id — click Start live paper first"
+                      );
+                      setError(
+                        "No active session id. Start a paper session first, then Run tick."
+                      );
+                    }
+                  }}
+                  className="rounded-full bg-sky-600 px-5 py-3 text-sm font-medium text-white hover:bg-sky-700 disabled:opacity-50"
+                >
+                  {tickBusy ? "Tick running…" : "Run tick now"}
+                </button>
                 {user && (
                   <button
                     type="button"
@@ -833,6 +838,10 @@ export function PaperTradingApp() {
                 )}
               </div>
             </div>
+            <p className="mt-2 text-[10px] text-neutral-400">
+              Build {(process.env.NEXT_PUBLIC_GIT_SHA || "local").slice(0, 7)} ·
+              keep this tab open while paper runs (browser drives ticks)
+            </p>
             {error && (
               <p className="mt-3 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-800">
                 {error}
