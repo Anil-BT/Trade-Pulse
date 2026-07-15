@@ -227,8 +227,14 @@ export function MarketWatchApp() {
     | "rvol"
     | "addedAt"
     | "barTime";
-  const [sortKey, setSortKey] = useState<SortKey>("changePct");
-  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
+  type TableSort = { key: SortKey; dir: "asc" | "desc" };
+  const DEFAULT_TABLE_SORT: TableSort = { key: "changePct", dir: "desc" };
+  /** Per-table sort — sector table + each strategy table independent */
+  const [tableSorts, setTableSorts] = useState<Record<string, TableSort>>({});
+
+  function getTableSort(tableId: string): TableSort {
+    return tableSorts[tableId] || DEFAULT_TABLE_SORT;
+  }
 
   const rotationOffsetRef = useRef(0);
   const busyRef = useRef(false);
@@ -558,19 +564,28 @@ export function MarketWatchApp() {
     });
   }, [sectorFilter, universeQuotes, cells]);
 
-  function toggleSort(key: SortKey) {
-    if (sortKey === key) {
-      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
-    } else {
-      setSortKey(key);
-      setSortDir(
-        key === "symbol" || key === "sector" ? "asc" : "desc"
-      );
-    }
+  function toggleSort(tableId: string, key: SortKey) {
+    setTableSorts((prev) => {
+      const cur = prev[tableId] || DEFAULT_TABLE_SORT;
+      if (cur.key === key) {
+        return {
+          ...prev,
+          [tableId]: { key, dir: cur.dir === "asc" ? "desc" : "asc" },
+        };
+      }
+      return {
+        ...prev,
+        [tableId]: {
+          key,
+          dir: key === "symbol" || key === "sector" ? "asc" : "desc",
+        },
+      };
+    });
   }
 
-  function sortRows(list: StickyCell[]): StickyCell[] {
-    const dir = sortDir === "asc" ? 1 : -1;
+  function sortRows(list: StickyCell[], sort: TableSort): StickyCell[] {
+    const dir = sort.dir === "asc" ? 1 : -1;
+    const sortKey = sort.key;
     return [...list].sort((a, b) => {
       const av = a[sortKey];
       const bv = b[sortKey];
@@ -589,10 +604,13 @@ export function MarketWatchApp() {
     });
   }
 
-  function sortSectorRows(list: SectorStockRow[]): SectorStockRow[] {
-    const dir = sortDir === "asc" ? 1 : -1;
+  function sortSectorRows(
+    list: SectorStockRow[],
+    sort: TableSort
+  ): SectorStockRow[] {
+    const dir = sort.dir === "asc" ? 1 : -1;
     const key: SortKey =
-      sortKey === "addedAt" ? "changePct" : sortKey;
+      sort.key === "addedAt" ? "changePct" : sort.key;
     return [...list].sort((a, b) => {
       if (key === "symbol" || key === "sector") {
         return dir * String(a[key] ?? "").localeCompare(String(b[key] ?? ""));
@@ -615,10 +633,13 @@ export function MarketWatchApp() {
     });
   }
 
+  const sectorTableId = "sector";
+  const sectorSort = getTableSort(sectorTableId);
+
   const sectorTableSorted = useMemo(
-    () => sortSectorRows(sectorStockRows),
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- sort via sortKey/sortDir
-    [sectorStockRows, sortKey, sortDir]
+    () => sortSectorRows(sectorStockRows, sectorSort),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sort via sectorSort
+    [sectorStockRows, sectorSort.key, sectorSort.dir]
   );
 
   const byStrategy = useMemo(() => {
@@ -630,11 +651,11 @@ export function MarketWatchApp() {
       map.set(c.strategyName, list);
     }
     for (const [k, list] of map) {
-      map.set(k, sortRows(list));
+      map.set(k, sortRows(list, getTableSort(`strategy:${k}`)));
     }
     return map;
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- sort via sortKey/sortDir
-  }, [cells, sectorFilter, sortKey, sortDir]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- per-table sort
+  }, [cells, sectorFilter, tableSorts]);
 
   // Order strategy sections by selected order
   const strategyOrder = useMemo(
@@ -1036,7 +1057,7 @@ export function MarketWatchApp() {
                         },
                       ] as const
                     ).map((col) => {
-                      const active = sortKey === col.key;
+                      const active = sectorSort.key === col.key;
                       return (
                         <th
                           key={col.key}
@@ -1046,7 +1067,7 @@ export function MarketWatchApp() {
                         >
                           <button
                             type="button"
-                            onClick={() => toggleSort(col.key)}
+                            onClick={() => toggleSort(sectorTableId, col.key)}
                             className={`inline-flex items-center gap-1 hover:text-black ${
                               active ? "text-black" : ""
                             } ${col.align === "right" ? "ml-auto" : ""}`}
@@ -1054,7 +1075,7 @@ export function MarketWatchApp() {
                             {col.label}
                             <span className="text-[10px] text-neutral-400">
                               {active
-                                ? sortDir === "asc"
+                                ? sectorSort.dir === "asc"
                                   ? "▲"
                                   : "▼"
                                 : "↕"}
@@ -1137,6 +1158,8 @@ export function MarketWatchApp() {
       <div className="space-y-8">
         {strategyOrder.map((name) => {
           const list = byStrategy.get(name) || [];
+          const tableId = `strategy:${name}`;
+          const sort = getTableSort(tableId);
           return (
             <section
               key={name}
@@ -1149,7 +1172,7 @@ export function MarketWatchApp() {
                 <p className="text-xs text-neutral-500">
                   {list.length} stock{list.length === 1 ? "" : "s"}
                   {sectorFilter ? ` · ${sectorFilter}` : ""}
-                  {" · sticky · click headers to sort"}
+                  {" · sticky · sort this table only"}
                 </p>
               </div>
 
@@ -1190,7 +1213,7 @@ export function MarketWatchApp() {
                             },
                           ] as const
                         ).map((col) => {
-                          const active = sortKey === col.key;
+                          const active = sort.key === col.key;
                           return (
                             <th
                               key={col.key}
@@ -1200,7 +1223,7 @@ export function MarketWatchApp() {
                             >
                               <button
                                 type="button"
-                                onClick={() => toggleSort(col.key)}
+                                onClick={() => toggleSort(tableId, col.key)}
                                 className={`inline-flex items-center gap-1 hover:text-black ${
                                   active ? "text-black" : ""
                                 } ${col.align === "right" ? "ml-auto" : ""}`}
@@ -1208,7 +1231,7 @@ export function MarketWatchApp() {
                                 {col.label}
                                 <span className="text-[10px] text-neutral-400">
                                   {active
-                                    ? sortDir === "asc"
+                                    ? sort.dir === "asc"
                                       ? "▲"
                                       : "▼"
                                     : "↕"}
@@ -1282,10 +1305,10 @@ export function MarketWatchApp() {
       </div>
 
       <p className="mt-6 text-[11px] text-neutral-400">
-        Click a column header to sort (same sort applies to every strategy
-        table). Selecting a strategy backfills full F&amp;O using today&apos;s
-        bars from the open. Signal = first entry bar today; % chg = session day
-        move; Rvol = annualized realized vol. Rows stay once matched (sticky).
+        Each table sorts independently. Selecting a strategy backfills full
+        F&amp;O using today&apos;s bars from the open. Signal = first entry bar
+        today; % chg = session day move; Rvol = annualized realized vol. Rows
+        stay once matched (sticky).
       </p>
     </div>
   );
