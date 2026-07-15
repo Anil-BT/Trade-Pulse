@@ -1093,10 +1093,10 @@ export function PaperTradingApp() {
             </h2>
             <p className="mb-4 text-xs text-neutral-500">
               <strong>uP&amp;L</strong> = unrealized P&amp;L (mark − entry) × qty.
-              Options: Entry/Mark are <em>premiums</em> (not stock). Prefer{" "}
-              <strong>mkt</strong> (option candle) / <strong>LTP</strong> (live
-              Upstox quote); <strong>model</strong> = Black–Scholes estimate when
-              market data is missing.
+              Options use <strong>strict market pricing only</strong>: Entry =
+              Upstox option candle premium; Mark = live <strong>LTP</strong> when
+              available. No Black–Scholes. Signals without market data are
+              skipped.
             </p>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[720px] text-sm">
@@ -1152,7 +1152,7 @@ export function PaperTradingApp() {
                           <div>{p.entryPrice.toFixed(2)}</div>
                           {isOpt && (
                             <div className="text-[10px] text-neutral-400">
-                              {p.premiumSource === "market" ? "mkt prem" : "model prem"}
+                              mkt prem
                             </div>
                           )}
                         </td>
@@ -1160,11 +1160,7 @@ export function PaperTradingApp() {
                           <div>{p.markPrice.toFixed(2)}</div>
                           {isOpt && (
                             <div className="text-[10px] text-neutral-400">
-                              {p.markSource === "ltp"
-                                ? "LTP"
-                                : p.markSource === "market"
-                                  ? "mkt prem"
-                                  : "model prem"}
+                              {p.markSource === "ltp" ? "LTP" : "mkt prem"}
                             </div>
                           )}
                         </td>

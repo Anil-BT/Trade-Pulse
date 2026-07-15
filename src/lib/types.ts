@@ -333,6 +333,8 @@ export interface BacktestResult {
     equitySignals: number;
     entriesTaken: number;
     skippedInsufficientCapital: number;
+    /** Signals skipped because market option premium was unavailable (strict mode) */
+    skippedNoMarketPremium?: number;
     /** Trades closed because unrealized loss hit max risk */
     maxRiskStops?: number;
     /** Trades closed on trail-to-cost (breakeven) stop */

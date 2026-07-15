@@ -150,6 +150,11 @@ function rowFromResult(
           : "")
     );
   }
+  if (d?.skippedNoMarketPremium) {
+    why.push(
+      `no mkt prem ×${d.skippedNoMarketPremium} (strict — no model)`
+    );
+  }
   if (
     (d?.equitySignals || 0) > 0 &&
     !d?.skippedInsufficientCapital &&
@@ -356,8 +361,9 @@ export async function processPaperSession(
             };
           }
 
-          // Prefer Upstox market option OHLC (+ live LTP for open mark) over BS model
+          // Paper options: STRICT market-only (no Black–Scholes fallback)
           let optionPricer;
+          const tag = s.strategy.name || `S${s.slot}`;
           if (cfg.tradeInstrument === "options_atm" && options) {
             try {
               const signalTimes = previewEntrySignals(
@@ -366,34 +372,54 @@ export async function processPaperSession(
                 s.strategy.entryLogic ?? "and",
                 Boolean(cfg.oneTradePerDay)
               );
-              // Always include last bar so open-leg mark can resolve market prem
               const last = candles[candles.length - 1];
               if (last) {
                 signalTimes.push({ timeMs: last.time, spot: last.close });
               }
-              if (signalTimes.length > 0) {
-                optionPricer = await createOptionPricer({
-                  symbol,
-                  side: options.side || "CE",
-                  equityCandles: candles,
-                  from: today,
-                  to: today,
-                  interval: cfg.interval,
-                  listedStrikes: options.listedStrikes || [],
-                  strikeStep: options.strikeStep || 0,
-                  lotSize: options.lotSize,
-                  preferredDaysToExpiry: options.daysToExpiry ?? 7,
-                  fallbackIv: options.iv ?? 0.18,
-                  accessToken: token,
-                  signalTimes,
-                  maxMarketContracts: 2,
-                });
-              }
+              // Always build pricer when options (even 0 signals → no market series)
+              optionPricer = await createOptionPricer({
+                symbol,
+                side: options.side || "CE",
+                equityCandles: candles,
+                from: today,
+                to: today,
+                interval: cfg.interval,
+                listedStrikes: options.listedStrikes || [],
+                strikeStep: options.strikeStep || 0,
+                lotSize: options.lotSize,
+                preferredDaysToExpiry: options.daysToExpiry ?? 7,
+                fallbackIv: options.iv ?? 0.18,
+                accessToken: token,
+                signalTimes:
+                  signalTimes.length > 0
+                    ? signalTimes
+                    : last
+                      ? [{ timeMs: last.time, spot: last.close }]
+                      : [],
+                maxMarketContracts: 3,
+                marketOnly: true,
+              });
             } catch (e) {
               console.warn(
                 `[paper-worker] option pricer ${symbol}:`,
                 e instanceof Error ? e.message : e
               );
+            }
+
+            if (!optionPricer || optionPricer.marketContractsUsed < 1) {
+              batchRowsBySlot.get(s.slot)!.push({
+                symbol,
+                lotSize: item.lotSize,
+                trades: 0,
+                winRate: 0,
+                totalPnl: 0,
+                totalPnlPct: 0,
+                finalEquity: cfg.initialCapital,
+                status: "no_trades",
+                message: `${tag}: strict mode — no Upstox option candles (skipped)`,
+                tradeList: [],
+              });
+              continue;
             }
           }
 
@@ -419,7 +445,16 @@ export async function processPaperSession(
             { optionPricer }
           );
 
-          // Live LTP mark for open options (closest to Upstox app price)
+          // Strict: drop any open not entered on market premium
+          if (
+            result.openPosition &&
+            cfg.tradeInstrument === "options_atm" &&
+            result.openPosition.premiumSource !== "market"
+          ) {
+            result.openPosition = undefined;
+          }
+
+          // Live LTP for open mark (required in strict mode for honest uP&L)
           if (
             result.openPosition &&
             result.openPosition.instrumentKey &&
@@ -431,12 +466,8 @@ export async function processPaperSession(
                 accessToken: token,
               });
               const key = result.openPosition.instrumentKey;
-              let ltp =
-                ltps.get(key) ||
-                [...ltps.values()].find((v) => v > 0) ||
-                0;
+              let ltp = ltps.get(key) || 0;
               if (!(ltp > 0)) {
-                // try any key in map (Upstox sometimes returns trading-symbol keys)
                 for (const [, v] of ltps) {
                   if (v > 0) {
                     ltp = v;
@@ -450,13 +481,23 @@ export async function processPaperSession(
                 result.openPosition.markPrice = ltp;
                 result.openPosition.unrealizedPnl = (ltp - entry) * qty;
                 result.openPosition.markSource = "ltp";
+              } else if (
+                result.openPosition.markSource !== "market" ||
+                !(result.openPosition.markPrice > 0)
+              ) {
+                // No LTP and no market candle mark — don't show fake model uP&L
+                result.openPosition.markPrice = result.openPosition.entryPrice;
+                result.openPosition.unrealizedPnl = 0;
+                result.openPosition.markSource = "market";
               }
             } catch {
-              /* keep candle/model mark */
+              if (result.openPosition.premiumSource === "market") {
+                result.openPosition.markPrice = result.openPosition.entryPrice;
+                result.openPosition.unrealizedPnl = 0;
+              }
             }
           }
 
-          const tag = s.strategy.name || `S${s.slot}`;
           batchRowsBySlot
             .get(s.slot)!
             .push(
@@ -471,14 +512,14 @@ export async function processPaperSession(
 
           if (result.openPosition) {
             const src =
-              result.openPosition.premiumSource ||
               result.openPosition.markSource ||
-              "model";
+              result.openPosition.premiumSource ||
+              "market";
             batchOpensBySlot.get(s.slot)!.push({
               ...result.openPosition,
               symbol,
-              label: `${tag} · ${symbol}${
-                src === "model" ? " · model" : src === "ltp" ? " · LTP" : " · mkt"
+              label: `${tag} · ${symbol} · ${
+                src === "ltp" ? "LTP" : "mkt"
               }`,
             });
           }

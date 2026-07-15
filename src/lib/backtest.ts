@@ -135,11 +135,13 @@ export function runBacktest(
 
   let equitySignals = 0;
   let skippedInsufficientCapital = 0;
+  let skippedNoMarketPremium = 0;
   let maxRiskStops = 0;
   let trailCostStops = 0;
   let minLotCost = Infinity;
   let marketFills = 0;
   let modelFills = 0;
+  const requireMarketPremium = Boolean(pricer?.marketOnly);
 
   const trades: Trade[] = [];
   const equityCurve: EquityPoint[] = [];
@@ -157,6 +159,7 @@ export function runBacktest(
         ? markUnitPrice(c, tradeInstrument, optCfg, pricer, {
             entryTime,
             entryStrike,
+            entryPrice,
           })
         : 0;
     equityCurve.push({ time: c.time, equity: cash + positionQty * markUnit });
@@ -236,23 +239,34 @@ export function runBacktest(
       let mark = markUnitPrice(last, tradeInstrument, optCfg, pricer, {
         entryTime,
         entryStrike,
+        entryPrice,
       });
-      let markSource: "market" | "model" | "ltp" | undefined =
-        tradeInstrument === "options_atm"
-          ? pricer
-            ? // Infer from quote path
-              (() => {
-                const q = pricer.quote({
-                  timeMs: last.time,
-                  spot: last.close,
-                  strike: entryStrike,
-                  heldFromMs: entryTime,
-                });
-                mark = q.premium;
-                return q.source;
-              })()
-            : "model"
-          : undefined;
+      let markSource: "market" | "model" | "ltp" | undefined;
+      if (tradeInstrument === "options_atm" && pricer) {
+        const q = pricer.quote({
+          timeMs: last.time,
+          spot: last.close,
+          strike: entryStrike,
+          heldFromMs: entryTime,
+        });
+        if (
+          !q.missing &&
+          q.source === "market" &&
+          q.premium > 0
+        ) {
+          mark = q.premium;
+          markSource = "market";
+        } else if (pricer.marketOnly) {
+          // Freeze at entry until worker applies live LTP
+          mark = entryPrice;
+          markSource = "market";
+        } else {
+          mark = q.premium;
+          markSource = q.source;
+        }
+      } else if (tradeInstrument === "options_atm") {
+        markSource = requireMarketPremium ? "market" : "model";
+      }
       const unrealized = (mark - entryPrice) * positionQty;
       equityCurve[equityCurve.length - 1] = {
         time: last.time,
@@ -287,6 +301,7 @@ export function runBacktest(
     equitySignals,
     entriesTaken: trades.length,
     skippedInsufficientCapital,
+    skippedNoMarketPremium,
     maxRiskStops,
     trailCostStops,
     minLotCost: Number.isFinite(minLotCost) ? minLotCost : undefined,
@@ -351,6 +366,12 @@ export function runBacktest(
         ? pricer.strikeFor(spot)
         : atmStrike(spot, optCfg.strikeStep, optCfg.listedStrikes);
 
+      // Strict market-only: no pricer or no BS fallback without market series
+      if (requireMarketPremium && !pricer) {
+        skippedNoMarketPremium += 1;
+        return;
+      }
+
       const q = pricer
         ? pricer.quote({ timeMs: c.time, spot, strike })
         : {
@@ -365,6 +386,17 @@ export function runBacktest(
             source: "model" as const,
             strike,
           };
+
+      if (
+        requireMarketPremium &&
+        (q.missing ||
+          q.source !== "market" ||
+          !(q.premium > 0) ||
+          !q.instrumentKey)
+      ) {
+        skippedNoMarketPremium += 1;
+        return;
+      }
 
       const premium = q.premium;
       if (q.source === "market") marketFills += 1;
@@ -531,16 +563,24 @@ function markUnitPrice(
   instrument: TradeInstrument,
   optCfg: OptionsConfig,
   pricer: OptionPricer | undefined,
-  pos: { entryTime: number; entryStrike: number }
+  pos: { entryTime: number; entryStrike: number; entryPrice?: number }
 ): number {
   if (instrument !== "options_atm") return c.close;
   if (pricer) {
-    return pricer.quote({
+    const q = pricer.quote({
       timeMs: c.time,
       spot: c.close,
       strike: pos.entryStrike,
       heldFromMs: pos.entryTime,
-    }).premium;
+    });
+    if (pricer.marketOnly) {
+      // Never BS: use market candle, else freeze at entry (caller may apply LTP)
+      if (!q.missing && q.source === "market" && q.premium > 0) {
+        return q.premium;
+      }
+      return pos.entryPrice && pos.entryPrice > 0 ? pos.entryPrice : 0;
+    }
+    return q.premium;
   }
   return optionPremium(
     c.close,
@@ -670,6 +710,7 @@ function buildDiagnostics(d: {
   equitySignals: number;
   entriesTaken: number;
   skippedInsufficientCapital: number;
+  skippedNoMarketPremium?: number;
   maxRiskStops?: number;
   trailCostStops?: number;
   minLotCost?: number;
@@ -709,6 +750,12 @@ function buildDiagnostics(d: {
       barsNote;
   } else if (
     d.entriesTaken === 0 &&
+    (d.skippedNoMarketPremium || 0) > 0 &&
+    d.tradeInstrument === "options_atm"
+  ) {
+    note = `Equity signals ${d.equitySignals}x but skipped ${d.skippedNoMarketPremium}x — no Upstox option market premium (strict mode, no model).`;
+  } else if (
+    d.entriesTaken === 0 &&
     d.skippedInsufficientCapital > 0 &&
     d.tradeInstrument === "options_atm"
   ) {
@@ -726,7 +773,7 @@ function buildDiagnostics(d: {
     note = `${d.skippedInsufficientCapital} signal(s) skipped - not enough free cash for the next 1-lot trade.`;
   } else if (d.tradeInstrument === "options_atm" && d.marketFills + d.modelFills > 0) {
     if (d.marketFills > 0 && d.modelFills === 0) {
-      note = "Option premiums from live F&O market history (Upstox).";
+      note = "Option premiums from Upstox market data only (strict / market fills).";
     } else if (d.marketFills > 0) {
       note = `Option premiums: ${d.marketFills} market fills, ${d.modelFills} model fills (realized-vol BS when F&O history missing).`;
     } else {
@@ -741,6 +788,7 @@ function buildDiagnostics(d: {
     equitySignals: d.equitySignals,
     entriesTaken: d.entriesTaken,
     skippedInsufficientCapital: d.skippedInsufficientCapital,
+    skippedNoMarketPremium: d.skippedNoMarketPremium || 0,
     maxRiskStops: d.maxRiskStops || 0,
     trailCostStops: d.trailCostStops || 0,
     candleCount: d.candleCount,

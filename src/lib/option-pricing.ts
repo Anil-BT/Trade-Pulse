@@ -25,6 +25,8 @@ export interface PremiumQuote {
   contractLabel?: string;
   instrumentKey?: string;
   dteDays?: number;
+  /** True when marketOnly and no usable option candle/LTP for this bar */
+  missing?: boolean;
 }
 
 export interface OptionPricer {
@@ -39,6 +41,8 @@ export interface OptionPricer {
   }): PremiumQuote;
   pricingMode: PremiumSource | "mixed";
   marketContractsUsed: number;
+  /** When true, never fall back to Black–Scholes */
+  marketOnly?: boolean;
 }
 
 /**
@@ -62,11 +66,17 @@ export async function createOptionPricer(opts: {
   signalTimes?: { timeMs: number; spot: number }[];
   /** Cap option history fetches (paper uses 2 to stay under rate limits) */
   maxMarketContracts?: number;
+  /**
+   * Strict market pricing: never return Black–Scholes.
+   * quote() sets missing=true when option candles are unavailable.
+   */
+  marketOnly?: boolean;
 }): Promise<OptionPricer> {
   const side = opts.side;
   const strikes = opts.listedStrikes;
   const step = opts.strikeStep;
   const token = sanitizeToken(opts.accessToken || "");
+  const marketOnly = Boolean(opts.marketOnly);
 
   const contracts = token
     ? await listOptionContracts(opts.symbol).catch(() => [] as OptionContract[])
@@ -192,7 +202,27 @@ export async function createOptionPricer(opts: {
             };
           }
         }
+        // Contract known but no candle at this time — still return key for LTP
+        if (marketOnly) {
+          return {
+            premium: 0,
+            source: "market",
+            strike: c.strike,
+            contractLabel: c.tradingSymbol,
+            instrumentKey: c.instrumentKey,
+            missing: true,
+          };
+        }
       }
+    }
+
+    if (marketOnly) {
+      return {
+        premium: 0,
+        source: "market",
+        strike,
+        missing: true,
+      };
     }
 
     return modelQuote(timeMs, spot, strike, heldFromMs);
@@ -201,8 +231,15 @@ export async function createOptionPricer(opts: {
   return {
     strikeFor,
     quote,
-    pricingMode: marketContractsUsed > 0 ? "mixed" : "model",
+    pricingMode: marketOnly
+      ? marketContractsUsed > 0
+        ? "market"
+        : "market"
+      : marketContractsUsed > 0
+        ? "mixed"
+        : "model",
     marketContractsUsed,
+    marketOnly,
   };
 }
 
