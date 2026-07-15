@@ -198,10 +198,14 @@ export async function POST(req: NextRequest) {
           } · until stop or 15:30 IST`,
           400
         ),
+        asciiSafe(
+          `${new Date().toLocaleTimeString("en-IN")} · First tick scheduled (dual options can take 1–3 min) · more lines appear when the tick saves`,
+          400
+        ),
       ],
       workerNote: dual
-        ? "Dual strategy - one candle fetch per symbol"
-        : "Starting server worker...",
+        ? "Dual strategy — first tick starting (shared candles)"
+        : "Starting server worker…",
     };
 
     const saved = await saveSession(doc);

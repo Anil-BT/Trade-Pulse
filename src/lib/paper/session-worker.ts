@@ -12,7 +12,7 @@ import { createOptionPricer } from "../option-pricing";
 import { previewEntrySignals } from "../run-job";
 import { sanitizeToken } from "../http";
 import { todayIst, isNseSessionOpen } from "./market-hours";
-import { isRateLimitError } from "./sanitize";
+import { asciiSafe, isRateLimitError } from "./sanitize";
 import {
   getSession,
   listRunningSessions,
@@ -262,11 +262,18 @@ async function processPaperSessionInner(
 
   // Heartbeat so UI shows "running" and concurrent kicks back off
   try {
+    const hbLine = asciiSafe(
+      `${new Date().toLocaleTimeString("en-IN")} · Tick #${(doc.tickCount || 0) + 1} starting...`,
+      400
+    );
     await updateSession(sessionId, {
       userId: doc.userId,
       lastWorkerAt: now,
       workerNote: "Server tick in progress…",
+      eventLog: [hbLine, ...(doc.eventLog || [])].slice(0, 40),
     });
+    // Refresh doc.eventLog for final merge
+    doc = (await getSession(doc.userId, sessionId, { preferCloud: true })) || doc;
   } catch {
     /* continue even if heartbeat write fails */
   }
