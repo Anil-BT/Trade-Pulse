@@ -162,12 +162,14 @@ export function PaperTradingApp() {
       const token = await idToken();
       if (!token) return;
       try {
+        // undefined = use known id; null = force no id (e.g. after stop)
         const sid =
-          sessionIdOverride ||
-          knownSessionId ||
-          (typeof window !== "undefined"
-            ? localStorage.getItem("tp_paper_session_id")
-            : null);
+          sessionIdOverride !== undefined
+            ? sessionIdOverride
+            : knownSessionId ||
+              (typeof window !== "undefined"
+                ? localStorage.getItem("tp_paper_session_id")
+                : null);
         // POST body carries auth — avoids Safari header / long-query issues
         const res = await paperFetch("/api/paper/session/status", {
           method: "POST",
@@ -186,7 +188,12 @@ export function PaperTradingApp() {
         }
         if (data.session) {
           setSession(data.session);
-          if (data.session.id) rememberSessionId(data.session.id);
+          // Only remember id while still running
+          if (data.session.id && data.session.status === "running") {
+            rememberSessionId(data.session.id);
+          } else if (data.session.status !== "running") {
+            rememberSessionId(null);
+          }
           setError(null);
         } else {
           // Don't wipe optimistic UI immediately if we just started
@@ -399,6 +406,16 @@ export function PaperTradingApp() {
       setError("Sign in to stop the server session.");
       return;
     }
+    const sid =
+      session?.id ||
+      knownSessionId ||
+      (typeof window !== "undefined"
+        ? localStorage.getItem("tp_paper_session_id")
+        : null);
+    if (!sid && !session) {
+      setError("No session id to stop. Try Refresh, then Stop again.");
+      return;
+    }
     setBusy(true);
     try {
       const res = await paperFetch("/api/paper/session/stop", {
@@ -406,13 +423,41 @@ export function PaperTradingApp() {
         token,
         body: {
           idToken: token,
-          sessionId: session?.id,
+          sessionId: sid || undefined,
         },
       });
-      const data = await parseApiJson<{ error?: string }>(res);
+      const data = await parseApiJson<{
+        error?: string;
+        status?: string;
+        sessionId?: string;
+        session?: Partial<SafeSession>;
+      }>(res);
       if (!res.ok) throw new Error(data.error || `Stop failed (${res.status})`);
+
+      // Optimistically clear running UI even before next poll
       rememberSessionId(null);
-      await refreshStatus();
+      setSession((prev) =>
+        prev
+          ? {
+              ...prev,
+              status: "stopped",
+              workerNote: data.session?.workerNote || "Stopped by user",
+              updatedAt: Date.now(),
+            }
+          : data.session
+            ? ({
+                id: data.sessionId || sid || "",
+                status: "stopped",
+                sessionDay: data.session.sessionDay || "",
+                startedAt: data.session.startedAt || Date.now(),
+                endsAt: data.session.endsAt || Date.now(),
+                updatedAt: Date.now(),
+                workerNote: data.session.workerNote || "Stopped by user",
+              } as SafeSession)
+            : null
+      );
+      // Confirm from server without re-attaching a stopped id as active
+      await refreshStatus(null);
     } catch (e) {
       setError(safeErrorMessage(e) || "Stop failed");
     } finally {

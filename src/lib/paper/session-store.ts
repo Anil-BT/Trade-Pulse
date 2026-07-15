@@ -155,24 +155,36 @@ export async function markSessionStopped(
   sessionId: string,
   note: string
 ): Promise<void> {
+  const now = Date.now();
   const m = mem().get(sessionId);
   if (m && m.userId === userId) {
     m.status = "stopped";
-    m.updatedAt = Date.now();
+    m.updatedAt = now;
     m.workerNote = note;
-    const t = memTimers().get(sessionId);
-    if (t) {
-      clearInterval(t);
-      memTimers().delete(sessionId);
+    m.lastWorkerAt = now;
+  } else {
+    // Ensure mem has a stopped stub so same-instance getActiveSession skips it
+    const existing = m;
+    if (existing) {
+      existing.status = "stopped";
+      existing.updatedAt = now;
+      existing.workerNote = note;
     }
+  }
+  const t = memTimers().get(sessionId);
+  if (t) {
+    clearInterval(t);
+    memTimers().delete(sessionId);
   }
 
   const patch = {
-    status: "stopped",
-    updatedAt: Date.now(),
+    status: "stopped" as const,
+    updatedAt: now,
     workerNote: note,
+    lastWorkerAt: now,
   };
 
+  let wrote = false;
   const db = await getAdminDbAsync();
   if (db) {
     try {
@@ -187,22 +199,35 @@ export async function markSessionStopped(
           userId,
           sessionId,
           status: "stopped",
-          updatedAt: Date.now(),
+          updatedAt: now,
         },
         { merge: true }
       );
-      return;
+      wrote = true;
     } catch (e) {
       console.error("[paper-session] mark stopped admin failed:", e);
     }
   }
 
-  if (await canUseRest()) {
-    await firestoreRestSet(`users/${userId}/${COL}/${sessionId}`, patch, true);
-    await firestoreRestSet(
-      `paperSessionIndex/${sessionId}`,
-      { userId, sessionId, status: "stopped", updatedAt: Date.now() },
+  if (!wrote && (await canUseRest())) {
+    const ok1 = await firestoreRestSet(
+      `users/${userId}/${COL}/${sessionId}`,
+      patch,
       true
+    );
+    const ok2 = await firestoreRestSet(
+      `paperSessionIndex/${sessionId}`,
+      { userId, sessionId, status: "stopped", updatedAt: now },
+      true
+    );
+    wrote = ok1 && ok2;
+  }
+
+  if (!wrote) {
+    // Still mark memory so local status is correct; surface for callers that re-read cloud
+    console.error(
+      "[paper-session] mark stopped: durable write failed",
+      sessionId
     );
   }
 }
