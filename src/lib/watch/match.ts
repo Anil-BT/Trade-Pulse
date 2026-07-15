@@ -24,8 +24,75 @@ export type WatchMatch = {
   /** Exit conditions true on last bar (context only) */
   exitMatch: boolean;
   changePct?: number;
+  /**
+   * Realized volatility (annualized %), close-to-close over ~20 bars.
+   * e.g. 22.5 means ~22.5% annualized.
+   */
+  rvol?: number;
   message?: string;
 };
+
+/** Price / day-change for every F&O name (sector graph — no strategy filter). */
+export type WatchQuote = {
+  symbol: string;
+  price: number;
+  barTime: number;
+  /** Session day change % (last close vs first bar open of that IST day) */
+  changePct?: number;
+};
+
+function istDayKey(ms: number): string {
+  const d = new Date(ms + 5.5 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 10);
+}
+
+/**
+ * Quote snapshot from candles — used for sector strength on the full F&O universe.
+ * Does not evaluate any strategy conditions.
+ */
+export function quoteFromCandles(
+  candles: Candle[]
+): Omit<WatchQuote, "symbol"> | null {
+  if (candles.length < 2) return null;
+  const last = candles[candles.length - 1];
+  const day = istDayKey(last.time);
+  // First bar of the last session day (open ≈ session open when series starts early enough)
+  let first = last;
+  for (let i = candles.length - 1; i >= 0; i--) {
+    if (istDayKey(candles[i].time) !== day) break;
+    first = candles[i];
+  }
+  const open = first.open;
+  const changePct =
+    open > 0 ? ((last.close - open) / open) * 100 : undefined;
+  return {
+    price: last.close,
+    barTime: last.time,
+    changePct: Number.isFinite(changePct) ? changePct : undefined,
+  };
+}
+
+/** Close-to-close realized vol, annualized as percent (e.g. 18.4). */
+function realizedVolPct(candles: Candle[], lookback = 20): number | undefined {
+  if (candles.length < lookback + 2) return undefined;
+  const closes = candles.map((c) => c.close);
+  const rets: number[] = [];
+  const start = closes.length - lookback;
+  for (let i = start; i < closes.length; i++) {
+    const a = closes[i - 1];
+    const b = closes[i];
+    if (a > 0 && b > 0) rets.push(Math.log(b / a));
+  }
+  if (rets.length < 5) return undefined;
+  const mean = rets.reduce((s, r) => s + r, 0) / rets.length;
+  let v = 0;
+  for (const r of rets) v += (r - mean) * (r - mean);
+  v = Math.sqrt(v / Math.max(rets.length - 1, 1));
+  // ~75 five-min bars per session (approx for intraday)
+  const annual = v * Math.sqrt(252 * 75) * 100;
+  if (!Number.isFinite(annual)) return undefined;
+  return Math.round(Math.min(Math.max(annual, 1), 200) * 10) / 10;
+}
 
 function defaultPeriod(type: IndicatorType): number {
   if (type === "RSI" || type === "ADX") return 14;
@@ -133,41 +200,90 @@ function evalConditions(
   return logic === "and" ? results.every(Boolean) : results.some(Boolean);
 }
 
+export type MatchScanMode = "last" | "session";
+
+/** Index of first bar of the last IST session day in `candles`. */
+function sessionDayStartIndex(candles: Candle[]): number {
+  if (!candles.length) return 0;
+  const lastDay = istDayKey(candles[candles.length - 1].time);
+  for (let i = candles.length - 1; i >= 0; i--) {
+    if (istDayKey(candles[i].time) !== lastDay) return i + 1;
+  }
+  return 0;
+}
+
 /**
- * Returns true if entry conditions hold on the last candle.
+ * Match strategy entry conditions on candles.
+ *
+ * - `session` (default): walk **today’s bars from the open** and return the
+ *   first bar where entry is true (screener “fired today”).
+ * - `last`: only the latest bar (live tick style).
+ *
+ * Price / day % always from the latest bar; `barTime` is the signal bar.
  */
 export function matchStrategyOnCandles(
   candles: Candle[],
-  strategy: StrategyConfig
+  strategy: StrategyConfig,
+  opts?: { mode?: MatchScanMode }
 ): Omit<WatchMatch, "symbol" | "strategyName"> | null {
   if (candles.length < 5) return null;
-  const i = candles.length - 1;
-  const c = candles[i];
+  const mode: MatchScanMode = opts?.mode ?? "session";
+  const lastI = candles.length - 1;
+  const last = candles[lastI];
   const entryLogic = strategy.entryLogic ?? "and";
   const exitLogic = strategy.exitLogic ?? "and";
   const map = buildSeriesMap(candles, [
     ...strategy.entry,
     ...strategy.exit,
   ]);
-  const entryMatch = evalConditions(strategy.entry, entryLogic, i, map);
-  if (!entryMatch) return null;
 
+  let signalI: number | null = null;
+  if (mode === "last") {
+    if (evalConditions(strategy.entry, entryLogic, lastI, map)) {
+      signalI = lastI;
+    }
+  } else {
+    const dayStart = sessionDayStartIndex(candles);
+    // Need i>=1 for cross_above / cross_below
+    const from = Math.max(dayStart, 1);
+    for (let i = from; i <= lastI; i++) {
+      if (evalConditions(strategy.entry, entryLogic, i, map)) {
+        signalI = i;
+        break;
+      }
+    }
+  }
+  if (signalI == null) return null;
+
+  const signal = candles[signalI];
   const exitMatch = strategy.exit.length
-    ? evalConditions(strategy.exit, exitLogic, i, map)
+    ? evalConditions(strategy.exit, exitLogic, lastI, map)
     : false;
 
-  const prev = candles.length > 1 ? candles[i - 1].close : c.close;
+  // Session day % (open → last close) for screener tables
+  const dayStart = sessionDayStartIndex(candles);
+  const dayOpen = candles[dayStart]?.open ?? last.open;
   const changePct =
-    prev > 0 ? ((c.close - prev) / prev) * 100 : undefined;
+    dayOpen > 0 ? ((last.close - dayOpen) / dayOpen) * 100 : undefined;
+  const rvol = realizedVolPct(candles, 20);
+
+  const onLast = signalI === lastI;
+  let message: string;
+  if (onLast && exitMatch) {
+    message = "Entry true on last bar (exit also true)";
+  } else if (onLast) {
+    message = "Entry true on last bar";
+  } else {
+    message = `Entry matched earlier today (signal bar)`;
+  }
 
   return {
-    price: c.close,
-    barTime: c.time,
+    price: last.close,
+    barTime: signal.time,
     entryMatch: true,
     exitMatch,
-    changePct,
-    message: exitMatch
-      ? "Entry true (exit also true on last bar)"
-      : "Entry conditions matched",
+    changePct: Number.isFinite(changePct) ? changePct : undefined,
+    rvol,
+    message,
   };
 }

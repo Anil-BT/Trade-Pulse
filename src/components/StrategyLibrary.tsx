@@ -10,10 +10,11 @@ import {
 import { useAuth } from "@/lib/firebase/auth-context";
 import {
   deleteCloudStrategy,
-  listCloudStrategies,
   migrateLocalToCloud,
   saveCloudStrategy,
 } from "@/lib/firebase/strategies";
+import { listUnifiedStrategies } from "@/lib/strategies/catalog";
+import { notifyStrategiesChanged } from "@/lib/strategies/events";
 
 export function StrategyLibrary({
   strategy,
@@ -34,16 +35,12 @@ export function StrategyLibrary({
 
   const refresh = useCallback(async () => {
     try {
-      if (user) {
-        setSaved(await listCloudStrategies(user.uid));
-      } else {
-        setSaved(listSavedStrategies());
-      }
+      setSaved(await listUnifiedStrategies(user?.uid ?? null));
     } catch (e) {
       setMsg(e instanceof Error ? e.message : "Failed to load strategies");
       setSaved(listSavedStrategies());
     }
-  }, [user]);
+  }, [user?.uid]);
 
   useEffect(() => {
     void refresh();
@@ -86,17 +83,18 @@ export function StrategyLibrary({
         );
         // also keep a local backup
         saveStrategy(row.name, row.strategy, row.id);
-        setMsg(`Saved “${row.name}” to cloud`);
+        setMsg(`Saved “${row.name}” — available in Paper & Market Watch`);
         onRenamed?.(row.name);
       } else {
         const row = saveStrategy(name || strategy.name, strategy);
         setMsg(
           configured
-            ? `Saved “${row.name}” on this device (sign in to sync)`
-            : `Saved “${row.name}” on this device`
+            ? `Saved “${row.name}” on this device (sign in to sync). Available in Paper & Market Watch.`
+            : `Saved “${row.name}” — available in Paper & Market Watch`
         );
         onRenamed?.(row.name);
       }
+      notifyStrategiesChanged();
       await refresh();
       setTimeout(() => setMsg(null), 2500);
     } catch (e) {
@@ -124,6 +122,7 @@ export function StrategyLibrary({
         await deleteCloudStrategy(user.uid, id);
       }
       deleteSavedStrategy(id);
+      notifyStrategiesChanged();
       await refresh();
     } catch (e) {
       setMsg(e instanceof Error ? e.message : "Delete failed");
@@ -156,10 +155,10 @@ export function StrategyLibrary({
       {msg && <p className="text-xs text-neutral-600">{msg}</p>}
       <p className="text-[11px] text-neutral-400">
         {cloud
-          ? "Synced to your Firebase account (Firestore)."
+          ? "Synced to Firebase — same list appears in Paper Trading and Market Watch."
           : configured
-            ? "Saved in this browser. Sign in (header) to sync across devices."
-            : "Saved in this browser (localStorage). See docs/FIREBASE.md to enable cloud."}
+            ? "Saved on this device (also Paper & Market Watch). Sign in to sync across devices."
+            : "Saved on this device — also listed in Paper Trading and Market Watch."}
       </p>
 
       {saved.length > 0 && (

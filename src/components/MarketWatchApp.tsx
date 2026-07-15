@@ -1,6 +1,16 @@
 "use client";
 
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import {
+  Bar,
+  BarChart,
+  CartesianGrid,
+  Cell,
+  ResponsiveContainer,
+  Tooltip,
+  XAxis,
+  YAxis,
+} from "recharts";
 import { STRATEGY_PRESETS } from "@/lib/presets";
 import { formatTime, uid } from "@/lib/format";
 import {
@@ -8,7 +18,13 @@ import {
   safeErrorMessage,
   sanitizeToken,
 } from "@/lib/http";
-import { listSavedStrategies } from "@/lib/strategy-store";
+import {
+  computeSectorStrength,
+  sectorOf,
+  type SectorStrength,
+} from "@/lib/watch/sectors";
+import { isNseSessionOpen, sessionStatus } from "@/lib/paper/market-hours";
+import { useSavedStrategies } from "@/lib/hooks/use-saved-strategies";
 import type { Interval, StrategyConfig } from "@/lib/types";
 
 const INTERVALS: { value: Interval; label: string }[] = [
@@ -25,20 +41,45 @@ type WatchMatch = {
   entryMatch: boolean;
   exitMatch: boolean;
   changePct?: number;
+  /** Realized vol annualized % */
+  rvol?: number;
   message?: string;
+  /** First time this symbol matched this strategy (sticky) */
+  addedAt?: number;
+  sector?: string;
 };
+
+/** Full-universe F&O quote (sector graph — no strategy filter). */
+type WatchQuote = {
+  symbol: string;
+  price: number;
+  barTime: number;
+  changePct?: number;
+};
+
+type WatchSource = "yahoo" | "upstox";
 
 type ScanResponse = {
   generatedAt: string;
   today: string;
   interval: string;
+  source?: WatchSource;
+  delayed?: boolean;
   strategies: string[];
+  matchMode?: "session" | "last";
   universeSize: number;
   scanned: number;
   matchCount: number;
+  quoteCount?: number;
   rateLimited?: number;
   errors?: number;
   matches: WatchMatch[];
+  quotes?: WatchQuote[];
+  batchSymbols?: string[];
+  nextOffset?: number;
+  batchSize?: number;
+  batchIndex?: number;
+  batchesPerCycle?: number;
   note?: string;
   error?: string;
 };
@@ -50,6 +91,11 @@ type StrategyPick = {
   selected: boolean;
 };
 
+type StickyCell = WatchMatch & {
+  addedAt: number;
+  sector: string;
+};
+
 function cloneStrategy(s: StrategyConfig): StrategyConfig {
   return structuredClone({
     ...s,
@@ -58,16 +104,79 @@ function cloneStrategy(s: StrategyConfig): StrategyConfig {
   });
 }
 
+function cellKey(m: { strategyName: string; symbol: string }) {
+  return `${m.strategyName}::${m.symbol}`;
+}
+
+/** Sticky merge: never remove; only update price / % when re-seen. */
+function mergeSticky(
+  prev: Map<string, StickyCell>,
+  batchMatches: WatchMatch[],
+  now: number
+): Map<string, StickyCell> {
+  const next = new Map(prev);
+  for (const m of batchMatches) {
+    const k = cellKey(m);
+    const existing = next.get(k);
+    if (existing) {
+      next.set(k, {
+        ...existing,
+        price: m.price,
+        barTime: m.barTime,
+        changePct: m.changePct,
+        rvol: m.rvol ?? existing.rvol,
+        exitMatch: m.exitMatch,
+        message: m.message,
+        sector: sectorOf(m.symbol),
+      });
+    } else {
+      next.set(k, {
+        ...m,
+        addedAt: now,
+        sector: sectorOf(m.symbol),
+      });
+    }
+  }
+  return next;
+}
+
+/** Sticky full-universe quotes for sector strength (keyed by symbol). */
+function mergeQuotes(
+  prev: Map<string, WatchQuote>,
+  batch: WatchQuote[]
+): Map<string, WatchQuote> {
+  const next = new Map(prev);
+  for (const q of batch) {
+    const sym = String(q.symbol || "")
+      .toUpperCase()
+      .replace(/\.NS$/i, "");
+    if (!sym) continue;
+    next.set(sym, {
+      symbol: sym,
+      price: q.price,
+      barTime: q.barTime,
+      changePct: q.changePct,
+    });
+  }
+  return next;
+}
+
 /**
- * TradingView / TradeFinder-style multi-strategy F&O market watch.
+ * Multi-strategy F&O scanner (sortable tables).
+ * - Config strategies once; runs while market open
+ * - Sticky rows: once matched, stay until cleared
+ * - Sector strength bars filter the tables
+ * - Click any column header to sort
  */
 export function MarketWatchApp() {
+  const [dataSource, setDataSource] = useState<WatchSource>("yahoo");
   const [upstoxToken, setUpstoxToken] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [interval, setIntervalBar] = useState<Interval>("5m");
-  const [maxSymbols, setMaxSymbols] = useState(40);
-  const [scanAll, setScanAll] = useState(false);
-  const [autoRefresh, setAutoRefresh] = useState(false);
+  const [batchSize, setBatchSize] = useState(25);
+  const [runOnMarketOpen, setRunOnMarketOpen] = useState(true);
+  const [statusLine, setStatusLine] = useState(sessionStatus().label);
+
   const [picks, setPicks] = useState<StrategyPick[]>(() =>
     STRATEGY_PRESETS.map((p) => ({
       id: `preset:${p.name}`,
@@ -80,178 +189,513 @@ export function MarketWatchApp() {
     }))
   );
 
+  /** Strategies saved from Backtest (local + cloud) */
+  const { saved: savedStrategies, loading: savedLoading } =
+    useSavedStrategies();
+
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [result, setResult] = useState<ScanResponse | null>(null);
-  const [filterStrategy, setFilterStrategy] = useState<string>("all");
-  const [filterText, setFilterText] = useState("");
+  const [meta, setMeta] = useState<ScanResponse | null>(null);
+  const [sticky, setSticky] = useState<Map<string, StickyCell>>(() => new Map());
+  /** Full F&O universe day quotes for sector graph (independent of strategies). */
+  const [universeQuotes, setUniverseQuotes] = useState<Map<string, WatchQuote>>(
+    () => new Map()
+  );
+  const [rotationOffset, setRotationOffset] = useState(0);
+  const [sectorFilter, setSectorFilter] = useState<string | null>(null);
+  const [configOpen, setConfigOpen] = useState(true);
+  type SortKey =
+    | "symbol"
+    | "price"
+    | "changePct"
+    | "sector"
+    | "rvol"
+    | "addedAt"
+    | "barTime";
+  const [sortKey, setSortKey] = useState<SortKey>("changePct");
+  const [sortDir, setSortDir] = useState<"asc" | "desc">("desc");
 
-  // Merge saved strategies from local library
+  const rotationOffsetRef = useRef(0);
+  const busyRef = useRef(false);
+  const stickyRef = useRef(sticky);
+  const selectedRef = useRef<StrategyConfig[]>([]);
+  /** Strategy ids selected on previous render — detect newly checked strategies */
+  const prevSelectedIdsRef = useRef<Set<string>>(new Set());
+  const backfillRunningRef = useRef(false);
+  const [backfillNote, setBackfillNote] = useState<string | null>(null);
+
+  // Merge / refresh user strategies from Backtest (and keep selection)
   useEffect(() => {
-    try {
-      const saved = listSavedStrategies();
-      if (!saved.length) return;
-      setPicks((prev) => {
-        const existing = new Set(prev.map((p) => p.id));
-        const extra: StrategyPick[] = [];
-        for (const s of saved) {
+    setPicks((prev) => {
+      const selected = new Map(
+        prev.filter((p) => p.selected).map((p) => [p.id, true] as const)
+      );
+      const presets: StrategyPick[] = STRATEGY_PRESETS.map((p) => {
+        const id = `preset:${p.name}`;
+        const was = prev.find((x) => x.id === id);
+        return {
+          id,
+          strategy: was?.strategy ?? cloneStrategy(p),
+          source: "preset" as const,
+          selected: selected.has(id)
+            ? true
+            : was
+              ? was.selected
+              : p.name === "VWAP Bull" ||
+                p.name === "Opening Range + EMA9" ||
+                p.name.includes("bullish"),
+        };
+      });
+
+      const savedPicks: StrategyPick[] = savedStrategies
+        .filter((s) => s.strategy?.entry?.length)
+        .map((s) => {
           const id = `saved:${s.id || s.name}`;
-          if (existing.has(id)) continue;
-          if (!s.strategy?.entry?.length) continue;
-          extra.push({
+          return {
             id,
             strategy: cloneStrategy({
               ...s.strategy,
               name: s.name || s.strategy.name,
             }),
-            source: "saved",
-            selected: false,
-          });
-        }
-        return extra.length ? [...prev, ...extra] : prev;
-      });
-    } catch {
-      /* ignore */
-    }
-  }, []);
+            source: "saved" as const,
+            // Keep checked if user already selected this id
+            selected: selected.has(id),
+          };
+        });
+
+      return [...presets, ...savedPicks];
+    });
+  }, [savedStrategies]);
 
   const selectedStrategies = useMemo(
     () => picks.filter((p) => p.selected).map((p) => p.strategy),
     [picks]
   );
 
-  const runScan = useCallback(async () => {
-    setError(null);
-    if (!selectedStrategies.length) {
-      setError("Select at least one strategy to watch.");
-      return;
-    }
-    const token = sanitizeToken(upstoxToken);
-    if (!token && !process.env.NEXT_PUBLIC_HAS_UPSTOX) {
-      // Server may still have env token
-    }
-
-    setBusy(true);
-    try {
-      const res = await fetch("/api/watch/scan", {
-        method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          Accept: "application/json",
-        },
-        body: JSON.stringify({
-          strategies: selectedStrategies,
-          interval,
-          upstoxAccessToken: token || undefined,
-          maxSymbols,
-          scanAll,
-        }),
-      });
-      const data = await parseApiJson<ScanResponse>(res);
-      if (!res.ok) throw new Error(data.error || `Scan failed (${res.status})`);
-      setResult(data);
-    } catch (e) {
-      setError(safeErrorMessage(e) || "Scan failed");
-    } finally {
-      setBusy(false);
-    }
-  }, [selectedStrategies, upstoxToken, interval, maxSymbols, scanAll]);
-
-  // Optional auto-refresh (like a live scanner)
   useEffect(() => {
-    if (!autoRefresh || !result) return;
-    const t = setInterval(() => {
-      if (!busy) void runScan();
-    }, 60_000);
-    return () => clearInterval(t);
-  }, [autoRefresh, result, busy, runScan]);
+    selectedRef.current = selectedStrategies;
+  }, [selectedStrategies]);
 
-  const filteredMatches = useMemo(() => {
-    if (!result?.matches) return [];
-    let rows = result.matches;
-    if (filterStrategy !== "all") {
-      rows = rows.filter((m) => m.strategyName === filterStrategy);
+  useEffect(() => {
+    busyRef.current = busy;
+  }, [busy]);
+
+  useEffect(() => {
+    rotationOffsetRef.current = rotationOffset;
+  }, [rotationOffset]);
+
+  useEffect(() => {
+    stickyRef.current = sticky;
+  }, [sticky]);
+
+  useEffect(() => {
+    setBatchSize(dataSource === "yahoo" ? 25 : 40);
+    setRotationOffset(0);
+    rotationOffsetRef.current = 0;
+    // New feed — rebuild universe quotes from scratch
+    setUniverseQuotes(new Map());
+  }, [dataSource]);
+
+  // Market status line
+  useEffect(() => {
+    const t = setInterval(() => setStatusLine(sessionStatus().label), 30_000);
+    return () => clearInterval(t);
+  }, []);
+
+  const runBatch = useCallback(
+    async (opts?: {
+      /** Force rotation offset for this request */
+      offset?: number;
+      /** Advance shared rotation after success (default true) */
+      advance?: boolean;
+      /** Override strategies for this call (defaults to current selection) */
+      strategies?: StrategyConfig[];
+    }): Promise<ScanResponse | null> => {
+      // Always scan F&O for sector quotes; strategies optional for match tables
+      const strats = opts?.strategies ?? selectedRef.current;
+      if (busyRef.current) return null;
+
+      const token = sanitizeToken(upstoxToken);
+      if (dataSource === "upstox" && !token) {
+        setError("Paste Upstox token or switch to Yahoo (free).");
+        return null;
+      }
+
+      const offset =
+        typeof opts?.offset === "number"
+          ? opts.offset
+          : rotationOffsetRef.current;
+
+      setBusy(true);
+      setError(null);
+      try {
+        const res = await fetch("/api/watch/scan", {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            Accept: "application/json",
+          },
+          body: JSON.stringify({
+            strategies: strats,
+            interval,
+            source: dataSource,
+            upstoxAccessToken:
+              dataSource === "upstox" ? token || undefined : undefined,
+            rotateUniverse: true,
+            rotationOffset: offset,
+            batchSize,
+            /** Session mode: any bar from today's open */
+            matchMode: "session",
+          }),
+        });
+        const data = await parseApiJson<ScanResponse>(res);
+        if (!res.ok) throw new Error(data.error || `Scan failed (${res.status})`);
+
+        setMeta(data);
+        const now = Date.now();
+        setUniverseQuotes((prev) => mergeQuotes(prev, data.quotes || []));
+        if (strats.length) {
+          setSticky((prev) => mergeSticky(prev, data.matches || [], now));
+        }
+
+        if (opts?.advance !== false && typeof data.nextOffset === "number") {
+          setRotationOffset(data.nextOffset);
+          rotationOffsetRef.current = data.nextOffset;
+        }
+        return data;
+      } catch (e) {
+        setError(safeErrorMessage(e) || "Scan failed");
+        return null;
+      } finally {
+        setBusy(false);
+      }
+    },
+    [upstoxToken, dataSource, interval, batchSize]
+  );
+
+  /**
+   * Full F&O pass for newly selected strategies: match entry on any bar
+   * from today's open through now, then keep normal 1-min rotation.
+   */
+  const runSessionBackfill = useCallback(
+    async (strategyNames: string[]) => {
+      if (backfillRunningRef.current) return;
+      if (!strategyNames.length) return;
+      backfillRunningRef.current = true;
+      const label = strategyNames.join(", ");
+      setBackfillNote(
+        `Backfilling ${label}: scanning full F&O from today's open…`
+      );
+      try {
+        let offset = 0;
+        let covered = 0;
+        let universeSize = 0;
+        let guard = 0;
+        const maxBatches = 40;
+
+        while (guard < maxBatches) {
+          guard += 1;
+          // Wait out any in-flight scan
+          while (busyRef.current) {
+            await new Promise((r) => setTimeout(r, 150));
+          }
+          const data = await runBatch({
+            offset,
+            advance: true,
+            strategies: selectedRef.current,
+          });
+          if (!data) break;
+
+          universeSize = data.universeSize || universeSize;
+          const step = data.scanned || data.batchSize || batchSize;
+          covered += step;
+          offset =
+            typeof data.nextOffset === "number" ? data.nextOffset : offset;
+
+          setBackfillNote(
+            `Backfilling ${label}: batch ${data.batchIndex}/${data.batchesPerCycle} · ${Math.min(covered, universeSize || covered)}/${universeSize || "?"} F&O (today’s bars)`
+          );
+
+          if (
+            universeSize > 0 &&
+            (covered >= universeSize ||
+              (data.batchesPerCycle != null &&
+                data.batchIndex != null &&
+                data.batchIndex >= data.batchesPerCycle))
+          ) {
+            break;
+          }
+          // Brief pause between batches (rate limits)
+          await new Promise((r) =>
+            setTimeout(r, dataSource === "yahoo" ? 800 : 300)
+          );
+        }
+        setBackfillNote(
+          `Backfill done for ${label} — matches use any bar from today’s open.`
+        );
+        window.setTimeout(() => setBackfillNote(null), 8000);
+      } finally {
+        backfillRunningRef.current = false;
+      }
+    },
+    [runBatch, batchSize, dataSource]
+  );
+
+  // Detect newly selected strategies → session backfill from start of day
+  useEffect(() => {
+    const selectedIds = new Set(
+      picks.filter((p) => p.selected).map((p) => p.id)
+    );
+    const newlySelected = picks.filter(
+      (p) => p.selected && !prevSelectedIdsRef.current.has(p.id)
+    );
+    prevSelectedIdsRef.current = selectedIds;
+
+    if (!newlySelected.length) return;
+
+    // Drop prior rows for these strategies so table rebuilds from today’s scan
+    const names = newlySelected.map((p) => p.strategy.name);
+    setSticky((prev) => {
+      const next = new Map(prev);
+      for (const [k, v] of next) {
+        if (names.includes(v.strategyName)) next.delete(k);
+      }
+      stickyRef.current = next;
+      return next;
+    });
+    setRotationOffset(0);
+    rotationOffsetRef.current = 0;
+
+    void runSessionBackfill(names);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when selection set grows
+  }, [picks, runSessionBackfill]);
+
+  // Auto-run full F&O rotation (sector graph) when market open
+  useEffect(() => {
+    const shouldRun = () =>
+      !backfillRunningRef.current &&
+      (!runOnMarketOpen || isNseSessionOpen());
+
+    if (shouldRun()) {
+      void runBatch();
     }
-    const q = filterText.trim().toUpperCase();
-    if (q) {
-      rows = rows.filter(
-        (m) =>
-          m.symbol.includes(q) || m.strategyName.toUpperCase().includes(q)
+
+    const t = setInterval(() => {
+      if (shouldRun() && !busyRef.current) {
+        void runBatch();
+      } else {
+        setStatusLine(sessionStatus().label);
+      }
+    }, 60_000);
+
+    return () => clearInterval(t);
+  }, [runOnMarketOpen, runBatch]);
+
+  const cells = useMemo(() => [...sticky.values()], [sticky]);
+
+  const sectorStrength: SectorStrength[] = useMemo(
+    () => computeSectorStrength([...universeQuotes.values()]),
+    [universeQuotes]
+  );
+
+  const quotesCovered = universeQuotes.size;
+
+  function toggleSort(key: SortKey) {
+    if (sortKey === key) {
+      setSortDir((d) => (d === "asc" ? "desc" : "asc"));
+    } else {
+      setSortKey(key);
+      setSortDir(
+        key === "symbol" || key === "sector" ? "asc" : "desc"
       );
     }
-    return rows;
-  }, [result, filterStrategy, filterText]);
+  }
+
+  function sortRows(list: StickyCell[]): StickyCell[] {
+    const dir = sortDir === "asc" ? 1 : -1;
+    return [...list].sort((a, b) => {
+      const av = a[sortKey];
+      const bv = b[sortKey];
+      if (sortKey === "symbol" || sortKey === "sector") {
+        return dir * String(av ?? "").localeCompare(String(bv ?? ""));
+      }
+      const an = Number(av);
+      const bn = Number(bv);
+      const aOk = Number.isFinite(an);
+      const bOk = Number.isFinite(bn);
+      if (!aOk && !bOk) return a.symbol.localeCompare(b.symbol);
+      if (!aOk) return 1;
+      if (!bOk) return -1;
+      if (an !== bn) return dir * (an - bn);
+      return a.symbol.localeCompare(b.symbol);
+    });
+  }
 
   const byStrategy = useMemo(() => {
-    const map = new Map<string, number>();
-    for (const m of result?.matches || []) {
-      map.set(m.strategyName, (map.get(m.strategyName) || 0) + 1);
+    const map = new Map<string, StickyCell[]>();
+    for (const c of cells) {
+      if (sectorFilter && c.sector !== sectorFilter) continue;
+      const list = map.get(c.strategyName) || [];
+      list.push(c);
+      map.set(c.strategyName, list);
+    }
+    for (const [k, list] of map) {
+      map.set(k, sortRows(list));
     }
     return map;
-  }, [result]);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sort via sortKey/sortDir
+  }, [cells, sectorFilter, sortKey, sortDir]);
+
+  // Order strategy sections by selected order
+  const strategyOrder = useMemo(
+    () => selectedStrategies.map((s) => s.name),
+    [selectedStrategies]
+  );
 
   function togglePick(id: string) {
     setPicks((prev) =>
       prev.map((p) => (p.id === id ? { ...p, selected: !p.selected } : p))
     );
+    // Backfill is triggered by the picks effect when a strategy is turned on
   }
 
-  function selectAll(on: boolean) {
-    setPicks((prev) => prev.map((p) => ({ ...p, selected: on })));
+  function clearMatches() {
+    setSticky(new Map());
+    stickyRef.current = new Map();
+    setUniverseQuotes(new Map());
+    setRotationOffset(0);
+    rotationOffsetRef.current = 0;
+    setSectorFilter(null);
   }
+
+  const chartHeight = Math.max(360, sectorStrength.length * 22 + 48);
 
   return (
     <div className="mx-auto max-w-6xl px-5 pb-24 pt-10 sm:px-8">
-      <header className="mb-10 max-w-2xl">
-        <p className="mb-3 text-xs font-medium tracking-[0.2em] text-neutral-500 uppercase">
-          Market watch
-        </p>
-        <h1 className="text-3xl font-semibold tracking-tight text-black sm:text-4xl">
-          Strategy scanner.
-          <br />
-          <span className="text-neutral-400">F&amp;O names that match now.</span>
-        </h1>
-        <p className="mt-4 text-base leading-relaxed text-neutral-600">
-          Pick one or more strategies. We scan the equity F&amp;O universe and
-          list stocks where <strong>entry conditions are true on the latest
-          bar</strong> — similar to TradingView / TradeFinder scanners.
-        </p>
+      <header className="mb-6 flex flex-wrap items-start justify-between gap-4">
+        <div className="max-w-2xl">
+          <p className="mb-2 text-xs font-medium tracking-[0.2em] text-neutral-500 uppercase">
+            Market watch
+          </p>
+          <h1 className="text-3xl font-semibold tracking-tight text-black sm:text-4xl">
+            Live strategy watch
+          </h1>
+          <p className="mt-2 text-sm leading-relaxed text-neutral-600">
+            Full F&amp;O universe rotates for sector strength. When you select a
+            strategy, the screener backfills the full universe using{" "}
+            <strong>today’s bars from the open</strong> (not only the last bar).
+            Click a sector bar to filter tables.
+          </p>
+          <p className="mt-2 text-xs text-neutral-500">
+            {statusLine}
+            {meta
+              ? ` · batch ${meta.batchIndex}/${meta.batchesPerCycle} · universe ${meta.universeSize} · F&O priced ${quotesCovered}/${meta.universeSize} · ${meta.source || dataSource}`
+              : quotesCovered
+                ? ` · F&O priced ${quotesCovered}`
+                : ""}
+            {busy ? " · scanning…" : ""}
+          </p>
+          {backfillNote && (
+            <p className="mt-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-950">
+              {backfillNote}
+            </p>
+          )}
+        </div>
+        <div className="flex flex-wrap gap-2">
+          <button
+            type="button"
+            onClick={() => setConfigOpen((v) => !v)}
+            className="rounded-full border border-neutral-300 px-4 py-2 text-sm font-medium hover:border-black"
+          >
+            {configOpen ? "Hide config" : "Configure"}
+          </button>
+          <button
+            type="button"
+            disabled={busy}
+            onClick={() => void runBatch()}
+            className="rounded-full border border-neutral-300 px-4 py-2 text-sm font-medium hover:border-black disabled:opacity-50"
+          >
+            Scan now
+          </button>
+          <button
+            type="button"
+            onClick={clearMatches}
+            className="rounded-full border border-neutral-300 px-4 py-2 text-sm font-medium hover:border-black"
+          >
+            Clear matches
+          </button>
+        </div>
       </header>
 
-      <div className="grid gap-8 lg:grid-cols-[320px_1fr]">
-        {/* Controls */}
-        <aside className="space-y-6">
-          <section className="rounded-3xl border border-neutral-200 bg-white p-5">
-            <h2 className="mb-3 text-xs font-medium tracking-wide text-neutral-500 uppercase">
-              Market data
-            </h2>
-            <label className="mb-1 block text-xs text-neutral-500">
-              Upstox access token
-            </label>
-            <div className="flex gap-2">
-              <input
-                type={showToken ? "text" : "password"}
-                value={upstoxToken}
-                onChange={(e) => setUpstoxToken(e.target.value)}
-                placeholder="Paste token (or server env)"
-                className="field-input flex-1 text-sm"
-              />
-              <button
-                type="button"
-                onClick={() => setShowToken((v) => !v)}
-                className="rounded-full border border-neutral-300 px-3 text-xs"
-              >
-                {showToken ? "Hide" : "Show"}
-              </button>
-            </div>
+      {dataSource === "yahoo" && (
+        <div className="mb-5 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-xs text-amber-950">
+          <strong>Yahoo free / delayed</strong> — not for live trading. Switch
+          to Upstox for live prices.
+        </div>
+      )}
 
-            <label className="mb-1 mt-4 block text-xs text-neutral-500">
-              Interval
-            </label>
+      {error && (
+        <p className="mb-4 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-800">
+          {error}
+        </p>
+      )}
+
+      {/* Config panel */}
+      {configOpen && (
+        <section className="mb-8 grid gap-4 rounded-3xl border border-neutral-200 bg-white p-5 sm:grid-cols-2 lg:grid-cols-3">
+          <div>
+            <p className="mb-2 text-xs font-medium tracking-wide text-neutral-500 uppercase">
+              Data source
+            </p>
+            <div className="flex flex-wrap gap-2">
+              {(
+                [
+                  { id: "yahoo" as const, label: "Yahoo (free)" },
+                  { id: "upstox" as const, label: "Upstox (live)" },
+                ] as const
+              ).map((s) => (
+                <button
+                  key={s.id}
+                  type="button"
+                  onClick={() => setDataSource(s.id)}
+                  className={`rounded-full px-3 py-1.5 text-xs font-medium ${
+                    dataSource === s.id
+                      ? "bg-black text-white"
+                      : "bg-neutral-100 text-neutral-700"
+                  }`}
+                >
+                  {s.label}
+                </button>
+              ))}
+            </div>
+            {dataSource === "upstox" && (
+              <div className="mt-3 flex gap-2">
+                <input
+                  type={showToken ? "text" : "password"}
+                  value={upstoxToken}
+                  onChange={(e) => setUpstoxToken(e.target.value)}
+                  placeholder="Upstox token"
+                  className="field-input flex-1 text-sm"
+                />
+                <button
+                  type="button"
+                  onClick={() => setShowToken((v) => !v)}
+                  className="rounded-full border px-3 text-xs"
+                >
+                  {showToken ? "Hide" : "Show"}
+                </button>
+              </div>
+            )}
+          </div>
+
+          <div>
+            <p className="mb-2 text-xs font-medium tracking-wide text-neutral-500 uppercase">
+              Interval &amp; batch
+            </p>
             <select
               value={interval}
               onChange={(e) => setIntervalBar(e.target.value as Interval)}
-              className="field-input text-sm"
+              className="field-input mb-2 text-sm"
             >
               {INTERVALS.map((i) => (
                 <option key={i.value} value={i.value}>
@@ -259,274 +703,336 @@ export function MarketWatchApp() {
                 </option>
               ))}
             </select>
-
-            <label className="mt-4 flex items-start gap-2 text-sm">
+            <label className="block text-xs text-neutral-500">
+              Batch / minute
               <input
-                type="checkbox"
-                checked={scanAll}
-                onChange={(e) => setScanAll(e.target.checked)}
-                className="mt-0.5 accent-black"
+                type="number"
+                min={5}
+                max={50}
+                value={batchSize}
+                onChange={(e) =>
+                  setBatchSize(
+                    Math.min(50, Math.max(5, Number(e.target.value) || 25))
+                  )
+                }
+                className="field-input mt-1 text-sm"
               />
-              <span>
-                Scan max F&amp;O batch (up to 80)
-                <span className="mt-0.5 block text-xs text-neutral-500">
-                  Larger scans take longer and may hit rate limits.
-                </span>
-              </span>
             </label>
-
-            {!scanAll && (
-              <label className="mt-3 block text-xs text-neutral-500">
-                Max symbols
-                <input
-                  type="number"
-                  min={5}
-                  max={80}
-                  value={maxSymbols}
-                  onChange={(e) =>
-                    setMaxSymbols(
-                      Math.min(80, Math.max(5, Number(e.target.value) || 40))
-                    )
-                  }
-                  className="field-input mt-1 text-sm"
-                />
-              </label>
-            )}
-
-            <label className="mt-4 flex items-center gap-2 text-sm">
+            <label className="mt-3 flex items-center gap-2 text-sm">
               <input
                 type="checkbox"
-                checked={autoRefresh}
-                onChange={(e) => setAutoRefresh(e.target.checked)}
+                checked={runOnMarketOpen}
+                onChange={(e) => setRunOnMarketOpen(e.target.checked)}
                 className="accent-black"
               />
-              Auto-refresh every 60s
+              Auto-run only in market hours (09:15–15:30 IST)
             </label>
+          </div>
 
-            <button
-              type="button"
-              disabled={busy || !selectedStrategies.length}
-              onClick={() => void runScan()}
-              className="mt-5 w-full rounded-full bg-black px-4 py-3 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-50"
-            >
-              {busy ? "Scanning…" : "Run market watch"}
-            </button>
-            {error && (
-              <p className="mt-3 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-800">
-                {error}
-              </p>
-            )}
-          </section>
-
-          <section className="rounded-3xl border border-neutral-200 bg-white p-5">
-            <div className="mb-3 flex items-center justify-between gap-2">
-              <h2 className="text-xs font-medium tracking-wide text-neutral-500 uppercase">
-                Strategies
-              </h2>
-              <div className="flex gap-2 text-[11px]">
-                <button
-                  type="button"
-                  onClick={() => selectAll(true)}
-                  className="text-neutral-600 underline hover:text-black"
-                >
-                  All
-                </button>
-                <button
-                  type="button"
-                  onClick={() => selectAll(false)}
-                  className="text-neutral-600 underline hover:text-black"
-                >
-                  None
-                </button>
-              </div>
-            </div>
-            <p className="mb-3 text-xs text-neutral-500">
-              {selectedStrategies.length} selected · presets + saved library
+          <div className="sm:col-span-2 lg:col-span-1">
+            <p className="mb-2 text-xs font-medium tracking-wide text-neutral-500 uppercase">
+              Strategies (tables below)
             </p>
-            <ul className="max-h-[420px] space-y-2 overflow-y-auto pr-1">
+            <p className="mb-2 text-[11px] text-neutral-400">
+              Presets + strategies you save in Backtest
+              {savedLoading ? " · loading…" : ""}
+              {!savedLoading && savedStrategies.length
+                ? ` · ${savedStrategies.length} saved`
+                : ""}
+            </p>
+            <ul className="max-h-56 space-y-1.5 overflow-y-auto pr-1">
               {picks.map((p) => (
                 <li key={p.id}>
-                  <label className="flex cursor-pointer items-start gap-2 rounded-xl border border-neutral-100 px-3 py-2 hover:border-neutral-300">
+                  <label className="flex cursor-pointer items-center gap-2 text-sm">
                     <input
                       type="checkbox"
                       checked={p.selected}
                       onChange={() => togglePick(p.id)}
-                      className="mt-1 accent-black"
+                      className="accent-black"
                     />
-                    <span className="min-w-0">
-                      <span className="block text-sm font-medium text-black">
-                        {p.strategy.name}
-                      </span>
-                      <span className="text-[11px] text-neutral-500">
-                        {p.source === "preset" ? "Preset" : "Saved"} ·{" "}
-                        {p.strategy.entry.length} entry ·{" "}
-                        {p.strategy.exit.length} exit
-                      </span>
+                    <span className="truncate font-medium">{p.strategy.name}</span>
+                    <span className="text-[10px] text-neutral-400">
+                      {p.source === "saved" ? "yours" : "preset"}
                     </span>
                   </label>
                 </li>
               ))}
             </ul>
-          </section>
-        </aside>
-
-        {/* Results */}
-        <section className="min-w-0">
-          <div className="mb-4 flex flex-wrap items-end justify-between gap-3">
-            <div>
-              <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
-                Matches
-              </h2>
-              {result && (
-                <p className="mt-1 text-xs text-neutral-500">
-                  {result.matchCount} match
-                  {result.matchCount === 1 ? "" : "es"} · scanned{" "}
-                  {result.scanned}/{result.universeSize} · {result.interval} ·{" "}
-                  {result.today}
-                  {result.generatedAt
-                    ? ` · ${formatTime(Date.parse(result.generatedAt))}`
-                    : ""}
-                  {result.rateLimited
-                    ? ` · ${result.rateLimited} rate-limited`
-                    : ""}
-                  {result.errors ? ` · ${result.errors} errors` : ""}
-                </p>
-              )}
-            </div>
-            {result && (
-              <div className="flex flex-wrap gap-2">
-                <select
-                  value={filterStrategy}
-                  onChange={(e) => setFilterStrategy(e.target.value)}
-                  className="rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-xs"
-                >
-                  <option value="all">All strategies</option>
-                  {result.strategies.map((n) => (
-                    <option key={n} value={n}>
-                      {n} ({byStrategy.get(n) || 0})
-                    </option>
-                  ))}
-                </select>
-                <input
-                  type="search"
-                  placeholder="Filter symbol…"
-                  value={filterText}
-                  onChange={(e) => setFilterText(e.target.value)}
-                  className="w-36 rounded-full border border-neutral-300 px-3 py-1.5 text-xs"
-                />
-              </div>
+            {!savedLoading && !savedStrategies.length && (
+              <p className="mt-2 text-[11px] text-neutral-400">
+                No saved strategies yet — open Backtest, edit a strategy, click{" "}
+                <strong>Save</strong>.
+              </p>
             )}
           </div>
-
-          {result?.note && (
-            <p className="mb-3 rounded-xl bg-neutral-50 px-3 py-2 text-xs text-neutral-600">
-              {result.note}
-            </p>
-          )}
-
-          {!result && !busy && (
-            <div className="rounded-3xl border border-dashed border-neutral-300 bg-white px-6 py-16 text-center text-sm text-neutral-500">
-              Select strategies and run market watch to list F&amp;O names
-              matching entry rules on the latest bar.
-            </div>
-          )}
-
-          {busy && (
-            <div className="rounded-3xl border border-neutral-200 bg-white px-6 py-16 text-center text-sm text-neutral-500">
-              Scanning F&amp;O universe…
-            </div>
-          )}
-
-          {result && !busy && filteredMatches.length === 0 && (
-            <div className="rounded-3xl border border-neutral-200 bg-white px-6 py-12 text-center text-sm text-neutral-500">
-              No matches right now for the selected strategies
-              {filterStrategy !== "all" || filterText
-                ? " (try clearing filters)"
-                : ""}
-              .
-            </div>
-          )}
-
-          {filteredMatches.length > 0 && (
-            <div className="overflow-x-auto rounded-3xl border border-neutral-200 bg-white shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-              <table className="w-full min-w-[640px] text-sm">
-                <thead>
-                  <tr className="border-b border-neutral-200 text-xs text-neutral-500 uppercase">
-                    <th className="px-4 py-3 text-left">Symbol</th>
-                    <th className="px-4 py-3 text-left">Strategy</th>
-                    <th className="px-4 py-3 text-right">Price</th>
-                    <th className="px-4 py-3 text-right">Chg%</th>
-                    <th className="px-4 py-3 text-left">Bar time</th>
-                    <th className="px-4 py-3 text-left">Note</th>
-                  </tr>
-                </thead>
-                <tbody>
-                  {filteredMatches.map((m, i) => (
-                    <tr
-                      key={`${m.strategyName}-${m.symbol}-${i}`}
-                      className="border-b border-neutral-100 hover:bg-neutral-50/80"
-                    >
-                      <td className="px-4 py-3 font-semibold tabular-nums text-black">
-                        {m.symbol}
-                      </td>
-                      <td className="px-4 py-3 text-neutral-700">
-                        {m.strategyName}
-                      </td>
-                      <td className="px-4 py-3 text-right tabular-nums">
-                        {m.price.toFixed(2)}
-                      </td>
-                      <td
-                        className={`px-4 py-3 text-right tabular-nums ${
-                          (m.changePct ?? 0) >= 0
-                            ? "text-black"
-                            : "text-neutral-500"
-                        }`}
-                      >
-                        {m.changePct != null
-                          ? `${m.changePct >= 0 ? "+" : ""}${m.changePct.toFixed(2)}%`
-                          : "—"}
-                      </td>
-                      <td className="px-4 py-3 text-xs whitespace-nowrap text-neutral-600">
-                        {formatTime(m.barTime)}
-                      </td>
-                      <td className="px-4 py-3 text-xs text-neutral-500">
-                        {m.exitMatch ? (
-                          <span className="rounded-full bg-neutral-100 px-2 py-0.5">
-                            Entry + exit both true
-                          </span>
-                        ) : (
-                          m.message || "Entry match"
-                        )}
-                      </td>
-                    </tr>
-                  ))}
-                </tbody>
-              </table>
-            </div>
-          )}
-
-          {result && byStrategy.size > 0 && (
-            <div className="mt-6 flex flex-wrap gap-2">
-              {[...byStrategy.entries()].map(([name, n]) => (
-                <button
-                  key={name}
-                  type="button"
-                  onClick={() =>
-                    setFilterStrategy((cur) => (cur === name ? "all" : name))
-                  }
-                  className={`rounded-full border px-3 py-1 text-xs ${
-                    filterStrategy === name
-                      ? "border-black bg-black text-white"
-                      : "border-neutral-300 bg-white text-neutral-700 hover:border-black"
-                  }`}
-                >
-                  {name}: {n}
-                </button>
-              ))}
-            </div>
-          )}
         </section>
+      )}
+
+      {/* Sector strength — all sectors, full F&O universe (not strategy matches) */}
+      <section className="mb-8 rounded-3xl border border-neutral-200 bg-white p-5">
+        <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+          <div>
+            <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
+              Sector strength
+            </h2>
+            <p className="mt-0.5 text-xs text-neutral-400">
+              All sectors · avg day % from all F&amp;O stocks scanned (
+              {quotesCovered} priced
+              {meta?.universeSize ? ` / ${meta.universeSize}` : ""})
+            </p>
+          </div>
+          {sectorFilter && (
+            <button
+              type="button"
+              onClick={() => setSectorFilter(null)}
+              className="text-xs font-medium text-neutral-600 underline hover:text-black"
+            >
+              Clear sector filter ({sectorFilter})
+            </button>
+          )}
+        </div>
+        <div
+          className="w-full overflow-x-auto"
+          style={{ height: chartHeight }}
+        >
+          <ResponsiveContainer width="100%" height="100%">
+            <BarChart
+              layout="vertical"
+              data={sectorStrength}
+              margin={{ top: 4, right: 16, left: 4, bottom: 4 }}
+            >
+              <CartesianGrid strokeDasharray="3 3" stroke="#e5e5e5" horizontal={false} />
+              <XAxis
+                type="number"
+                tick={{ fontSize: 11, fill: "#737373" }}
+                tickFormatter={(v) => `${Number(v).toFixed(1)}%`}
+              />
+              <YAxis
+                type="category"
+                dataKey="sector"
+                width={118}
+                tick={{ fontSize: 10, fill: "#525252" }}
+                interval={0}
+              />
+              <Tooltip
+                formatter={(value, _n, item) => {
+                  const p = item?.payload as SectorStrength | undefined;
+                  const priced = p?.count ?? 0;
+                  const uni = p?.universeCount ?? 0;
+                  return [
+                    `${Number(value ?? 0).toFixed(2)}% avg day · priced ${priced}/${uni} F&O · ↑${p?.bullish ?? 0} ↓${p?.bearish ?? 0}`,
+                    "Strength",
+                  ];
+                }}
+                labelFormatter={(l) => String(l)}
+                contentStyle={{
+                  fontSize: 12,
+                  borderRadius: 12,
+                  border: "1px solid #e5e5e5",
+                }}
+              />
+              <Bar
+                dataKey="avgChangePct"
+                name="Avg day %"
+                radius={[0, 4, 4, 0]}
+                cursor="pointer"
+                barSize={14}
+                onClick={(state) => {
+                  const sector =
+                    state &&
+                    typeof state === "object" &&
+                    "sector" in state
+                      ? String((state as { sector?: string }).sector || "")
+                      : "";
+                  if (!sector) return;
+                  setSectorFilter((cur) =>
+                    cur === sector ? null : sector
+                  );
+                }}
+              >
+                {sectorStrength.map((s) => (
+                  <Cell
+                    key={s.sector}
+                    fill={
+                      sectorFilter === s.sector
+                        ? "#171717"
+                        : s.count === 0
+                          ? "#e5e5e5"
+                          : s.avgChangePct >= 0
+                            ? "#10b981"
+                            : "#f43f5e"
+                    }
+                    opacity={
+                      sectorFilter && sectorFilter !== s.sector ? 0.3 : 1
+                    }
+                  />
+                ))}
+              </Bar>
+            </BarChart>
+          </ResponsiveContainer>
+        </div>
+        <p className="mt-2 text-[11px] text-neutral-400">
+          Horizontal scale = avg session day %. Bars use all F&amp;O stocks in
+          each sector (not strategy matches) — e.g. IT has TCS/INFY/…, FMCG has
+          HUL/ITC/…. Grey = none of that sector priced yet this cycle. Click a
+          bar to filter match tables.
+        </p>
+      </section>
+
+      {/* Sortable tables — one per strategy */}
+      <div className="space-y-8">
+        {strategyOrder.map((name) => {
+          const list = byStrategy.get(name) || [];
+          return (
+            <section
+              key={name}
+              className="rounded-3xl border border-neutral-200 bg-white p-5"
+            >
+              <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+                <h2 className="text-base font-semibold tracking-tight text-black">
+                  {name}
+                </h2>
+                <p className="text-xs text-neutral-500">
+                  {list.length} stock{list.length === 1 ? "" : "s"}
+                  {sectorFilter ? ` · ${sectorFilter}` : ""}
+                  {" · sticky · click headers to sort"}
+                </p>
+              </div>
+
+              {list.length === 0 ? (
+                <p className="py-8 text-center text-sm text-neutral-400">
+                  No matches yet for this strategy
+                  {sectorFilter ? ` in ${sectorFilter}` : ""}.
+                </p>
+              ) : (
+                <div className="overflow-x-auto">
+                  <table className="w-full min-w-[720px] text-sm">
+                    <thead>
+                      <tr className="border-b border-neutral-200 text-left text-xs text-neutral-500 uppercase">
+                        {(
+                          [
+                            { key: "symbol" as const, label: "Stock", align: "left" },
+                            { key: "price" as const, label: "Price", align: "right" },
+                            {
+                              key: "changePct" as const,
+                              label: "% chg",
+                              align: "right",
+                            },
+                            {
+                              key: "sector" as const,
+                              label: "Sector",
+                              align: "left",
+                            },
+                            { key: "rvol" as const, label: "Rvol", align: "right" },
+                            {
+                              key: "barTime" as const,
+                              label: "Signal",
+                              align: "left",
+                            },
+                            {
+                              key: "addedAt" as const,
+                              label: "Added",
+                              align: "left",
+                            },
+                          ] as const
+                        ).map((col) => {
+                          const active = sortKey === col.key;
+                          return (
+                            <th
+                              key={col.key}
+                              className={`px-3 py-2.5 font-medium ${
+                                col.align === "right" ? "text-right" : "text-left"
+                              }`}
+                            >
+                              <button
+                                type="button"
+                                onClick={() => toggleSort(col.key)}
+                                className={`inline-flex items-center gap-1 hover:text-black ${
+                                  active ? "text-black" : ""
+                                } ${col.align === "right" ? "ml-auto" : ""}`}
+                              >
+                                {col.label}
+                                <span className="text-[10px] text-neutral-400">
+                                  {active
+                                    ? sortDir === "asc"
+                                      ? "▲"
+                                      : "▼"
+                                    : "↕"}
+                                </span>
+                              </button>
+                            </th>
+                          );
+                        })}
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {list.map((c) => {
+                        const ch = c.changePct;
+                        const chCls =
+                          ch == null
+                            ? "text-neutral-500"
+                            : ch >= 0
+                              ? "text-emerald-700"
+                              : "text-rose-600";
+                        return (
+                          <tr
+                            key={cellKey(c)}
+                            className="border-b border-neutral-100 hover:bg-neutral-50/80"
+                          >
+                            <td className="px-3 py-2.5 font-semibold text-black whitespace-nowrap">
+                              {c.symbol}
+                            </td>
+                            <td className="px-3 py-2.5 text-right tabular-nums text-neutral-800">
+                              ₹
+                              {c.price.toLocaleString("en-IN", {
+                                maximumFractionDigits: 2,
+                                minimumFractionDigits: 2,
+                              })}
+                            </td>
+                            <td
+                              className={`px-3 py-2.5 text-right tabular-nums font-medium ${chCls}`}
+                            >
+                              {ch != null
+                                ? `${ch >= 0 ? "+" : ""}${ch.toFixed(2)}%`
+                                : "—"}
+                            </td>
+                            <td className="px-3 py-2.5 text-neutral-700">
+                              {c.sector}
+                            </td>
+                            <td className="px-3 py-2.5 text-right tabular-nums text-neutral-700">
+                              {c.rvol != null ? `${c.rvol.toFixed(1)}%` : "—"}
+                            </td>
+                            <td className="px-3 py-2.5 text-xs whitespace-nowrap text-neutral-600">
+                              {c.barTime ? formatTime(c.barTime) : "—"}
+                            </td>
+                            <td className="px-3 py-2.5 text-xs whitespace-nowrap text-neutral-500">
+                              {c.addedAt ? formatTime(c.addedAt) : "—"}
+                            </td>
+                          </tr>
+                        );
+                      })}
+                    </tbody>
+                  </table>
+                </div>
+              )}
+            </section>
+          );
+        })}
+
+        {!strategyOrder.length && (
+          <div className="rounded-3xl border border-dashed border-neutral-300 bg-white px-6 py-16 text-center text-sm text-neutral-500">
+            Select strategies in Configure. Watch starts automatically when the
+            market is open.
+          </div>
+        )}
       </div>
+
+      <p className="mt-6 text-[11px] text-neutral-400">
+        Click a column header to sort (same sort applies to every strategy
+        table). Selecting a strategy backfills full F&amp;O using today&apos;s
+        bars from the open. Signal = first entry bar today; % chg = session day
+        move; Rvol = annualized realized vol. Rows stay once matched (sticky).
+      </p>
     </div>
   );
 }

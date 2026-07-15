@@ -41,6 +41,7 @@ import {
   scanResultsAvailable,
 } from "@/lib/firebase/scan-results";
 import { useAuth } from "@/lib/firebase/auth-context";
+import { useSavedStrategies } from "@/lib/hooks/use-saved-strategies";
 import type {
   BacktestResult,
   Candle,
@@ -142,6 +143,7 @@ export function BacktestApp() {
   /** F&O report loaded from cloud (no Upstox this run) */
   const [scanFromCache, setScanFromCache] = useState(false);
   const { user } = useAuth();
+  const { saved: savedStrategies } = useSavedStrategies();
   /** Days that completed without fetch/backtest errors (safe to upload) */
   const okDaysRef = useRef<Set<string>>(new Set());
 
@@ -185,6 +187,29 @@ export function BacktestApp() {
         })
       );
     }
+  }
+
+  function applyStrategyPick(key: string) {
+    if (key.startsWith("saved:")) {
+      const id = key.slice("saved:".length);
+      const row = savedStrategies.find((s) => s.id === id);
+      if (row?.strategy) loadStrategy(row.strategy);
+      return;
+    }
+    if (key.startsWith("preset:")) {
+      applyPreset(key.slice("preset:".length));
+    }
+  }
+
+  function strategySelectValue(s: StrategyConfig): string {
+    const saved = savedStrategies.find(
+      (row) => row.name === s.name || row.strategy?.name === s.name
+    );
+    if (saved) return `saved:${saved.id}`;
+    if (STRATEGY_PRESETS.some((p) => p.name === s.name)) {
+      return `preset:${s.name}`;
+    }
+    return "custom";
   }
 
   function loadStrategy(s: StrategyConfig) {
@@ -1245,15 +1270,29 @@ export function BacktestApp() {
                 Strategy
               </h2>
               <select
-                defaultValue={PRESET_OPENING_RANGE_EMA.name}
-                onChange={(e) => applyPreset(e.target.value)}
+                value={strategySelectValue(strategy)}
+                onChange={(e) => applyStrategyPick(e.target.value)}
                 className="rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-black"
               >
-                {STRATEGY_PRESETS.map((p) => (
-                  <option key={p.name} value={p.name}>
-                    Preset: {p.name}
-                  </option>
-                ))}
+                <optgroup label="Presets">
+                  {STRATEGY_PRESETS.map((p) => (
+                    <option key={p.name} value={`preset:${p.name}`}>
+                      {p.name}
+                    </option>
+                  ))}
+                </optgroup>
+                {savedStrategies.length > 0 && (
+                  <optgroup label="Your strategies">
+                    {savedStrategies.map((s) => (
+                      <option key={s.id} value={`saved:${s.id}`}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {strategySelectValue(strategy) === "custom" && (
+                  <option value="custom">{strategy.name} (current)</option>
+                )}
               </select>
             </div>
 

@@ -18,6 +18,7 @@ import {
 } from "@/lib/http";
 import { sessionStatus } from "@/lib/paper/market-hours";
 import { useAuth } from "@/lib/firebase/auth-context";
+import { useSavedStrategies } from "@/lib/hooks/use-saved-strategies";
 import type {
   EntryTimeWindow,
   Interval,
@@ -77,6 +78,7 @@ type SafeSession = {
  */
 export function PaperTradingApp() {
   const { user } = useAuth();
+  const { saved: savedStrategies } = useSavedStrategies();
   const [upstoxToken, setUpstoxToken] = useState("");
   const [showToken, setShowToken] = useState(false);
   const [barInterval, setBarInterval] = useState<Interval>("5m");
@@ -291,11 +293,38 @@ export function PaperTradingApp() {
     });
   }
 
-  function applyPreset(name: string, slot: 1 | 2 = 1) {
-    const next = clonePreset(name);
-    if (!next) return;
-    if (slot === 1) setStrategy(next);
-    else setStrategy2(next);
+  /** Select value: `preset:Name` | `saved:id` | `custom` (edited / not in list) */
+  function strategySelectValue(
+    s: StrategyConfig,
+    slot: 1 | 2
+  ): string {
+    const saved = savedStrategies.find(
+      (row) =>
+        row.name === s.name ||
+        row.strategy?.name === s.name
+    );
+    if (saved) return `saved:${saved.id}`;
+    if (STRATEGY_PRESETS.some((p) => p.name === s.name)) {
+      return `preset:${s.name}`;
+    }
+    return `custom:${slot}`;
+  }
+
+  function applyStrategyPick(key: string, slot: 1 | 2 = 1) {
+    if (key.startsWith("saved:")) {
+      const id = key.slice("saved:".length);
+      const row = savedStrategies.find((s) => s.id === id);
+      if (row?.strategy) loadStrategy(row.strategy, slot);
+      return;
+    }
+    if (key.startsWith("preset:")) {
+      const name = key.slice("preset:".length);
+      const next = clonePreset(name);
+      if (!next) return;
+      if (slot === 1) setStrategy(next);
+      else setStrategy2(next);
+      return;
+    }
   }
 
   function loadStrategy(s: StrategyConfig, slot: 1 | 2 = 1) {
@@ -920,14 +949,29 @@ export function PaperTradingApp() {
               <select
                 className="field-input mb-3"
                 disabled={running}
-                value={strategy.name}
-                onChange={(e) => applyPreset(e.target.value, 1)}
+                value={strategySelectValue(strategy, 1)}
+                onChange={(e) => applyStrategyPick(e.target.value, 1)}
               >
-                {STRATEGY_PRESETS.map((p) => (
-                  <option key={p.name} value={p.name}>
-                    {p.name}
-                  </option>
-                ))}
+                <optgroup label="Presets">
+                  {STRATEGY_PRESETS.map((p) => (
+                    <option key={p.name} value={`preset:${p.name}`}>
+                      {p.name}
+                    </option>
+                  ))}
+                </optgroup>
+                {savedStrategies.length > 0 && (
+                  <optgroup label="Your strategies (from Backtest)">
+                    {savedStrategies.map((s) => (
+                      <option key={s.id} value={`saved:${s.id}`}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {!STRATEGY_PRESETS.some((p) => p.name === strategy.name) &&
+                  !savedStrategies.some((s) => s.name === strategy.name) && (
+                    <option value="custom:1">{strategy.name} (current)</option>
+                  )}
               </select>
               <Field label="Name">
                 <input
@@ -1009,14 +1053,31 @@ export function PaperTradingApp() {
                 <select
                   className="field-input mb-3"
                   disabled={running}
-                  value={strategy2.name}
-                  onChange={(e) => applyPreset(e.target.value, 2)}
+                  value={strategySelectValue(strategy2, 2)}
+                  onChange={(e) => applyStrategyPick(e.target.value, 2)}
                 >
-                  {STRATEGY_PRESETS.map((p) => (
-                    <option key={p.name} value={p.name}>
-                      {p.name}
-                    </option>
-                  ))}
+                  <optgroup label="Presets">
+                    {STRATEGY_PRESETS.map((p) => (
+                      <option key={p.name} value={`preset:${p.name}`}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                  {savedStrategies.length > 0 && (
+                    <optgroup label="Your strategies (from Backtest)">
+                      {savedStrategies.map((s) => (
+                        <option key={s.id} value={`saved:${s.id}`}>
+                          {s.name}
+                        </option>
+                      ))}
+                    </optgroup>
+                  )}
+                  {!STRATEGY_PRESETS.some((p) => p.name === strategy2.name) &&
+                    !savedStrategies.some((s) => s.name === strategy2.name) && (
+                      <option value="custom:2">
+                        {strategy2.name} (current)
+                      </option>
+                    )}
                 </select>
                 <Field label="Name">
                   <input
