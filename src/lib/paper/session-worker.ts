@@ -40,8 +40,11 @@ import type {
  * Dual options = 2 pricers/symbol — keep small so a tick finishes within
  * serverless maxDuration and actually persists strategyResults.
  */
-const MAX_SYMBOLS_HARD = process.env.VERCEL ? 20 : 80;
-const MAX_SYMBOLS_DUAL_OPTIONS = process.env.VERCEL ? 10 : 40;
+const MAX_SYMBOLS_HARD = process.env.VERCEL ? 16 : 80;
+const MAX_SYMBOLS_DUAL_OPTIONS = process.env.VERCEL ? 6 : 30;
+
+/** Soft-lock max age: if a tick heartbeated then died, allow a new one after this */
+const IN_PROGRESS_LOCK_MS = 180_000;
 
 /** In-process lock so concurrent status/cron kicks don't double-run one session */
 const tickInFlight = new Set<string>();
@@ -234,10 +237,11 @@ async function processPaperSessionInner(
   }
 
   const now = Date.now();
-  // Soft lock: another instance started a tick recently — skip (cron + status race)
+  // Soft lock: another instance started a tick recently — skip (cron + status race).
+  // Expire after IN_PROGRESS_LOCK_MS so a killed mid-tick cannot stall forever.
   if (
     doc.lastWorkerAt &&
-    now - doc.lastWorkerAt < 35_000 &&
+    now - doc.lastWorkerAt < IN_PROGRESS_LOCK_MS &&
     /tick in progress/i.test(String(doc.workerNote || ""))
   ) {
     return doc;
@@ -274,19 +278,80 @@ async function processPaperSessionInner(
     });
     // Refresh doc.eventLog for final merge
     doc = (await getSession(doc.userId, sessionId, { preferCloud: true })) || doc;
-  } catch {
-    /* continue even if heartbeat write fails */
+  } catch (e) {
+    console.error("[paper-worker] heartbeat failed:", e);
   }
 
   try {
     const cfg = doc.config;
     const strats = strategiesForConfig(cfg);
     const dual = strats.length > 1;
-    const universe = await listFnoEquitySymbols();
+    if (!strats.length) {
+      const line = asciiSafe(
+        `${new Date().toLocaleTimeString("en-IN")} · Tick aborted — no strategies on session config`,
+        400
+      );
+      return await updateSession(sessionId, {
+        userId: doc.userId,
+        lastWorkerAt: Date.now(),
+        lastError: "No strategies in session config",
+        workerNote: "No strategies configured",
+        eventLog: [line, ...(doc.eventLog || [])].slice(0, 40),
+      });
+    }
+
+    let universe: Awaited<ReturnType<typeof listFnoEquitySymbols>> = [];
+    try {
+      universe = await listFnoEquitySymbols();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const line = asciiSafe(
+        `${new Date().toLocaleTimeString("en-IN")} · F&O universe load failed: ${msg.slice(0, 120)}`,
+        400
+      );
+      return await updateSession(sessionId, {
+        userId: doc.userId,
+        lastWorkerAt: Date.now(),
+        lastError: msg.slice(0, 300),
+        workerNote: "F&O universe load failed",
+        eventLog: [line, ...(doc.eventLog || [])].slice(0, 40),
+      });
+    }
+
     // Full universe when scanAll; otherwise first maxSymbols (still rotate if > batch)
     const fullList = cfg.scanAll
       ? universe
       : universe.slice(0, Math.min(universe.length, Math.max(5, cfg.maxSymbols || 30)));
+
+    if (!fullList.length) {
+      const line = asciiSafe(
+        `${new Date().toLocaleTimeString("en-IN")} · Tick #${(doc.tickCount || 0) + 1} — F&O universe empty (retry next tick)`,
+        400
+      );
+      return await updateSession(sessionId, {
+        userId: doc.userId,
+        lastWorkerAt: Date.now(),
+        lastError: "F&O universe empty",
+        workerNote: "F&O universe empty — will retry",
+        eventLog: [line, ...(doc.eventLog || [])].slice(0, 40),
+        tickCount: (doc.tickCount || 0) + 1,
+      });
+    }
+
+    const token = sanitizeToken(doc.upstoxAccessToken);
+    if (!token) {
+      const line = asciiSafe(
+        `${new Date().toLocaleTimeString("en-IN")} · Tick aborted — missing Upstox access token on session`,
+        400
+      );
+      return await updateSession(sessionId, {
+        userId: doc.userId,
+        lastWorkerAt: Date.now(),
+        lastError: "Missing Upstox token",
+        workerNote: "Paste Upstox token and start again",
+        eventLog: [line, ...(doc.eventLog || [])].slice(0, 40),
+      });
+    }
 
     const hardCap =
       dual && cfg.tradeInstrument === "options_atm"
@@ -310,7 +375,6 @@ async function processPaperSessionInner(
         ? ((offset + list.length - 1) % fullList.length) + 1
         : 0;
 
-    const token = sanitizeToken(doc.upstoxAccessToken);
     // Block entries before cash open (warmup bars still used for indicators)
     const entryNotBeforeMs = Date.parse(`${today}T09:15:00+05:30`);
     // Fallback if parse fails
@@ -735,15 +799,24 @@ async function processPaperSessionInner(
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : "worker failed";
+    console.error("[paper-worker] tick error:", msg);
     const latest = await getSession(doc.userId, sessionId, {
       preferCloud: true,
     });
     if (latest && latest.status !== "running") return latest;
+    const line = asciiSafe(
+      `${new Date().toLocaleTimeString("en-IN")} · Tick failed: ${msg.slice(0, 160)}`,
+      400
+    );
     return await updateSession(sessionId, {
       userId: doc.userId,
       lastWorkerAt: Date.now(),
-      lastError: msg,
-      workerNote: msg,
+      lastError: msg.slice(0, 400),
+      workerNote: `Tick failed: ${msg.slice(0, 120)}`,
+      eventLog: [line, ...(latest?.eventLog || doc.eventLog || [])].slice(
+        0,
+        40
+      ),
     });
   }
 }

@@ -263,6 +263,43 @@ export function PaperTradingApp() {
     void refreshStatus();
   }, [user, refreshStatus]);
 
+  /**
+   * Run one server tick and apply session snapshot.
+   * Browser-driven so Vercel doesn't depend only on unreliable after()/cron.
+   */
+  const runPaperTick = useCallback(
+    async (sessionId: string) => {
+      const token = await idToken();
+      if (!token || !sessionId) return;
+      try {
+        const res = await paperFetch("/api/paper/session/tick", {
+          method: "POST",
+          token,
+          body: { sessionId, idToken: token },
+        });
+        const data = await parseApiJson<{
+          error?: string;
+          session?: SafeSession | null;
+          skipped?: boolean;
+          reason?: string;
+        }>(res);
+        if (!res.ok) {
+          if (data.error) setError(data.error);
+          return;
+        }
+        if (data.session) {
+          setSession(data.session);
+          if (data.session.status === "running" && data.session.id) {
+            rememberSessionId(data.session.id);
+          }
+        }
+      } catch (e) {
+        console.warn("[paper-tick]", e);
+      }
+    },
+    [user]
+  );
+
   // Poll status while session running (UI only — work is on server)
   useEffect(() => {
     if ((!running && !knownSessionId) || !user) {
@@ -277,6 +314,42 @@ export function PaperTradingApp() {
       if (pollRef.current) clearInterval(pollRef.current);
     };
   }, [running, knownSessionId, user, refreshStatus]);
+
+  // Drive paper ticks from the browser (status after() alone is not enough on Vercel)
+  useEffect(() => {
+    if (!running || !user) return;
+    const sid =
+      session?.id ||
+      knownSessionId ||
+      (typeof window !== "undefined"
+        ? localStorage.getItem("tp_paper_session_id")
+        : null);
+    if (!sid) return;
+
+    let cancelled = false;
+    let tickBusy = false;
+
+    const kick = async () => {
+      if (cancelled || tickBusy) return;
+      tickBusy = true;
+      try {
+        await runPaperTick(sid);
+      } finally {
+        tickBusy = false;
+      }
+    };
+
+    // First tick soon after start / page open
+    const t0 = window.setTimeout(() => void kick(), 800);
+    // Dual options ticks often run 1–3 min; interval only starts next when free
+    const t = window.setInterval(() => void kick(), 70_000);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(t0);
+      window.clearInterval(t);
+    };
+  }, [running, user, session?.id, knownSessionId, runPaperTick]);
 
   useEffect(() => {
     const t = setInterval(() => setStatusLine(sessionStatus().label), 30_000);
@@ -465,6 +538,12 @@ export function PaperTradingApp() {
       }
       // Pull latest from server by sessionId (state update is async)
       await refreshStatus(data.sessionId || null);
+      // First real tick in-request (do not rely on after()) — may take 1–3 min
+      if (data.sessionId) {
+        setBusy(false);
+        void runPaperTick(data.sessionId);
+        return;
+      }
     } catch (e) {
       setError(safeErrorMessage(e) || "Start failed");
     } finally {
@@ -629,9 +708,27 @@ export function PaperTradingApp() {
                 )}
                 {workerStale && (
                   <p className="mt-1 rounded-lg bg-amber-50 px-2 py-1 text-[11px] text-amber-900">
-                    No server tick for 3+ minutes. Keep this tab open or wait for
-                    the 1-min cron; check Upstox token / rate limits in the log.
+                    No completed tick for 3+ minutes. Keep this tab open (browser
+                    drives ticks). Check Upstox token and Server log for errors.
                   </p>
+                )}
+                {running && (
+                  <button
+                    type="button"
+                    disabled={busy}
+                    onClick={() => {
+                      const sid =
+                        session?.id ||
+                        knownSessionId ||
+                        (typeof window !== "undefined"
+                          ? localStorage.getItem("tp_paper_session_id")
+                          : null);
+                      if (sid) void runPaperTick(sid);
+                    }}
+                    className="mt-2 rounded-full border border-neutral-300 px-3 py-1 text-[11px] font-medium hover:border-black disabled:opacity-50"
+                  >
+                    Run tick now
+                  </button>
                 )}
                 {session?.lastBatch && session.lastBatch.universeSize > 0 && (
                   <p className="mt-1 text-[11px] text-neutral-600">

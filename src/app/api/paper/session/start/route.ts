@@ -220,7 +220,9 @@ export async function POST(req: NextRequest) {
       return jsonError(saved.error || "Failed to save session", 500);
     }
 
-    // Keep working after the HTTP response (Vercel/serverless-safe)
+    // Best-effort background kick (may not finish on all hosts).
+    // Client also calls /api/paper/session/tick right after start — that is the
+    // reliable path for dual options.
     after(async () => {
       try {
         const { processPaperSession } = await import(
@@ -238,8 +240,9 @@ export async function POST(req: NextRequest) {
       endsAt,
       durable: saved.durable,
       session: toPublicSession(doc),
+      kickTick: true,
       note: saved.durable
-        ? "Paper session saved. Status updates on Refresh / poll; first tick runs in background."
+        ? "Paper session saved. Keep the Paper tab open — browser runs ticks and writes server log lines."
         : "Session is memory-only (not durable across instances).",
     });
   } catch (e) {
