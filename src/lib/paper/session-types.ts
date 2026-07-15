@@ -94,12 +94,13 @@ export function strategiesForConfig(cfg: PaperSessionConfig): {
     options?: OptionsTradeSettings;
     slot: 1 | 2;
   }[] = [{ strategy: cfg.strategy, options: cfg.options, slot: 1 }];
-  if (
-    cfg.strategy2?.entry?.length &&
-    cfg.strategy2?.exit?.length
-  ) {
+  // Strategy 2: entry required; exit optional (empty exit = hold until day end)
+  if (cfg.strategy2?.entry?.length) {
     list.push({
-      strategy: cfg.strategy2,
+      strategy: {
+        ...cfg.strategy2,
+        exit: cfg.strategy2.exit?.length ? cfg.strategy2.exit : [],
+      },
       options: cfg.options2 ?? cfg.options,
       slot: 2,
     });

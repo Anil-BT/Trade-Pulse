@@ -19,7 +19,8 @@ import { uid } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 60;
+/** First tick runs in after() — allow dual-strategy option batch */
+export const maxDuration = 300;
 
 function sessionEndsAtMs(): number {
   const today = todayIst();
@@ -117,9 +118,9 @@ export async function POST(req: NextRequest) {
       return jsonError("Strategy 1 entry and exit required", 400);
     }
     if (config.strategy2) {
-      if (!config.strategy2.entry?.length || !config.strategy2.exit?.length) {
+      if (!config.strategy2.entry?.length) {
         return jsonError(
-          "Strategy 2 needs entry and exit conditions (or disable dual strategy).",
+          "Strategy 2 needs entry conditions (or disable dual strategy).",
           400
         );
       }

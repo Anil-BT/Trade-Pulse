@@ -66,31 +66,58 @@ export function compactSession(doc: {
   eventLog?: string[];
   [k: string]: unknown;
 }): typeof doc {
-  const MAX_ROWS = 250;
+  const MAX_ROWS = 200;
   const MAX_LOG = 30;
+  const MAX_TRADES_PER_ROW = 8;
+
+  const trimRow = (row: unknown): unknown => {
+    if (!row || typeof row !== "object") return row;
+    const r = row as Record<string, unknown>;
+    const list = r.tradeList;
+    if (!Array.isArray(list) || list.length <= MAX_TRADES_PER_ROW) return r;
+    return {
+      ...r,
+      tradeList: list.slice(-MAX_TRADES_PER_ROW),
+      tradeListTruncated: list.length,
+    };
+  };
 
   const trimReport = <T extends { rows?: unknown[] }>(r: T | null | undefined) => {
     if (!r) return r;
-    if (Array.isArray(r.rows) && r.rows.length > MAX_ROWS) {
-      return { ...r, rows: r.rows.slice(0, MAX_ROWS) };
+    let rows = Array.isArray(r.rows) ? r.rows.map(trimRow) : r.rows;
+    if (Array.isArray(rows) && rows.length > MAX_ROWS) {
+      // Prefer rows with trades / opens first, then fill
+      const scored = [...rows].sort((a, b) => {
+        const ar = a as { trades?: number; message?: string };
+        const br = b as { trades?: number; message?: string };
+        const as =
+          (Number(ar.trades) || 0) * 10 +
+          (String(ar.message || "").includes("OPEN") ? 5 : 0);
+        const bs =
+          (Number(br.trades) || 0) * 10 +
+          (String(br.message || "").includes("OPEN") ? 5 : 0);
+        return bs - as;
+      });
+      rows = scored.slice(0, MAX_ROWS);
     }
-    return r;
+    return { ...r, rows };
   };
 
   return {
     ...doc,
     report: trimReport(doc.report as { rows?: unknown[] }) as typeof doc.report,
     openPositions: Array.isArray(doc.openPositions)
-      ? doc.openPositions.slice(0, 100)
+      ? doc.openPositions.slice(0, 120)
       : doc.openPositions,
     eventLog: Array.isArray(doc.eventLog)
       ? doc.eventLog.slice(0, MAX_LOG).map((l) => asciiSafe(l, 400))
       : doc.eventLog,
     strategyResults: Array.isArray(doc.strategyResults)
       ? doc.strategyResults.map((sr) => ({
-          ...sr,
+          strategyName: sr.strategyName,
+          slot: sr.slot,
           report: trimReport(sr.report) as typeof sr.report,
-          openPositions: (sr.openPositions || []).slice(0, 100),
+          openPositions: (sr.openPositions || []).slice(0, 80),
         }))
       : doc.strategyResults,
   };

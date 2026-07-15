@@ -12,7 +12,8 @@ import {
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-export const maxDuration = 60;
+/** Worker ticks run in after() — dual options need >60s on Vercel */
+export const maxDuration = 300;
 
 async function handleStatus(
   req: NextRequest,
@@ -59,7 +60,8 @@ async function handleStatus(
       const sid = doc.id;
       const uid = user.uid;
       const last = doc.lastWorkerAt || 0;
-      if (Date.now() - last > 45_000) {
+      // Kick a tick if idle >40s (cron also runs every minute)
+      if (Date.now() - last > 40_000) {
         after(async () => {
           try {
             const { processPaperSession } = await import(

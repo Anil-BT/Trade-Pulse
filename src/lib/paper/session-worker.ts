@@ -35,8 +35,16 @@ import type {
   StrategyConfig,
 } from "../types";
 
-/** Max symbols per worker tick. Smaller on Vercel so the tick finishes and saves. */
-const MAX_SYMBOLS_HARD = process.env.VERCEL ? 25 : 80;
+/**
+ * Max symbols per worker tick.
+ * Dual options = 2 pricers/symbol — keep small so a tick finishes within
+ * serverless maxDuration and actually persists strategyResults.
+ */
+const MAX_SYMBOLS_HARD = process.env.VERCEL ? 20 : 80;
+const MAX_SYMBOLS_DUAL_OPTIONS = process.env.VERCEL ? 10 : 40;
+
+/** In-process lock so concurrent status/cron kicks don't double-run one session */
+const tickInFlight = new Set<string>();
 
 function findSessionInMem(sessionId: string): PaperSessionDoc | null {
   const g = globalThis as { __paperSessions?: Map<string, PaperSessionDoc> };
@@ -183,6 +191,22 @@ export async function processPaperSession(
   sessionId: string,
   userIdHint?: string
 ): Promise<PaperSessionDoc | null> {
+  if (tickInFlight.has(sessionId)) {
+    return findSessionInMem(sessionId);
+  }
+  tickInFlight.add(sessionId);
+
+  try {
+    return await processPaperSessionInner(sessionId, userIdHint);
+  } finally {
+    tickInFlight.delete(sessionId);
+  }
+}
+
+async function processPaperSessionInner(
+  sessionId: string,
+  userIdHint?: string
+): Promise<PaperSessionDoc | null> {
   // Always prefer cloud status — warm mem often still says "running" after Stop
   let doc: PaperSessionDoc | null = null;
   if (userIdHint) {
@@ -210,6 +234,15 @@ export async function processPaperSession(
   }
 
   const now = Date.now();
+  // Soft lock: another instance started a tick recently — skip (cron + status race)
+  if (
+    doc.lastWorkerAt &&
+    now - doc.lastWorkerAt < 35_000 &&
+    /tick in progress/i.test(String(doc.workerNote || ""))
+  ) {
+    return doc;
+  }
+
   if (now > doc.endsAt) {
     await setSessionStatus(sessionId, "ended", {
       workerNote: "Auto-stopped at session end (15:30 IST)",
@@ -227,16 +260,32 @@ export async function processPaperSession(
     return getSession(doc.userId, sessionId);
   }
 
+  // Heartbeat so UI shows "running" and concurrent kicks back off
+  try {
+    await updateSession(sessionId, {
+      userId: doc.userId,
+      lastWorkerAt: now,
+      workerNote: "Server tick in progress…",
+    });
+  } catch {
+    /* continue even if heartbeat write fails */
+  }
+
   try {
     const cfg = doc.config;
     const strats = strategiesForConfig(cfg);
+    const dual = strats.length > 1;
     const universe = await listFnoEquitySymbols();
     // Full universe when scanAll; otherwise first maxSymbols (still rotate if > batch)
     const fullList = cfg.scanAll
       ? universe
       : universe.slice(0, Math.min(universe.length, Math.max(5, cfg.maxSymbols || 30)));
 
-    const batchSize = Math.min(MAX_SYMBOLS_HARD, fullList.length || 1);
+    const hardCap =
+      dual && cfg.tradeInstrument === "options_atm"
+        ? MAX_SYMBOLS_DUAL_OPTIONS
+        : MAX_SYMBOLS_HARD;
+    const batchSize = Math.min(hardCap, fullList.length || 1);
     const offset =
       fullList.length > 0
         ? (doc.rotationOffset || 0) % fullList.length
@@ -619,8 +668,12 @@ export async function processPaperSession(
         ),
       0
     );
+    const stratNames = strats
+      .map((s) => s.strategy.name || `S${s.slot}`)
+      .join(" + ");
     const logLine =
       `${new Date().toLocaleTimeString("en-IN")} · Tick #${(doc.tickCount || 0) + 1} · ` +
+      `${dual ? `dual [${stratNames}]` : stratNames} · ` +
       `batch ${offset + 1}–${Math.min(offset + list.length, fullList.length)} of ${fullList.length}` +
       ` (${list.length} this tick) · covered ${covered}/${fullList.length} · ` +
       `~${cycles} min/full cycle · trades ${tradeSum} · open ${openCount} · signals ${signalSum}` +
@@ -664,11 +717,12 @@ export async function processPaperSession(
         ? `Rate limited on ${rateLimited} symbol(s) this tick — session continues; those names retry next cycle`
         : undefined,
       workerNote:
-        fullList.length > batchSize
-          ? `Rotating F&O: ${covered}/${fullList.length} symbols touched · next batch @ index ${advancedOffset} · ~${cycles} min per full pass`
+        (dual ? `Dual: ${stratNames}. ` : "") +
+        (fullList.length > batchSize
+          ? `Rotating F&O: ${covered}/${fullList.length} symbols · next @ ${advancedOffset} · ~${cycles} min/full pass · ${strats.length} strateg${strats.length === 1 ? "y" : "ies"}`
           : isNseSessionOpen()
             ? "Server worker running — browser/logout does not stop this session"
-            : "Outside market hours — session held until stop or 15:30 end",
+            : "Outside market hours — session held until stop or 15:30 end"),
       eventLog,
       tickCount: (doc.tickCount || 0) + 1,
     });

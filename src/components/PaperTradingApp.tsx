@@ -367,9 +367,9 @@ export function PaperTradingApp() {
       return;
     }
     if (dualStrategy) {
-      if (!strategy2.entry.length || !strategy2.exit.length) {
+      if (!strategy2.entry.length) {
         setError(
-          "Strategy 2 needs entry and exit conditions (or turn dual off)."
+          "Strategy 2 needs entry conditions (or turn dual off)."
         );
         return;
       }
@@ -557,6 +557,11 @@ export function PaperTradingApp() {
         : [];
   const openPositions = session?.openPositions || [];
   const eventLog = session?.eventLog || [];
+  const dualFromSession = Boolean(session?.config?.strategy2?.name);
+  const workerStale =
+    running &&
+    session?.lastWorkerAt != null &&
+    Date.now() - session.lastWorkerAt > 3 * 60_000;
 
   return (
     <div className="mx-auto max-w-6xl px-5 pb-24 pt-10 sm:px-8">
@@ -611,12 +616,35 @@ export function PaperTradingApp() {
                       : ""}
                   </p>
                 )}
+                {(dualFromSession || dualStrategy) && (
+                  <p className="mt-1 text-[11px] font-medium text-neutral-800">
+                    Dual strategies:{" "}
+                    {session?.config?.strategy?.name || strategy.name}
+                    {" + "}
+                    {session?.config?.strategy2?.name || strategy2.name}
+                    {strategyResults.length
+                      ? ` · ${strategyResults.length} result book(s)`
+                      : " · waiting for first tick…"}
+                  </p>
+                )}
+                {workerStale && (
+                  <p className="mt-1 rounded-lg bg-amber-50 px-2 py-1 text-[11px] text-amber-900">
+                    No server tick for 3+ minutes. Keep this tab open or wait for
+                    the 1-min cron; check Upstox token / rate limits in the log.
+                  </p>
+                )}
                 {session?.lastBatch && session.lastBatch.universeSize > 0 && (
                   <p className="mt-1 text-[11px] text-neutral-600">
                     Rotating universe: batch index {session.lastBatch.fromIndex}{" "}
                     · {session.lastBatch.universeSize} F&amp;O names · ~
-                    {Math.ceil(session.lastBatch.universeSize / 80)} min for a
-                    full pass
+                    {Math.ceil(
+                      session.lastBatch.universeSize /
+                        Math.max(
+                          1,
+                          dualFromSession || dualStrategy ? 10 : 20
+                        )
+                    )}{" "}
+                    min for a full pass
                     {session.lastBatch.rateLimited
                       ? ` · ${session.lastBatch.rateLimited} rate-limited (retry next cycle)`
                       : ""}
@@ -1150,14 +1178,14 @@ export function PaperTradingApp() {
         {openPositions.length > 0 && (
           <section className="rounded-3xl border border-neutral-200 bg-white p-6">
             <h2 className="mb-1 text-sm font-medium tracking-wide text-neutral-500 uppercase">
-              Open paper positions (all strategies)
+              Open paper positions
+              {dualFromSession || strategyResults.length > 1
+                ? " (both strategies)"
+                : ""}
             </h2>
             <p className="mb-4 text-xs text-neutral-500">
-              <strong>uP&amp;L</strong> = unrealized P&amp;L (mark − entry) × qty.
-              Options use <strong>strict market pricing only</strong>: Entry =
-              Upstox option candle premium; Mark = live <strong>LTP</strong> when
-              available. No Black–Scholes. Signals without market data are
-              skipped.
+              Label starts with the strategy name. <strong>uP&amp;L</strong> =
+              (mark − entry) × qty. Options: strict market premium / LTP only.
             </p>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[720px] text-sm">
@@ -1249,19 +1277,52 @@ export function PaperTradingApp() {
           </section>
         )}
 
-        {strategyResults.map((sr) => (
-          <div key={`${sr.slot}-${sr.strategyName}`} className="space-y-2">
-            <p className="px-1 text-sm font-semibold text-neutral-800">
-              Results · Strategy {sr.slot}: {sr.strategyName}
-            </p>
-            <ScanReportView
-              report={sr.report}
-              onClose={() => {
-                /* keep session report */
-              }}
-            />
-          </div>
-        ))}
+        {strategyResults.length > 0 && (
+          <section className="space-y-6">
+            <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
+              Per-strategy results
+              {strategyResults.length > 1
+                ? ` (${strategyResults.length} books)`
+                : ""}
+            </h2>
+            {strategyResults.map((sr) => (
+              <div
+                key={`${sr.slot}-${sr.strategyName}`}
+                className="space-y-2 rounded-3xl border border-neutral-200 bg-white p-4"
+              >
+                <div className="flex flex-wrap items-baseline justify-between gap-2 px-1">
+                  <p className="text-sm font-semibold text-neutral-800">
+                    Strategy {sr.slot}: {sr.strategyName}
+                  </p>
+                  <p className="text-xs text-neutral-500">
+                    {(sr.openPositions || []).length} open ·{" "}
+                    {sr.report?.summary?.totalTrades ?? 0} closed trades ·{" "}
+                    {sr.report?.scanned ?? 0} symbols scanned
+                  </p>
+                </div>
+                {sr.report ? (
+                  <ScanReportView
+                    report={sr.report}
+                    onClose={() => {
+                      /* keep session report */
+                    }}
+                  />
+                ) : (
+                  <p className="px-1 text-sm text-neutral-400">
+                    No report yet for this strategy — wait for next server tick.
+                  </p>
+                )}
+              </div>
+            ))}
+          </section>
+        )}
+
+        {running && !strategyResults.length && !openPositions.length && (
+          <p className="text-center text-sm text-neutral-400">
+            Session running — first dual/single results appear after a server
+            tick completes (often 30–90s). Watch the server log above.
+          </p>
+        )}
       </div>
     </div>
   );

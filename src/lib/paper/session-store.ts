@@ -695,7 +695,9 @@ export function toPublicSession(doc: PaperSessionDoc): Record<string, unknown> {
   const { upstoxAccessToken: _t, ...rest } = doc;
   try {
     return compactSession(rest as never) as Record<string, unknown>;
-  } catch {
+  } catch (e) {
+    console.error("[paper-session] toPublicSession compact failed:", e);
+    // Keep dual results + opens even if compact fails — UI must not drop them
     return {
       id: doc.id,
       status: doc.status,
@@ -707,12 +709,38 @@ export function toPublicSession(doc: PaperSessionDoc): Record<string, unknown> {
       lastError: doc.lastError,
       tickCount: doc.tickCount,
       lastBatch: doc.lastBatch,
+      lastWorkerAt: doc.lastWorkerAt,
+      rotationOffset: doc.rotationOffset,
       eventLog: (doc.eventLog || []).slice(0, 10),
+      openPositions: (doc.openPositions || []).slice(0, 80),
+      strategyResults: Array.isArray(doc.strategyResults)
+        ? doc.strategyResults.map((sr) => ({
+            strategyName: sr.strategyName,
+            slot: sr.slot,
+            openPositions: (sr.openPositions || []).slice(0, 40),
+            report: sr.report
+              ? {
+                  ...sr.report,
+                  rows: (sr.report.rows || []).slice(0, 80).map((row) => ({
+                    ...row,
+                    tradeList: (row.tradeList || []).slice(-5),
+                  })),
+                }
+              : sr.report,
+          }))
+        : [],
+      report: doc.report
+        ? {
+            ...doc.report,
+            rows: (doc.report.rows || []).slice(0, 80),
+          }
+        : null,
       config: {
         strategy: { name: doc.config?.strategy?.name },
         strategy2: doc.config?.strategy2
           ? { name: doc.config.strategy2.name }
           : undefined,
+        dual: Boolean(doc.config?.strategy2?.entry?.length),
       },
     };
   }
