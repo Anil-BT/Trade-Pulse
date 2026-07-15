@@ -1088,9 +1088,15 @@ export function PaperTradingApp() {
 
         {openPositions.length > 0 && (
           <section className="rounded-3xl border border-neutral-200 bg-white p-6">
-            <h2 className="mb-4 text-sm font-medium tracking-wide text-neutral-500 uppercase">
+            <h2 className="mb-1 text-sm font-medium tracking-wide text-neutral-500 uppercase">
               Open paper positions (all strategies)
             </h2>
+            <p className="mb-4 text-xs text-neutral-500">
+              <strong>uP&amp;L</strong> = unrealized profit &amp; loss (mark − entry)
+              × qty. In options mode Entry/Mark are{" "}
+              <em>option premiums</em> (model), not the stock price. Spot is
+              shown under each row when available.
+            </p>
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
                 <thead>
@@ -1102,25 +1108,56 @@ export function PaperTradingApp() {
                   </tr>
                 </thead>
                 <tbody>
-                  {openPositions.map((p, i) => (
-                    <tr
-                      key={`${p.label || p.symbol}-${p.entryTime}-${i}`}
-                      className="border-b border-neutral-100"
-                    >
-                      <td className="px-2 py-2 font-medium">
-                        {p.label || p.symbol}
-                      </td>
-                      <td className="px-2 py-2 text-right tabular-nums">
-                        {p.entryPrice.toFixed(2)}
-                      </td>
-                      <td className="px-2 py-2 text-right tabular-nums">
-                        {p.markPrice.toFixed(2)}
-                      </td>
-                      <td className="px-2 py-2 text-right tabular-nums">
-                        {formatMoney(p.unrealizedPnl)}
-                      </td>
-                    </tr>
-                  ))}
+                  {openPositions.map((p, i) => {
+                    const isOpt = Boolean(p.optionSide || p.strike);
+                    return (
+                      <tr
+                        key={`${p.label || p.symbol}-${p.entryTime}-${i}`}
+                        className="border-b border-neutral-100"
+                      >
+                        <td className="px-2 py-2 font-medium">
+                          <div>{p.label || p.symbol}</div>
+                          {isOpt && (
+                            <div className="mt-0.5 text-[11px] font-normal text-neutral-500">
+                              {p.optionSide || "OPT"}
+                              {p.strike != null ? ` ${p.strike}` : ""}
+                              {p.lots != null ? ` · ${p.lots} lot` : ""}
+                              {p.underlyingMark != null || p.underlyingEntry != null
+                                ? ` · spot ₹${(
+                                    p.underlyingMark ?? p.underlyingEntry
+                                  )!.toFixed(2)}`
+                                : ""}
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-2 py-2 text-right tabular-nums">
+                          <div>{p.entryPrice.toFixed(2)}</div>
+                          {isOpt && (
+                            <div className="text-[10px] text-neutral-400">
+                              prem
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-2 py-2 text-right tabular-nums">
+                          <div>{p.markPrice.toFixed(2)}</div>
+                          {isOpt && (
+                            <div className="text-[10px] text-neutral-400">
+                              prem
+                            </div>
+                          )}
+                        </td>
+                        <td
+                          className={`px-2 py-2 text-right tabular-nums font-medium ${
+                            p.unrealizedPnl >= 0
+                              ? "text-black"
+                              : "text-neutral-500"
+                          }`}
+                        >
+                          {formatMoney(p.unrealizedPnl)}
+                        </td>
+                      </tr>
+                    );
+                  })}
                 </tbody>
               </table>
             </div>

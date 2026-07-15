@@ -268,14 +268,26 @@ export interface DaySummary {
 /** Open paper/live leg (not yet exited). */
 export interface OpenPosition {
   entryTime: number;
+  /**
+   * Fill unit price: equity stock ₹, or option premium ₹ per unit.
+   * For options_atm this is premium, not the underlying stock price.
+   */
   entryPrice: number;
   qty: number;
   capitalUsed: number;
+  /** Underlying equity spot at entry (options mode) */
   underlyingEntry?: number;
+  /** Underlying equity spot at last mark (options mode) */
+  underlyingMark?: number;
   strike?: number;
   lots?: number;
+  lotSize?: number;
   optionSide?: "CE" | "PE";
+  /**
+   * Mark unit price in same units as entryPrice (premium for options).
+   */
   markPrice: number;
+  /** Unrealized P&L = (markPrice − entryPrice) × qty  (₹) */
   unrealizedPnl: number;
   symbol?: string;
   label?: string;

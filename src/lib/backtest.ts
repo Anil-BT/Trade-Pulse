@@ -230,12 +230,16 @@ export function runBacktest(
   if (positionQty > 0) {
     const last = candles[candles.length - 1];
     if (req.leaveOpenPositions) {
-      // Paper / live: keep leg open — mark-to-market on last bar for equity curve
-      const mark = last.close;
+      // Mark in *same units as entry*: equity = stock ₹, options = premium ₹
+      // (Never use underlying close as option mark — that inflated uP&L massively.)
+      const mark = markUnitPrice(last, tradeInstrument, optCfg, pricer, {
+        entryTime,
+        entryStrike,
+      });
       const unrealized = (mark - entryPrice) * positionQty;
       equityCurve[equityCurve.length - 1] = {
         time: last.time,
-        equity: cash + unrealized,
+        equity: cash + positionQty * mark,
       };
       openLeg = {
         entryTime,
@@ -243,8 +247,11 @@ export function runBacktest(
         qty: positionQty,
         capitalUsed: entryPrice * Math.abs(positionQty),
         underlyingEntry: entryUnderlying || undefined,
+        underlyingMark: last.close,
         strike: entryStrike || undefined,
         lots: entryLots || undefined,
+        lotSize:
+          tradeInstrument === "options_atm" ? optCfg.lotSize : undefined,
         optionSide: tradeInstrument === "options_atm" ? optCfg.side : undefined,
         markPrice: mark,
         unrealizedPnl: unrealized,
