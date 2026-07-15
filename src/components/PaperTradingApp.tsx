@@ -9,7 +9,7 @@ import {
   PRESET_OPENING_RANGE_EMA,
   PRESET_OR_EMA20_FIB_S3_PDL,
 } from "@/lib/presets";
-import { formatMoney, uid } from "@/lib/format";
+import { formatMoney, formatTime, uid } from "@/lib/format";
 import {
   cleanClientIdToken,
   parseApiJson,
@@ -1098,12 +1098,19 @@ export function PaperTradingApp() {
               shown under each row when available.
             </p>
             <div className="overflow-x-auto">
-              <table className="w-full text-sm">
+              <table className="w-full min-w-[720px] text-sm">
                 <thead>
                   <tr className="border-b text-xs text-neutral-500 uppercase">
                     <th className="px-2 py-2 text-left">Strategy / symbol</th>
+                    <th className="px-2 py-2 text-right">Strike</th>
                     <th className="px-2 py-2 text-right">Entry</th>
                     <th className="px-2 py-2 text-right">Mark</th>
+                    <th className="px-2 py-2 text-left whitespace-nowrap">
+                      Entry time
+                    </th>
+                    <th className="px-2 py-2 text-left whitespace-nowrap">
+                      Exit time
+                    </th>
                     <th className="px-2 py-2 text-right">uP&amp;L</th>
                   </tr>
                 </thead>
@@ -1120,15 +1127,25 @@ export function PaperTradingApp() {
                           {isOpt && (
                             <div className="mt-0.5 text-[11px] font-normal text-neutral-500">
                               {p.optionSide || "OPT"}
-                              {p.strike != null ? ` ${p.strike}` : ""}
                               {p.lots != null ? ` · ${p.lots} lot` : ""}
-                              {p.underlyingMark != null || p.underlyingEntry != null
+                              {p.underlyingMark != null ||
+                              p.underlyingEntry != null
                                 ? ` · spot ₹${(
                                     p.underlyingMark ?? p.underlyingEntry
                                   )!.toFixed(2)}`
                                 : ""}
                             </div>
                           )}
+                        </td>
+                        <td className="px-2 py-2 text-right tabular-nums text-neutral-700">
+                          {p.strike != null && Number.isFinite(p.strike)
+                            ? p.strike.toLocaleString("en-IN")
+                            : "—"}
+                          {p.optionSide ? (
+                            <span className="ml-1 text-[10px] text-neutral-400">
+                              {p.optionSide}
+                            </span>
+                          ) : null}
                         </td>
                         <td className="px-2 py-2 text-right tabular-nums">
                           <div>{p.entryPrice.toFixed(2)}</div>
@@ -1145,6 +1162,12 @@ export function PaperTradingApp() {
                               prem
                             </div>
                           )}
+                        </td>
+                        <td className="px-2 py-2 text-xs whitespace-nowrap text-neutral-600">
+                          {p.entryTime ? formatTime(p.entryTime) : "—"}
+                        </td>
+                        <td className="px-2 py-2 text-xs whitespace-nowrap text-neutral-400">
+                          Open
                         </td>
                         <td
                           className={`px-2 py-2 text-right tabular-nums font-medium ${
