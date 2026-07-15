@@ -21,6 +21,7 @@ import {
 import {
   computeSectorStrength,
   sectorOf,
+  symbolsInSector,
   type SectorStrength,
 } from "@/lib/watch/sectors";
 import { isNseSessionOpen, sessionStatus } from "@/lib/paper/market-hours";
@@ -161,11 +162,25 @@ function mergeQuotes(
   return next;
 }
 
+/** One row in the sector screener table (all F&O names in a sector). */
+type SectorStockRow = {
+  symbol: string;
+  price: number;
+  changePct?: number;
+  sector: string;
+  barTime: number;
+  rvol?: number;
+  /** True when this name has a live quote this session */
+  priced: boolean;
+  /** Strategy names that currently match (sticky) */
+  matchStrategies: string[];
+};
+
 /**
  * Multi-strategy F&O scanner (sortable tables).
  * - Config strategies once; runs while market open
  * - Sticky rows: once matched, stay until cleared
- * - Sector strength bars filter the tables
+ * - Click sector bar → full sector stock table (like screener)
  * - Click any column header to sort
  */
 export function MarketWatchApp() {
@@ -500,6 +515,49 @@ export function MarketWatchApp() {
 
   const quotesCovered = universeQuotes.size;
 
+  /** All F&O names in the selected sector (map + live quotes + match tags). */
+  const sectorStockRows: SectorStockRow[] = useMemo(() => {
+    if (!sectorFilter) return [];
+    const symbols = symbolsInSector(sectorFilter);
+    // Also include any quoted/matched names in this sector not in map (Others edge)
+    const extra = new Set<string>();
+    for (const q of universeQuotes.values()) {
+      if (sectorOf(q.symbol) === sectorFilter) extra.add(q.symbol);
+    }
+    for (const c of cells) {
+      if (c.sector === sectorFilter) extra.add(c.symbol);
+    }
+    const all = [
+      ...new Set([...symbols, ...extra].map((s) => s.toUpperCase())),
+    ].sort((a, b) => a.localeCompare(b));
+
+    const matchesBySym = new Map<string, string[]>();
+    const rvolBySym = new Map<string, number>();
+    for (const c of cells) {
+      if (c.sector !== sectorFilter) continue;
+      const list = matchesBySym.get(c.symbol) || [];
+      list.push(c.strategyName);
+      matchesBySym.set(c.symbol, list);
+      if (c.rvol != null && Number.isFinite(c.rvol)) {
+        rvolBySym.set(c.symbol, c.rvol);
+      }
+    }
+
+    return all.map((symbol) => {
+      const q = universeQuotes.get(symbol);
+      return {
+        symbol,
+        price: q?.price ?? 0,
+        changePct: q?.changePct,
+        sector: sectorFilter,
+        barTime: q?.barTime ?? 0,
+        rvol: rvolBySym.get(symbol),
+        priced: Boolean(q && q.price > 0),
+        matchStrategies: matchesBySym.get(symbol) || [],
+      };
+    });
+  }, [sectorFilter, universeQuotes, cells]);
+
   function toggleSort(key: SortKey) {
     if (sortKey === key) {
       setSortDir((d) => (d === "asc" ? "desc" : "asc"));
@@ -530,6 +588,38 @@ export function MarketWatchApp() {
       return a.symbol.localeCompare(b.symbol);
     });
   }
+
+  function sortSectorRows(list: SectorStockRow[]): SectorStockRow[] {
+    const dir = sortDir === "asc" ? 1 : -1;
+    const key: SortKey =
+      sortKey === "addedAt" ? "changePct" : sortKey;
+    return [...list].sort((a, b) => {
+      if (key === "symbol" || key === "sector") {
+        return dir * String(a[key] ?? "").localeCompare(String(b[key] ?? ""));
+      }
+      // Prefer priced names first when sorting by price / %
+      if (key === "price" || key === "changePct" || key === "barTime") {
+        if (a.priced !== b.priced) return a.priced ? -1 : 1;
+      }
+      const av = a[key as keyof SectorStockRow];
+      const bv = b[key as keyof SectorStockRow];
+      const an = Number(av);
+      const bn = Number(bv);
+      const aOk = Number.isFinite(an);
+      const bOk = Number.isFinite(bn);
+      if (!aOk && !bOk) return a.symbol.localeCompare(b.symbol);
+      if (!aOk) return 1;
+      if (!bOk) return -1;
+      if (an !== bn) return dir * (an - bn);
+      return a.symbol.localeCompare(b.symbol);
+    });
+  }
+
+  const sectorTableSorted = useMemo(
+    () => sortSectorRows(sectorStockRows),
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- sort via sortKey/sortDir
+    [sectorStockRows, sortKey, sortDir]
+  );
 
   const byStrategy = useMemo(() => {
     const map = new Map<string, StickyCell[]>();
@@ -581,10 +671,10 @@ export function MarketWatchApp() {
             Live strategy watch
           </h1>
           <p className="mt-2 text-sm leading-relaxed text-neutral-600">
-            Full F&amp;O universe rotates for sector strength. When you select a
-            strategy, the screener backfills the full universe using{" "}
-            <strong>today’s bars from the open</strong> (not only the last bar).
-            Click a sector bar to filter tables.
+            Full F&amp;O universe rotates for sector strength. Click a{" "}
+            <strong>sector bar</strong> for a stock table of every F&amp;O name
+            in that sector. Strategies backfill from{" "}
+            <strong>today’s open</strong> into sticky match tables below.
           </p>
           <p className="mt-2 text-xs text-neutral-500">
             {statusLine}
@@ -872,12 +962,176 @@ export function MarketWatchApp() {
           </ResponsiveContainer>
         </div>
         <p className="mt-2 text-[11px] text-neutral-400">
-          Horizontal scale = avg session day %. Bars use all F&amp;O stocks in
-          each sector (not strategy matches) — e.g. IT has TCS/INFY/…, FMCG has
-          HUL/ITC/…. Grey = none of that sector priced yet this cycle. Click a
-          bar to filter match tables.
+          Horizontal scale = avg session day %. Click a bar to open that
+          sector&apos;s stock table (all F&amp;O names in the sector). Grey =
+          none priced yet this cycle.
         </p>
       </section>
+
+      {/* Sector stock table — all F&O names in selected sector */}
+      {sectorFilter && (
+        <section className="mb-8 rounded-3xl border-2 border-neutral-900 bg-white p-5">
+          <div className="mb-3 flex flex-wrap items-baseline justify-between gap-2">
+            <div>
+              <h2 className="text-base font-semibold tracking-tight text-black">
+                {sectorFilter}
+              </h2>
+              <p className="mt-0.5 text-xs text-neutral-500">
+                {sectorTableSorted.length} F&amp;O stock
+                {sectorTableSorted.length === 1 ? "" : "s"}
+                {" · "}
+                {sectorTableSorted.filter((r) => r.priced).length} priced
+                {" · click headers to sort"}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => setSectorFilter(null)}
+              className="rounded-full border border-neutral-300 px-3 py-1.5 text-xs font-medium hover:border-black"
+            >
+              Close sector table
+            </button>
+          </div>
+
+          {sectorTableSorted.length === 0 ? (
+            <p className="py-8 text-center text-sm text-neutral-400">
+              No F&amp;O names mapped to {sectorFilter}.
+            </p>
+          ) : (
+            <div className="overflow-x-auto">
+              <table className="w-full min-w-[720px] text-sm">
+                <thead>
+                  <tr className="border-b border-neutral-200 text-left text-xs text-neutral-500 uppercase">
+                    {(
+                      [
+                        {
+                          key: "symbol" as const,
+                          label: "Stock",
+                          align: "left",
+                        },
+                        {
+                          key: "price" as const,
+                          label: "Price",
+                          align: "right",
+                        },
+                        {
+                          key: "changePct" as const,
+                          label: "% chg",
+                          align: "right",
+                        },
+                        {
+                          key: "sector" as const,
+                          label: "Sector",
+                          align: "left",
+                        },
+                        {
+                          key: "rvol" as const,
+                          label: "Rvol",
+                          align: "right",
+                        },
+                        {
+                          key: "barTime" as const,
+                          label: "Bar time",
+                          align: "left",
+                        },
+                      ] as const
+                    ).map((col) => {
+                      const active = sortKey === col.key;
+                      return (
+                        <th
+                          key={col.key}
+                          className={`px-3 py-2.5 font-medium ${
+                            col.align === "right" ? "text-right" : "text-left"
+                          }`}
+                        >
+                          <button
+                            type="button"
+                            onClick={() => toggleSort(col.key)}
+                            className={`inline-flex items-center gap-1 hover:text-black ${
+                              active ? "text-black" : ""
+                            } ${col.align === "right" ? "ml-auto" : ""}`}
+                          >
+                            {col.label}
+                            <span className="text-[10px] text-neutral-400">
+                              {active
+                                ? sortDir === "asc"
+                                  ? "▲"
+                                  : "▼"
+                                : "↕"}
+                            </span>
+                          </button>
+                        </th>
+                      );
+                    })}
+                    <th className="px-3 py-2.5 text-left font-medium">
+                      Strategy match
+                    </th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {sectorTableSorted.map((r) => {
+                    const ch = r.changePct;
+                    const chCls =
+                      ch == null
+                        ? "text-neutral-500"
+                        : ch >= 0
+                          ? "text-emerald-700"
+                          : "text-rose-600";
+                    return (
+                      <tr
+                        key={r.symbol}
+                        className={`border-b border-neutral-100 hover:bg-neutral-50/80 ${
+                          !r.priced ? "opacity-60" : ""
+                        }`}
+                      >
+                        <td className="px-3 py-2.5 font-semibold text-black whitespace-nowrap">
+                          {r.symbol}
+                        </td>
+                        <td className="px-3 py-2.5 text-right tabular-nums text-neutral-800">
+                          {r.priced
+                            ? `₹${r.price.toLocaleString("en-IN", {
+                                maximumFractionDigits: 2,
+                                minimumFractionDigits: 2,
+                              })}`
+                            : "—"}
+                        </td>
+                        <td
+                          className={`px-3 py-2.5 text-right tabular-nums font-medium ${chCls}`}
+                        >
+                          {ch != null
+                            ? `${ch >= 0 ? "+" : ""}${ch.toFixed(2)}%`
+                            : "—"}
+                        </td>
+                        <td className="px-3 py-2.5 text-neutral-700">
+                          {r.sector}
+                        </td>
+                        <td className="px-3 py-2.5 text-right tabular-nums text-neutral-700">
+                          {r.rvol != null ? `${r.rvol.toFixed(1)}%` : "—"}
+                        </td>
+                        <td className="px-3 py-2.5 text-xs whitespace-nowrap text-neutral-600">
+                          {r.barTime ? formatTime(r.barTime) : "—"}
+                        </td>
+                        <td className="px-3 py-2.5 text-xs text-neutral-600">
+                          {r.matchStrategies.length
+                            ? r.matchStrategies.join(", ")
+                            : r.priced
+                              ? "—"
+                              : "not scanned yet"}
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </div>
+          )}
+          <p className="mt-2 text-[11px] text-neutral-400">
+            Full F&amp;O list for this sector. Price / % update as the universe
+            rotates. Strategy match shows sticky signals if a selected strategy
+            fired today.
+          </p>
+        </section>
+      )}
 
       {/* Sortable tables — one per strategy */}
       <div className="space-y-8">
