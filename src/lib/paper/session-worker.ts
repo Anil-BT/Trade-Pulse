@@ -195,6 +195,10 @@ export async function processPaperSession(
   userIdHint?: string
 ): Promise<PaperSessionDoc | null> {
   if (tickInFlight.has(sessionId)) {
+    // Same-instance re-entry — still return cloud doc so API can show latest log
+    if (userIdHint) {
+      return getSession(userIdHint, sessionId, { preferCloud: true });
+    }
     return findSessionInMem(sessionId);
   }
   tickInFlight.add(sessionId);
@@ -244,7 +248,19 @@ async function processPaperSessionInner(
     now - doc.lastWorkerAt < IN_PROGRESS_LOCK_MS &&
     /tick in progress/i.test(String(doc.workerNote || ""))
   ) {
-    return doc;
+    // Always leave a breadcrumb so the Server log is not stuck on "Session started"
+    const skipLine = asciiSafe(
+      `${new Date().toLocaleTimeString("en-IN")} · Tick skipped (previous still in progress, started ${Math.round((now - doc.lastWorkerAt) / 1000)}s ago)`,
+      400
+    );
+    try {
+      return await updateSession(sessionId, {
+        userId: doc.userId,
+        eventLog: [skipLine, ...(doc.eventLog || [])].slice(0, 40),
+      });
+    } catch {
+      return doc;
+    }
   }
 
   if (now > doc.endsAt) {
@@ -357,7 +373,12 @@ async function processPaperSessionInner(
       dual && cfg.tradeInstrument === "options_atm"
         ? MAX_SYMBOLS_DUAL_OPTIONS
         : MAX_SYMBOLS_HARD;
-    const batchSize = Math.min(hardCap, fullList.length || 1);
+    // First completed tick uses a tiny batch so a "Tick #1" line always lands quickly
+    const firstTick = !(doc.tickCount && doc.tickCount > 0);
+    const batchSize = Math.min(
+      firstTick ? Math.min(3, hardCap) : hardCap,
+      fullList.length || 1
+    );
     const offset =
       fullList.length > 0
         ? (doc.rotationOffset || 0) % fullList.length

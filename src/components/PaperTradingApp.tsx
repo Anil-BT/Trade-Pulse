@@ -1,6 +1,6 @@
 "use client";
 
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConditionBuilder } from "./ConditionBuilder";
 import { ScanReportView } from "./ScanReport";
 import { StrategyLibrary } from "./StrategyLibrary";
@@ -123,6 +123,9 @@ export function PaperTradingApp() {
 
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /** Local tick lines so UI shows progress even if cloud eventLog is slow */
+  const [clientTickLog, setClientTickLog] = useState<string[]>([]);
+  const [tickBusy, setTickBusy] = useState(false);
   const [session, setSession] = useState<SafeSession | null>(null);
   /** Last known session id (survives a null status poll briefly) */
   const [knownSessionId, setKnownSessionId] = useState<string | null>(() => {
@@ -267,10 +270,20 @@ export function PaperTradingApp() {
    * Run one server tick and apply session snapshot.
    * Browser-driven so Vercel doesn't depend only on unreliable after()/cron.
    */
+  const pushClientLog = useCallback((line: string) => {
+    const ts = new Date().toLocaleTimeString("en-IN");
+    setClientTickLog((prev) => [`${ts} · ${line}`, ...prev].slice(0, 20));
+  }, []);
+
   const runPaperTick = useCallback(
     async (sessionId: string) => {
       const token = await idToken();
-      if (!token || !sessionId) return;
+      if (!token || !sessionId) {
+        pushClientLog("Tick aborted — not signed in or no session id");
+        return;
+      }
+      setTickBusy(true);
+      pushClientLog(`Calling /api/paper/session/tick (${sessionId.slice(0, 8)}…)`);
       try {
         const res = await paperFetch("/api/paper/session/tick", {
           method: "POST",
@@ -282,22 +295,48 @@ export function PaperTradingApp() {
           session?: SafeSession | null;
           skipped?: boolean;
           reason?: string;
+          tickCount?: number | null;
+          eventLog?: string[];
+          lastError?: string;
         }>(res);
         if (!res.ok) {
-          if (data.error) setError(data.error);
+          const err = data.error || `Tick failed (${res.status})`;
+          setError(err);
+          pushClientLog(`ERROR: ${err}`);
           return;
+        }
+        if (data.skipped) {
+          pushClientLog(`Skipped: ${data.reason || "not running"}`);
+        } else {
+          pushClientLog(
+            `Tick response OK · tickCount=${data.tickCount ?? "?"} · server lines=${(data.eventLog || []).length}`
+          );
+        }
+        if (data.lastError) {
+          pushClientLog(`Server lastError: ${data.lastError}`);
         }
         if (data.session) {
           setSession(data.session);
           if (data.session.status === "running" && data.session.id) {
             rememberSessionId(data.session.id);
           }
+        } else if (data.eventLog?.length) {
+          // Merge server log even if full session payload missing
+          setSession((prev) =>
+            prev
+              ? { ...prev, eventLog: data.eventLog, updatedAt: Date.now() }
+              : prev
+          );
         }
       } catch (e) {
-        console.warn("[paper-tick]", e);
+        const msg = safeErrorMessage(e) || "Tick network error";
+        pushClientLog(`ERROR: ${msg}`);
+        setError(msg);
+      } finally {
+        setTickBusy(false);
       }
     },
-    [user]
+    [user, pushClientLog]
   );
 
   // Poll status while session running (UI only — work is on server)
@@ -538,9 +577,10 @@ export function PaperTradingApp() {
       }
       // Pull latest from server by sessionId (state update is async)
       await refreshStatus(data.sessionId || null);
-      // First real tick in-request (do not rely on after()) — may take 1–3 min
+      // First real tick in-request — may take 1–3 min for dual options
       if (data.sessionId) {
         setBusy(false);
+        pushClientLog("Start OK — requesting first tick…");
         void runPaperTick(data.sessionId);
         return;
       }
@@ -635,7 +675,15 @@ export function PaperTradingApp() {
           ]
         : [];
   const openPositions = session?.openPositions || [];
-  const eventLog = session?.eventLog || [];
+  const eventLog = useMemo(() => {
+    const server = session?.eventLog || [];
+    // Client lines first so user always sees tick attempts
+    const merged = [...clientTickLog];
+    for (const line of server) {
+      if (!merged.includes(line)) merged.push(line);
+    }
+    return merged.slice(0, 40);
+  }, [session?.eventLog, clientTickLog]);
   const dualFromSession = Boolean(session?.config?.strategy2?.name);
   const workerStale =
     running &&
@@ -715,7 +763,7 @@ export function PaperTradingApp() {
                 {running && (
                   <button
                     type="button"
-                    disabled={busy}
+                    disabled={busy || tickBusy}
                     onClick={() => {
                       const sid =
                         session?.id ||
@@ -724,10 +772,11 @@ export function PaperTradingApp() {
                           ? localStorage.getItem("tp_paper_session_id")
                           : null);
                       if (sid) void runPaperTick(sid);
+                      else pushClientLog("No session id — start again");
                     }}
                     className="mt-2 rounded-full border border-neutral-300 px-3 py-1 text-[11px] font-medium hover:border-black disabled:opacity-50"
                   >
-                    Run tick now
+                    {tickBusy ? "Tick running…" : "Run tick now"}
                   </button>
                 )}
                 {session?.lastBatch && session.lastBatch.universeSize > 0 && (
@@ -1256,20 +1305,32 @@ export function PaperTradingApp() {
             )}
           </section>
 
-          {eventLog.length > 0 && (
-            <section className="rounded-3xl border border-neutral-200 bg-white p-5">
-              <h2 className="mb-3 text-sm font-medium tracking-wide text-neutral-500 uppercase">
+          <section className="rounded-3xl border border-neutral-200 bg-white p-5">
+            <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+              <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
                 Server log
               </h2>
-              <ul className="max-h-48 space-y-1 overflow-y-auto font-mono text-[11px] text-neutral-600">
+              {tickBusy && (
+                <span className="text-[11px] font-medium text-sky-700">
+                  Tick in progress (may take 1–3 min)…
+                </span>
+              )}
+            </div>
+            {eventLog.length === 0 ? (
+              <p className="text-xs text-neutral-400">
+                No log lines yet. After Start, a tick should write here within a
+                few seconds.
+              </p>
+            ) : (
+              <ul className="max-h-56 space-y-1 overflow-y-auto font-mono text-[11px] text-neutral-600">
                 {eventLog.map((line, i) => (
                   <li key={i} className="border-b border-neutral-50 py-1">
                     {line}
                   </li>
                 ))}
               </ul>
-            </section>
-          )}
+            )}
+          </section>
         </div>
 
         {openPositions.length > 0 && (

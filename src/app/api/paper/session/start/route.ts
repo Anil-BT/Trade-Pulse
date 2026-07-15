@@ -1,4 +1,4 @@
-import { after, NextRequest, NextResponse } from "next/server";
+import { NextRequest, NextResponse } from "next/server";
 import { verifyUserIdToken } from "@/lib/firebase/admin";
 import { safeErrorMessage, sanitizeToken } from "@/lib/http";
 import { todayIst } from "@/lib/paper/market-hours";
@@ -19,8 +19,7 @@ import { uid } from "@/lib/format";
 
 export const dynamic = "force-dynamic";
 export const runtime = "nodejs";
-/** First tick runs in after() — allow dual-strategy option batch */
-export const maxDuration = 300;
+export const maxDuration = 60;
 
 function sessionEndsAtMs(): number {
   const today = todayIst();
@@ -220,19 +219,9 @@ export async function POST(req: NextRequest) {
       return jsonError(saved.error || "Failed to save session", 500);
     }
 
-    // Best-effort background kick (may not finish on all hosts).
-    // Client also calls /api/paper/session/tick right after start — that is the
-    // reliable path for dual options.
-    after(async () => {
-      try {
-        const { processPaperSession } = await import(
-          "@/lib/paper/session-worker"
-        );
-        await processPaperSession(id, user.uid);
-      } catch (e) {
-        console.error("[paper-start] first tick:", e);
-      }
-    });
+    // Do NOT run processPaperSession in after() — it races the browser tick
+    // and soft-locks without always writing a visible log. Client calls
+    // /api/paper/session/tick immediately after start.
 
     return NextResponse.json({
       sessionId: id,
