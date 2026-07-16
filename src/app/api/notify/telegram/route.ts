@@ -40,10 +40,13 @@ export async function POST(req: NextRequest) {
     // Telegram limit ~4096
     const message = text.slice(0, 4000);
 
-    const chatId = String(
+    // Strip quotes/spaces people paste from JSON
+    const chatIdRaw = String(
       body.chatId || process.env.TELEGRAM_CHAT_ID || ""
-    ).trim();
-    if (!chatId) {
+    )
+      .trim()
+      .replace(/^["']|["']$/g, "");
+    if (!chatIdRaw) {
       return NextResponse.json(
         {
           error:
@@ -52,6 +55,10 @@ export async function POST(req: NextRequest) {
         { status: 400 }
       );
     }
+    // Telegram accepts string or number; numeric ids work as numbers
+    const chatId: string | number = /^-?\d+$/.test(chatIdRaw)
+      ? Number(chatIdRaw)
+      : chatIdRaw;
 
     const url = `https://api.telegram.org/bot${token}/sendMessage`;
     const res = await fetch(url, {

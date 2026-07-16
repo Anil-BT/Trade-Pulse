@@ -24,8 +24,15 @@ import {
   symbolsInSector,
   type SectorStrength,
 } from "@/lib/watch/sectors";
+import {
+  loadWatchConfig,
+  saveWatchConfig,
+  type MarketWatchConfig,
+  type WatchStrategyPref,
+} from "@/lib/watch/watch-config";
 import { isNseSessionOpen, sessionStatus } from "@/lib/paper/market-hours";
 import { useSavedStrategies } from "@/lib/hooks/use-saved-strategies";
+import { useAuth } from "@/lib/firebase/auth-context";
 import type { Interval, StrategyConfig } from "@/lib/types";
 
 const INTERVALS: { value: Interval; label: string }[] = [
@@ -94,8 +101,24 @@ type StrategyPick = {
   telegramNotify?: boolean;
 };
 
-const TG_CHAT_KEY = "tp_telegram_chat_id";
 const TG_NOTIFIED_KEY = "tp_telegram_notified_v1";
+
+function applyStrategyPrefs(
+  list: StrategyPick[],
+  prefs: WatchStrategyPref[] | undefined
+): StrategyPick[] {
+  if (!prefs?.length) return list;
+  const map = new Map(prefs.map((p) => [p.id, p]));
+  return list.map((p) => {
+    const pr = map.get(p.id);
+    if (!pr) return p;
+    return {
+      ...p,
+      selected: Boolean(pr.selected),
+      telegramNotify: Boolean(pr.telegramNotify),
+    };
+  });
+}
 
 type StickyCell = WatchMatch & {
   addedAt: number;
@@ -219,6 +242,7 @@ type SectorStockRow = {
  * - Click any column header to sort
  */
 export function MarketWatchApp() {
+  const { user } = useAuth();
   const [dataSource, setDataSource] = useState<WatchSource>("yahoo");
   const [upstoxToken, setUpstoxToken] = useState("");
   const [showToken, setShowToken] = useState(false);
@@ -226,6 +250,10 @@ export function MarketWatchApp() {
   const [batchSize, setBatchSize] = useState(25);
   const [runOnMarketOpen, setRunOnMarketOpen] = useState(true);
   const [statusLine, setStatusLine] = useState(sessionStatus().label);
+  const [configNote, setConfigNote] = useState<string | null>(null);
+  const [saveBusy, setSaveBusy] = useState(false);
+  const watchConfigRef = useRef<MarketWatchConfig | null>(null);
+  const configAppliedRef = useRef(false);
 
   const [picks, setPicks] = useState<StrategyPick[]>(() =>
     STRATEGY_PRESETS.map((p) => ({
@@ -333,9 +361,43 @@ export function MarketWatchApp() {
           };
         });
 
-      return [...presets, ...savedPicks];
+      let next = [...presets, ...savedPicks];
+      // Apply saved Market Watch prefs (selected + Telegram once)
+      if (watchConfigRef.current?.strategies?.length) {
+        next = applyStrategyPrefs(next, watchConfigRef.current.strategies);
+      }
+      return next;
     });
   }, [savedStrategies]);
+
+  // Load permanent config (localStorage + cloud when signed in)
+  useEffect(() => {
+    let cancelled = false;
+    (async () => {
+      try {
+        const cfg = await loadWatchConfig(user?.uid ?? null);
+        if (cancelled || !cfg) return;
+        watchConfigRef.current = cfg;
+        setDataSource(cfg.dataSource === "upstox" ? "upstox" : "yahoo");
+        setIntervalBar((cfg.interval as Interval) || "5m");
+        setBatchSize(cfg.batchSize || 25);
+        setRunOnMarketOpen(cfg.runOnMarketOpen !== false);
+        if (cfg.telegramChatId) setTelegramChatId(cfg.telegramChatId);
+        setPicks((prev) => applyStrategyPrefs(prev, cfg.strategies));
+        configAppliedRef.current = true;
+        setConfigNote(
+          user?.uid
+            ? "Loaded your saved Market Watch config (cloud)."
+            : "Loaded saved Market Watch config (this device)."
+        );
+      } catch {
+        /* ignore */
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [user?.uid]);
 
   const selectedStrategies = useMemo(
     () => picks.filter((p) => p.selected).map((p) => p.strategy),
@@ -372,21 +434,21 @@ export function MarketWatchApp() {
     return () => clearInterval(t);
   }, []);
 
-  // Telegram: load chat id + notified keys + bot configured?
+  // Telegram: notified keys + bot configured on server?
   useEffect(() => {
-    try {
-      const saved = localStorage.getItem(TG_CHAT_KEY);
-      if (saved) setTelegramChatId(saved);
-    } catch {
-      /* ignore */
-    }
     notifiedRef.current = loadNotifiedKeys();
     void fetch("/api/notify/telegram")
       .then((r) => r.json())
-      .then((d: { configured?: boolean }) => {
+      .then((d: { configured?: boolean; defaultChatId?: boolean }) => {
         setTelegramConfigured(Boolean(d.configured));
+        if (d.defaultChatId && !telegramChatId) {
+          setTelegramNote(
+            "TELEGRAM_CHAT_ID is set on server (optional override below)."
+          );
+        }
       })
       .catch(() => setTelegramConfigured(false));
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- one-shot probe
   }, []);
 
   useEffect(() => {
@@ -530,18 +592,16 @@ export function MarketWatchApp() {
         const now = Date.now();
         setUniverseQuotes((prev) => mergeQuotes(prev, data.quotes || []));
         if (strats.length) {
-          let newlyAdded: StickyCell[] = [];
-          setSticky((prev) => {
-            const { next, added } = mergeSticky(
-              prev,
-              data.matches || [],
-              now
-            );
-            newlyAdded = added;
-            return next;
-          });
-          if (newlyAdded.length) {
-            void notifyNewSignals(newlyAdded);
+          // Use stickyRef so Telegram sees true first-time adds (not setState race)
+          const { next, added } = mergeSticky(
+            stickyRef.current,
+            data.matches || [],
+            now
+          );
+          stickyRef.current = next;
+          setSticky(next);
+          if (added.length) {
+            void notifyNewSignals(added);
           }
         }
 
@@ -852,6 +912,41 @@ export function MarketWatchApp() {
     );
   }
 
+  async function handleSaveConfig() {
+    setSaveBusy(true);
+    setConfigNote(null);
+    try {
+      const config: MarketWatchConfig = {
+        version: 1,
+        dataSource,
+        interval,
+        batchSize,
+        runOnMarketOpen,
+        telegramChatId: telegramChatId.trim(),
+        strategies: picks.map((p) => ({
+          id: p.id,
+          selected: p.selected,
+          telegramNotify: Boolean(p.telegramNotify),
+        })),
+        updatedAt: Date.now(),
+      };
+      watchConfigRef.current = config;
+      const r = await saveWatchConfig(config, user?.uid ?? null);
+      setConfigNote(
+        r.cloud
+          ? "Saved permanently for your account (cloud + this device)."
+          : user
+            ? "Saved on this device (sign in for cloud sync)."
+            : "Saved on this device. Sign in to sync across browsers."
+      );
+      setTelegramNote(null);
+    } catch (e) {
+      setConfigNote(safeErrorMessage(e) || "Save failed");
+    } finally {
+      setSaveBusy(false);
+    }
+  }
+
   function clearMatches() {
     setSticky(new Map());
     stickyRef.current = new Map();
@@ -893,6 +988,11 @@ export function MarketWatchApp() {
               {backfillNote}
             </p>
           )}
+          {configNote && (
+            <p className="mt-2 rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-950">
+              {configNote}
+            </p>
+          )}
         </div>
         <div className="flex flex-wrap gap-2">
           <button
@@ -901,6 +1001,14 @@ export function MarketWatchApp() {
             className="rounded-full border border-neutral-300 px-4 py-2 text-sm font-medium hover:border-black"
           >
             {configOpen ? "Hide config" : "Configure"}
+          </button>
+          <button
+            type="button"
+            disabled={saveBusy}
+            onClick={() => void handleSaveConfig()}
+            className="rounded-full bg-black px-4 py-2 text-sm font-medium text-white hover:bg-neutral-800 disabled:opacity-50"
+          >
+            {saveBusy ? "Saving…" : "Save config"}
           </button>
           <button
             type="button"
@@ -1030,42 +1138,55 @@ export function MarketWatchApp() {
               {telegramConfigured === null
                 ? "Checking bot…"
                 : telegramConfigured
-                  ? "Bot token OK (server). Enable 📱 on a strategy table — sends once per new signal."
-                  : "Set TELEGRAM_BOT_TOKEN in env (.env.local / Vercel)."}
+                  ? "Bot token OK. Enable Telegram once on a table, then Save config. Sends once per new signal."
+                  : "Set TELEGRAM_BOT_TOKEN in Vercel env (Production) and redeploy."}
             </p>
             <label className="block text-xs text-neutral-500">
               Chat / group ID
               <input
                 value={telegramChatId}
-                onChange={(e) => {
-                  setTelegramChatId(e.target.value);
-                  try {
-                    localStorage.setItem(TG_CHAT_KEY, e.target.value.trim());
-                  } catch {
-                    /* ignore */
-                  }
-                }}
-                placeholder="e.g. -100123… or leave empty for TELEGRAM_CHAT_ID"
+                onChange={(e) => setTelegramChatId(e.target.value)}
+                placeholder="e.g. -100123… or empty = TELEGRAM_CHAT_ID env"
                 className="field-input mt-1 text-sm"
               />
             </label>
-            <button
-              type="button"
-              disabled={!telegramConfigured}
-              onClick={() => {
-                void (async () => {
-                  const ok = await sendTelegram(
-                    `TradePulse test · Market Watch · ${new Date().toLocaleTimeString("en-IN")}`
-                  );
-                  if (ok) setTelegramNote("Telegram test message sent.");
-                })();
-              }}
-              className="mt-2 rounded-full border border-neutral-300 px-3 py-1.5 text-xs font-medium hover:border-black disabled:opacity-50"
-            >
-              Send test message
-            </button>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <button
+                type="button"
+                disabled={!telegramConfigured}
+                onClick={() => {
+                  void (async () => {
+                    const ok = await sendTelegram(
+                      `TradePulse test · Market Watch · ${new Date().toLocaleTimeString("en-IN")}`
+                    );
+                    if (ok) {
+                      setTelegramNote("Telegram test message sent.");
+                    }
+                  })();
+                }}
+                className="rounded-full border border-neutral-300 px-3 py-1.5 text-xs font-medium hover:border-black disabled:opacity-50"
+              >
+                Send test message
+              </button>
+              <button
+                type="button"
+                disabled={saveBusy}
+                onClick={() => void handleSaveConfig()}
+                className="rounded-full bg-black px-3 py-1.5 text-xs font-medium text-white hover:bg-neutral-800 disabled:opacity-50"
+              >
+                {saveBusy ? "Saving…" : "Save config"}
+              </button>
+            </div>
             {telegramNote && (
-              <p className="mt-2 text-[11px] text-neutral-600">{telegramNote}</p>
+              <p
+                className={`mt-2 text-[11px] ${
+                  /fail|error|not set|required/i.test(telegramNote)
+                    ? "text-red-700"
+                    : "text-neutral-600"
+                }`}
+              >
+                {telegramNote}
+              </p>
             )}
           </div>
 
