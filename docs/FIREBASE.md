@@ -51,6 +51,11 @@ service cloud.firestore {
       allow read, write: if request.auth != null
         && request.auth.uid == userId;
     }
+    // Market Watch config (Telegram chat id, strategy selection, etc.)
+    match /users/{userId}/settings/{docId} {
+      allow read, write: if request.auth != null
+        && request.auth.uid == userId;
+    }
     match /paperSessionIndex/{docId} {
       allow read, write: if false;
     }

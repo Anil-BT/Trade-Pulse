@@ -932,13 +932,19 @@ export function MarketWatchApp() {
       };
       watchConfigRef.current = config;
       const r = await saveWatchConfig(config, user?.uid ?? null);
-      setConfigNote(
-        r.cloud
-          ? "Saved permanently for your account (cloud + this device)."
-          : user
-            ? "Saved on this device (sign in for cloud sync)."
-            : "Saved on this device. Sign in to sync across browsers."
-      );
+      if (r.cloud) {
+        setConfigNote(
+          "Saved permanently for your account (cloud + this device)."
+        );
+      } else if (r.cloudError) {
+        setConfigNote(r.cloudError);
+      } else if (user) {
+        setConfigNote("Saved on this device (cloud sync unavailable).");
+      } else {
+        setConfigNote(
+          "Saved on this device. Sign in to sync across browsers."
+        );
+      }
       setTelegramNote(null);
     } catch (e) {
       setConfigNote(safeErrorMessage(e) || "Save failed");

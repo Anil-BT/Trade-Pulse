@@ -91,12 +91,21 @@ export async function loadWatchConfig(
 export async function saveWatchConfig(
   config: MarketWatchConfig,
   userId?: string | null
-): Promise<{ cloud: boolean }> {
+): Promise<{ cloud: boolean; local: boolean; cloudError?: string }> {
   const next = { ...config, updatedAt: Date.now(), version: 1 as const };
   saveLocalWatchConfig(next);
-  if (userId) {
-    await saveCloudWatchConfig(userId, next);
-    return { cloud: true };
+  if (!userId) {
+    return { cloud: false, local: true };
   }
-  return { cloud: false };
+  try {
+    await saveCloudWatchConfig(userId, next);
+    return { cloud: true, local: true };
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    // permission-denied when Firestore rules omit /settings
+    const friendly = /permission|insufficient/i.test(msg)
+      ? "Cloud save blocked by Firestore rules. Publish rules for users/{uid}/settings (see docs/FIREBASE.md). Config is still saved on this device."
+      : msg;
+    return { cloud: false, local: true, cloudError: friendly };
+  }
 }
