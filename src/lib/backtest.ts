@@ -349,6 +349,11 @@ export function runBacktest(
         time: last.time,
         equity: cash + qtyOpen * mark,
       };
+      // Remaining lots after scale-out (partial TP); entryLots is original size
+      const remainingLots =
+        tradeInstrument === "options_atm" && optCfg.lotSize > 0
+          ? Math.max(1, Math.round(qtyOpen / optCfg.lotSize))
+          : legs.length || entryLots || undefined;
       openLeg = {
         entryTime,
         entryPrice,
@@ -357,7 +362,7 @@ export function runBacktest(
         underlyingEntry: entryUnderlying || undefined,
         underlyingMark: last.close,
         strike: entryStrike || undefined,
-        lots: entryLots || undefined,
+        lots: remainingLots,
         lotSize:
           tradeInstrument === "options_atm" ? optCfg.lotSize : undefined,
         optionSide: tradeInstrument === "options_atm" ? optCfg.side : undefined,

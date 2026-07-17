@@ -4,11 +4,13 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { ConditionBuilder } from "./ConditionBuilder";
 import { ScanReportView } from "./ScanReport";
 import { StrategyLibrary } from "./StrategyLibrary";
+import { TrailStopFields } from "./TrailStopFields";
 import {
   STRATEGY_PRESETS,
-  PRESET_OPENING_RANGE_EMA,
-  PRESET_OR_EMA20_FIB_S3_PDL,
+  PRESET_SECTOR_OR_EMA20_VWAP_FIB_BULL,
+  PRESET_SECTOR_OR_EMA20_VWAP_FIB_BEAR,
 } from "@/lib/presets";
+import { padLotRules, withLots } from "@/lib/lot-rules";
 import { formatMoney, formatTime, uid } from "@/lib/format";
 import {
   cleanClientIdToken,
@@ -104,18 +106,19 @@ export function PaperTradingApp() {
     useState<TradeInstrument>("options_atm");
   const [optionSide, setOptionSide] = useState<"CE" | "PE">("CE");
   const [lotSize, setLotSize] = useState(0);
+  /** F&O lots per entry (1–3); same multi-lot scale-out as backtest */
+  const [lotsPerTrade, setLotsPerTrade] = useState(1);
   const [strikeStep, setStrikeStep] = useState(0);
   const [ivPct, setIvPct] = useState(18);
   const [daysToExpiry, setDaysToExpiry] = useState(7);
+  /** Bullish book (CE by default) — same engine as backtest */
   const [strategy, setStrategy] = useState<StrategyConfig>(() =>
-    structuredClone(PRESET_OPENING_RANGE_EMA)
+    structuredClone(PRESET_SECTOR_OR_EMA20_VWAP_FIB_BULL)
   );
-  /** Second strategy — same Upstox candles, separate paper book */
-  const [dualStrategy, setDualStrategy] = useState(false);
+  /** Second strategy — same Upstox candles, separate paper book (bearish / PE) */
+  const [dualStrategy, setDualStrategy] = useState(true);
   const [strategy2, setStrategy2] = useState<StrategyConfig>(() =>
-    structuredClone(
-      PRESET_OR_EMA20_FIB_S3_PDL || PRESET_OPENING_RANGE_EMA
-    )
+    structuredClone(PRESET_SECTOR_OR_EMA20_VWAP_FIB_BEAR)
   );
   const [optionSide2, setOptionSide2] = useState<"CE" | "PE">("PE");
   const [scanMaxSymbols, setScanMaxSymbols] = useState(40);
@@ -440,11 +443,14 @@ export function PaperTradingApp() {
   }
 
   function loadStrategy(s: StrategyConfig, slot: 1 | 2 = 1) {
-    const next = structuredClone({
-      ...s,
-      entry: s.entry.map((c) => ({ ...c, id: c.id || uid() })),
-      exit: s.exit.map((c) => ({ ...c, id: c.id || uid() })),
-    });
+    const next = withLots(
+      structuredClone({
+        ...s,
+        entry: s.entry.map((c) => ({ ...c, id: c.id || uid() })),
+        exit: s.exit.map((c) => ({ ...c, id: c.id || uid() })),
+      }),
+      lotsPerTrade
+    );
     if (slot === 1) setStrategy(next);
     else setStrategy2(next);
   }
@@ -453,6 +459,7 @@ export function PaperTradingApp() {
     return {
       side,
       lotSize,
+      lots: lotsPerTrade,
       strikeStep,
       iv: ivPct / 100,
       daysToExpiry,
@@ -475,17 +482,23 @@ export function PaperTradingApp() {
       return;
     }
     if (!strategy.entry.length || !strategy.exit.length) {
-      setError("Strategy 1 needs entry and exit conditions.");
+      setError("Bullish strategy needs entry and exit conditions.");
       return;
     }
     if (dualStrategy) {
       if (!strategy2.entry.length) {
         setError(
-          "Strategy 2 needs entry conditions (or turn dual off)."
+          "Bearish strategy needs entry conditions (or turn dual off)."
         );
         return;
       }
     }
+
+    // Same multi-lot + scale-out rules as backtest engine
+    const bull = withLots(structuredClone(strategy), lotsPerTrade);
+    const bear = withLots(structuredClone(strategy2), lotsPerTrade);
+    setStrategy(bull);
+    if (dualStrategy) setStrategy2(bear);
 
     const upstox = sanitizeToken(upstoxToken);
     setBusy(true);
@@ -498,8 +511,8 @@ export function PaperTradingApp() {
           idToken: token,
           upstoxAccessToken: upstox || undefined,
           config: {
-            strategy,
-            strategy2: dualStrategy ? strategy2 : undefined,
+            strategy: bull,
+            strategy2: dualStrategy ? bear : undefined,
             options2:
               dualStrategy && tradeInstrument === "options_atm"
                 ? buildOptions(optionSide2)
@@ -1067,9 +1080,9 @@ export function PaperTradingApp() {
               ))}
             </div>
             {tradeInstrument === "options_atm" && (
-              <div className="space-y-2">
+              <div className="space-y-3">
                 <p className="text-xs text-neutral-500">
-                  Strategy 1 option side
+                  Bullish book option side
                 </p>
                 <div className="flex flex-wrap gap-2">
                   {(["CE", "PE"] as const).map((s) => (
@@ -1090,11 +1103,46 @@ export function PaperTradingApp() {
                   <input
                     type="number"
                     disabled={running}
-                    placeholder="Lot (0=auto)"
+                    placeholder="Lot size (0=auto)"
                     value={lotSize}
                     onChange={(e) => setLotSize(Number(e.target.value) || 0)}
-                    className="field-input w-28"
+                    className="field-input w-32"
                   />
+                </div>
+                <div>
+                  <p className="mb-1.5 text-xs font-medium text-neutral-500">
+                    Lots per trade
+                  </p>
+                  <select
+                    disabled={running}
+                    value={lotsPerTrade}
+                    onChange={(e) => {
+                      const n = Math.min(
+                        3,
+                        Math.max(1, Number(e.target.value) || 1)
+                      );
+                      setLotsPerTrade(n);
+                      setStrategy((s) => ({
+                        ...s,
+                        positionLots: n,
+                        lotRules: padLotRules(s, n),
+                      }));
+                      setStrategy2((s) => ({
+                        ...s,
+                        positionLots: n,
+                        lotRules: padLotRules(s, n),
+                      }));
+                    }}
+                    className="field-input"
+                  >
+                    <option value={1}>1 lot</option>
+                    <option value={2}>2 lots (scale-out TP + trail)</option>
+                    <option value={3}>3 lots</option>
+                  </select>
+                  <p className="mt-1 text-[11px] text-neutral-400">
+                    Same as backtest: multi-lot entry, per-lot take-profit /
+                    trail-to-cost / trailing SL on each strategy.
+                  </p>
                 </div>
               </div>
             )}
@@ -1113,18 +1161,19 @@ export function PaperTradingApp() {
                   onChange={(e) => setDualStrategy(e.target.checked)}
                   className="h-4 w-4 accent-black"
                 />
-                Run 2 strategies at once
+                Bull + bear (2 books)
               </label>
             </div>
             <p className="mb-4 text-xs text-neutral-500">
-              Dual mode shares one Upstox candle fetch per symbol — no extra
-              market-data cost. Each strategy keeps its own paper book.
+              Same as backtest dual mode: one Upstox candle fetch per symbol;
+              bullish (CE) and bearish (PE) conditions evaluated independently.
+              Each book uses multi-lot rules if lots &gt; 1.
             </p>
 
-            {/* Strategy 1 */}
-            <div className="rounded-2xl border border-neutral-200 bg-neutral-50/50 p-4">
-              <p className="mb-3 text-xs font-semibold text-neutral-800">
-                Strategy 1
+            {/* Strategy 1 — Bullish */}
+            <div className="rounded-2xl border border-emerald-200 bg-emerald-50/40 p-4">
+              <p className="mb-3 text-xs font-semibold text-emerald-900">
+                Bullish strategy
                 {tradeInstrument === "options_atm"
                   ? ` · ${optionSide}`
                   : ""}
@@ -1166,13 +1215,19 @@ export function PaperTradingApp() {
                   className="field-input mb-3"
                 />
               </Field>
-              {strategy.trailStopToCost?.enabled ? (
-                <p className="mb-4 text-xs text-neutral-500">
-                  Trail SL to cost when profit ≥{" "}
-                  {strategy.trailStopToCost.profitPctOfCapital ?? 20}% of
-                  capital
-                </p>
-              ) : null}
+              <TrailStopFields
+                strategy={withLots(strategy, lotsPerTrade)}
+                disabled={running}
+                lotsHint="Lots per trade is under Trade instrument."
+                onChange={(updater) => {
+                  setStrategy((prev) => {
+                    const base = withLots(prev, lotsPerTrade);
+                    const next =
+                      typeof updater === "function" ? updater(base) : updater;
+                    return withLots(next, lotsPerTrade);
+                  });
+                }}
+              />
               <div className="space-y-6">
                 <ConditionBuilder
                   title="Entry when"
@@ -1202,11 +1257,11 @@ export function PaperTradingApp() {
               </div>
             </div>
 
-            {/* Strategy 2 */}
+            {/* Strategy 2 — Bearish */}
             {dualStrategy && (
-              <div className="mt-4 rounded-2xl border border-neutral-900 bg-white p-4">
-                <p className="mb-3 text-xs font-semibold text-neutral-800">
-                  Strategy 2
+              <div className="mt-4 rounded-2xl border border-rose-200 bg-rose-50/30 p-4">
+                <p className="mb-3 text-xs font-semibold text-rose-900">
+                  Bearish strategy
                   {tradeInstrument === "options_atm"
                     ? ` · ${optionSide2}`
                     : ""}
@@ -1272,13 +1327,19 @@ export function PaperTradingApp() {
                     className="field-input mb-3"
                   />
                 </Field>
-                {strategy2.trailStopToCost?.enabled ? (
-                  <p className="mb-4 text-xs text-neutral-500">
-                    Trail SL to cost when profit ≥{" "}
-                    {strategy2.trailStopToCost.profitPctOfCapital ?? 20}% of
-                    capital
-                  </p>
-                ) : null}
+                <TrailStopFields
+                  strategy={withLots(strategy2, lotsPerTrade)}
+                  disabled={running}
+                  lotsHint="Lots per trade is under Trade instrument."
+                  onChange={(updater) => {
+                    setStrategy2((prev) => {
+                      const base = withLots(prev, lotsPerTrade);
+                      const next =
+                        typeof updater === "function" ? updater(base) : updater;
+                      return withLots(next, lotsPerTrade);
+                    });
+                  }}
+                />
                 <div className="space-y-6">
                   <ConditionBuilder
                     title="Entry when"
@@ -1352,13 +1413,15 @@ export function PaperTradingApp() {
             </h2>
             <p className="mb-4 text-xs text-neutral-500">
               Label starts with the strategy name. <strong>uP&amp;L</strong> =
-              (mark − entry) × qty. Options: strict market premium / LTP only.
+              (mark − entry) × qty. Multi-lot: remaining lots after scale-out TP
+              stay open until trail / signal. Options: market premium / LTP.
             </p>
             <div className="overflow-x-auto">
               <table className="w-full min-w-[720px] text-sm">
                 <thead>
                   <tr className="border-b text-xs text-neutral-500 uppercase">
                     <th className="px-2 py-2 text-left">Strategy / symbol</th>
+                    <th className="px-2 py-2 text-right">Lots</th>
                     <th className="px-2 py-2 text-right">Strike</th>
                     <th className="px-2 py-2 text-right">Entry</th>
                     <th className="px-2 py-2 text-right">Mark</th>
@@ -1374,6 +1437,10 @@ export function PaperTradingApp() {
                 <tbody>
                   {openPositions.map((p, i) => {
                     const isOpt = Boolean(p.optionSide || p.strike);
+                    const remainingLots =
+                      isOpt && p.lotSize && p.lotSize > 0
+                        ? Math.max(1, Math.round(p.qty / p.lotSize))
+                        : p.lots ?? null;
                     return (
                       <tr
                         key={`${p.label || p.symbol}-${p.entryTime}-${i}`}
@@ -1384,7 +1451,7 @@ export function PaperTradingApp() {
                           {isOpt && (
                             <div className="mt-0.5 text-[11px] font-normal text-neutral-500">
                               {p.optionSide || "OPT"}
-                              {p.lots != null ? ` · ${p.lots} lot` : ""}
+                              {p.qty != null ? ` · qty ${p.qty}` : ""}
                               {p.underlyingMark != null ||
                               p.underlyingEntry != null
                                 ? ` · spot ₹${(
@@ -1393,6 +1460,11 @@ export function PaperTradingApp() {
                                 : ""}
                             </div>
                           )}
+                        </td>
+                        <td className="px-2 py-2 text-right tabular-nums text-neutral-700">
+                          {remainingLots != null
+                            ? `${remainingLots} open`
+                            : "—"}
                         </td>
                         <td className="px-2 py-2 text-right tabular-nums text-neutral-700">
                           {p.strike != null && Number.isFinite(p.strike)
@@ -1452,35 +1524,55 @@ export function PaperTradingApp() {
                 ? ` (${strategyResults.length} books)`
                 : ""}
             </h2>
-            {strategyResults.map((sr) => (
-              <div
-                key={`${sr.slot}-${sr.strategyName}`}
-                className="space-y-2 rounded-3xl border border-neutral-200 bg-white p-4"
-              >
-                <div className="flex flex-wrap items-baseline justify-between gap-2 px-1">
-                  <p className="text-sm font-semibold text-neutral-800">
-                    Strategy {sr.slot}: {sr.strategyName}
-                  </p>
-                  <p className="text-xs text-neutral-500">
-                    {(sr.openPositions || []).length} open ·{" "}
-                    {sr.report?.summary?.totalTrades ?? 0} closed trades ·{" "}
-                    {sr.report?.scanned ?? 0} symbols scanned
-                  </p>
+            {strategyResults.map((sr) => {
+              const sideLabel =
+                sr.slot === 1
+                  ? "Bullish · CE book"
+                  : "Bearish · PE book";
+              return (
+                <div
+                  key={`${sr.slot}-${sr.strategyName}`}
+                  className={`space-y-2 rounded-3xl border bg-white p-4 ${
+                    sr.slot === 1
+                      ? "border-emerald-200"
+                      : "border-rose-200"
+                  }`}
+                >
+                  <div className="flex flex-wrap items-baseline justify-between gap-2 px-1">
+                    <p
+                      className={`text-sm font-semibold ${
+                        sr.slot === 1 ? "text-emerald-900" : "text-rose-900"
+                      }`}
+                    >
+                      {sideLabel}: {sr.strategyName}
+                    </p>
+                    <p className="text-xs text-neutral-500">
+                      {(sr.openPositions || []).length} open ·{" "}
+                      {sr.report?.summary?.totalTrades ?? 0} closed trades ·{" "}
+                      {sr.report?.scanned ?? 0} symbols scanned
+                    </p>
+                  </div>
+                  {sr.report ? (
+                    <ScanReportView
+                      report={{
+                        ...sr.report,
+                        side: sr.slot === 1 ? "bullish" : "bearish",
+                      }}
+                      hideSave
+                      heading={sideLabel}
+                      onClose={() => {
+                        /* keep session report */
+                      }}
+                    />
+                  ) : (
+                    <p className="px-1 text-sm text-neutral-400">
+                      No report yet for this strategy — wait for next server
+                      tick.
+                    </p>
+                  )}
                 </div>
-                {sr.report ? (
-                  <ScanReportView
-                    report={sr.report}
-                    onClose={() => {
-                      /* keep session report */
-                    }}
-                  />
-                ) : (
-                  <p className="px-1 text-sm text-neutral-400">
-                    No report yet for this strategy — wait for next server tick.
-                  </p>
-                )}
-              </div>
-            ))}
+              );
+            })}
           </section>
         )}
 
