@@ -116,21 +116,42 @@ export function allSectors(): string[] {
  * Sector strength from full F&O quotes (not strategy matches).
  * Always returns every configured sector (empty ones with count 0).
  * Sorted by avg day change desc; zero-count sectors last alphabetically.
+ *
+ * When rows include turnover (or volume×price), uses turnover-weighted avg
+ * (same idea as sector-trend backtest). Falls back to equal-weight.
  */
 export function computeSectorStrength(
-  rows: { symbol: string; changePct?: number }[]
+  rows: { symbol: string; changePct?: number; turnover?: number }[]
 ): SectorStrength[] {
   const acc = new Map<
     string,
-    { sum: number; nCh: number; n: number; bullish: number; bearish: number }
+    {
+      sum: number;
+      wSum: number;
+      wRet: number;
+      nCh: number;
+      n: number;
+      bullish: number;
+      bearish: number;
+    }
   >();
   for (const sector of allSectors()) {
-    acc.set(sector, { sum: 0, nCh: 0, n: 0, bullish: 0, bearish: 0 });
+    acc.set(sector, {
+      sum: 0,
+      wSum: 0,
+      wRet: 0,
+      nCh: 0,
+      n: 0,
+      bullish: 0,
+      bearish: 0,
+    });
   }
   for (const r of rows) {
     const sector = sectorOf(r.symbol);
     const cur = acc.get(sector) || {
       sum: 0,
+      wSum: 0,
+      wRet: 0,
       nCh: 0,
       n: 0,
       bullish: 0,
@@ -143,13 +164,23 @@ export function computeSectorStrength(
       cur.nCh += 1;
       if (ch >= 0) cur.bullish += 1;
       else cur.bearish += 1;
+      const w = Number(r.turnover);
+      if (Number.isFinite(w) && w > 0) {
+        cur.wSum += w;
+        cur.wRet += ch * w;
+      }
     }
     acc.set(sector, cur);
   }
   return [...acc.entries()]
     .map(([sector, v]) => ({
       sector,
-      avgChangePct: v.nCh > 0 ? v.sum / v.nCh : 0,
+      avgChangePct:
+        v.wSum > 0
+          ? v.wRet / v.wSum
+          : v.nCh > 0
+            ? v.sum / v.nCh
+            : 0,
       count: v.n,
       /** How many F&O names belong to this sector in the universe map */
       universeCount: symbolsInSector(sector).length,

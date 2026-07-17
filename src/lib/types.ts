@@ -30,7 +30,15 @@ export type IndicatorType =
   | "ADX"
   /** Session VWAP (resets each IST trading day) */
   | "VWAP"
+  /**
+   * Opening range high from 09:15 IST for `period` minutes (default 15).
+   * period 15 → 09:15–09:30, period 30 → 09:15–09:45.
+   */
   | "OPENING_RANGE_HIGH"
+  /**
+   * Opening range low from 09:15 IST for `period` minutes (default 15).
+   * period 15 → 09:15–09:30, period 30 → 09:15–09:45.
+   */
   | "OPENING_RANGE_LOW"
   /** Previous session Fibonacci pivot levels (classic fib pivots) */
   | "FIB_PIVOT"
@@ -44,15 +52,21 @@ export type IndicatorType =
   | "PREV_DAY_HIGH"
   | "PREV_DAY_LOW"
   /**
-   * Breakout high = max(1st OR bar high, Fib R3, Prev Day High).
+   * Breakout high = max(OR high 09:15–09:30, Fib R3, Prev Day High).
    * Use with cross_above for true breakout entries.
    */
   | "BREAKOUT_HIGH"
   /**
-   * Breakdown low = min(1st OR bar low / 1st 5m low, Fib S3, Prev Day Low).
+   * Breakdown low = min(OR low 09:15–09:30, Fib S3, Prev Day Low).
    * Use with cross_below for true breakdown entries.
    */
-  | "BREAKOUT_LOW";
+  | "BREAKOUT_LOW"
+  /** On-Balance Volume (cumulative) */
+  | "OBV"
+  /**
+   * Volume / SMA(volume, period). Use e.g. VOL_RATIO ≥ 1.5 for volume spike.
+   */
+  | "VOL_RATIO";
 
 export type CompareOperand =
   | "close"
@@ -62,7 +76,17 @@ export type CompareOperand =
   | "volume"
   | { indicator: IndicatorType; period?: number };
 
-export type Comparator = "gt" | "gte" | "lt" | "lte" | "cross_above" | "cross_below";
+export type Comparator =
+  | "gt"
+  | "gte"
+  | "lt"
+  | "lte"
+  | "cross_above"
+  | "cross_below"
+  /** Left series bar-to-bar rising (right ignored) */
+  | "rising"
+  /** Left series bar-to-bar falling (right ignored) */
+  | "falling";
 
 export interface Condition {
   id: string;
@@ -87,6 +111,54 @@ export interface StrategyConfig {
     /** % of initial capital (default 20) */
     profitPctOfCapital?: number;
   };
+  /**
+   * Classic trailing stop: track high-water mark since entry, exit when price
+   * falls `pct`% from that peak (long only). Used when lotRules is empty.
+   */
+  trailStop?: {
+    enabled: boolean;
+    /** Trail distance in % below peak (e.g. 1 = 1%) */
+    pct: number;
+  };
+  /**
+   * How many lots (F&O) or scale units to open per entry (1–5). Default 1.
+   * With 2 lots, configure lotRules[0] and lotRules[1] independently.
+   */
+  positionLots?: number;
+  /**
+   * Per-lot exit / trail rules (lot 1 = index 0).
+   * If omitted, trailStop / trailStopToCost apply to all lots together.
+   */
+  lotRules?: LotTrailRule[];
+}
+
+/** Exit / trailing behaviour for one lot of a multi-lot position. */
+export interface LotTrailRule {
+  /**
+   * Take-profit: close this lot when mark is +this % above entry.
+   * Example: 20 → exit lot when premium/price is ≥ entry × 1.20.
+   * Typical: lot 1 books 20%, lot 2 trails at cost / trail SL.
+   */
+  takeProfitPct?: number;
+  /** Trail % from peak for this lot; 0 or omitted = no % trail */
+  trailPct?: number;
+  /** Move this lot’s stop to cost (breakeven) after arming */
+  trailToCost?: boolean;
+  /**
+   * Arm trail-to-cost when this lot’s unrealized profit ≥ this % of capital
+   * (this lot’s share). Ignored if armToCostOnPartialTp handles it.
+   */
+  trailToCostProfitPctOfCapital?: number;
+  /**
+   * When another lot takes profit, arm trail-to-cost on this lot.
+   * Default true if trailToCost is enabled.
+   */
+  armToCostOnPartialTp?: boolean;
+  /**
+   * Close this lot when strategy exit conditions fire.
+   * Default true. Set false to hold this lot until trail / TP only.
+   */
+  exitOnSignal?: boolean;
 }
 
 export interface OptionsTradeSettings {
@@ -97,6 +169,11 @@ export interface OptionsTradeSettings {
    * (e.g. RELIANCE=500, TCS=225, INFY=400).
    */
   lotSize: number;
+  /**
+   * Number of lots to buy per entry (1–5). Default 1.
+   * Prefer strategy.positionLots when set.
+   */
+  lots?: number;
   /** 0 = auto from FO chain / spot. */
   strikeStep: number;
   /** Annualized IV 0–1 (e.g. 0.25 = 25%). */
@@ -169,6 +246,18 @@ export interface BacktestRequest {
    * Open leg is returned on result.openPosition.
    */
   leaveOpenPositions?: boolean;
+  /**
+   * When set, only open entries on these IST session days (YYYY-MM-DD).
+   * Used by sector-trend scan (stock only tradeable on days it was a top pick).
+   */
+  allowedEntryDates?: string[];
+  /**
+   * Sector-filter mode: shortlist IS the entry signal.
+   * On each allowedEntryDates day, enter on the first bar that passes
+   * entryNotBefore + entryTimeWindows (strategy entry conditions ignored).
+   * Strategy exit conditions still apply.
+   */
+  sectorPickEntry?: boolean;
 }
 
 export interface Trade {
@@ -183,8 +272,14 @@ export interface Trade {
   pnl: number;
   pnlPct: number;
   barsHeld: number;
-  /** Why the trade closed (strategy signal vs max-risk / trail-to-cost stop) */
-  exitReason?: "signal" | "max_risk" | "trail_cost" | "eod";
+  /** Why the trade closed (strategy signal vs max-risk / trail / take-profit) */
+  exitReason?:
+    | "signal"
+    | "max_risk"
+    | "trail_cost"
+    | "trail_sl"
+    | "take_profit"
+    | "eod";
   /** Equity underlying spot used for signals at entry/exit */
   underlyingEntry?: number;
   underlyingExit?: number;
@@ -339,6 +434,8 @@ export interface BacktestResult {
     maxRiskStops?: number;
     /** Trades closed on trail-to-cost (breakeven) stop */
     trailCostStops?: number;
+    /** Trades closed on % trailing stop from peak */
+    trailSlStops?: number;
     minLotCost?: number;
     maxRiskCap?: number;
     /** ₹ profit level that arms trail-to-cost */
@@ -399,6 +496,28 @@ export interface ScanRow {
   tradeList?: ScanTradeDetail[];
 }
 
+/** One day's sector-trend pick (configurable morning ranking). */
+export interface SectorTrendDayPick {
+  date: string;
+  /**
+   * Day label: bullish / bearish if all picked sectors agree, else mixed.
+   * Each sector also has its own direction.
+   */
+  direction: "bullish" | "bearish" | "mixed";
+  /** Avg signed move of the picked top sectors */
+  topSectorsAvgPct: number;
+  sectors: {
+    sector: string;
+    /** Mean stock % in window (same metric as Market Watch bars) */
+    avgChangePct: number;
+    /** |avgChangePct| — bar length / trend strength */
+    strength: number;
+    /** Sign of sector bar: green bar → bullish, red → bearish */
+    direction: "bullish" | "bearish";
+    stocks: { symbol: string; changePct: number }[];
+  }[];
+}
+
 export interface ScanReport {
   generatedAt: string;
   strategyName: string;
@@ -421,4 +540,22 @@ export interface ScanReport {
     losers: number;
   };
   rows: ScanRow[];
+  /** Present when scan used sector morning ranking → top sectors/stocks */
+  sectorTrend?: {
+    /** Requested mode (auto resolves per day) */
+    mode: "auto" | "bullish" | "bearish";
+    windowStart: string;
+    windowEnd: string;
+    windowLabel: string;
+    topSectors: number;
+    topStocksPerSector: number;
+    biasThreshold: number;
+    weightMode?: "turnover" | "equal";
+    minStocks?: number;
+    minBreadthPct?: number;
+    bullDays: number;
+    bearDays: number;
+    dayPicks: SectorTrendDayPick[];
+    note?: string;
+  };
 }

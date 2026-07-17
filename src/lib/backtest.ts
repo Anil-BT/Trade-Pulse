@@ -19,11 +19,31 @@ import type {
   EntryTimeWindow,
   EquityPoint,
   IndicatorType,
+  LotTrailRule,
   OptionsTradeSettings,
   StrategyConfig,
   Trade,
   TradeInstrument,
 } from "./types";
+
+/** One open lot (or equity slice) with its own trail rules */
+type PositionLeg = {
+  /** 1-based lot label */
+  lotNo: number;
+  units: number;
+  lots: number;
+  trailPeak: number;
+  trailPct: number | null;
+  /** Take profit at +this % from entry (price/premium) */
+  takeProfitPct: number | null;
+  trailToCostArmed: boolean;
+  trailToCostEnabled: boolean;
+  /** ₹ profit on this leg that arms trail-to-cost */
+  trailToCostThreshold: number | null;
+  /** Arm BE when another lot books take-profit */
+  armToCostOnPartialTp: boolean;
+  exitOnSignal: boolean;
+};
 
 /** IST session day key (same as indicators). */
 function sessionDayKey(timeMs: number): string {
@@ -109,16 +129,16 @@ export function runBacktest(
   /** Skip new entries during indicator warmup bars (lookback fetch). */
   const entryNotBeforeMs = req.entryNotBeforeMs ?? 0;
   const entryWindows = req.entryTimeWindows;
+  const allowedEntryDates = req.allowedEntryDates?.length
+    ? new Set(req.allowedEntryDates)
+    : null;
   const maxRiskCap = resolveMaxRiskCap(req.maxRiskPerTrade, initialCapital);
-  const trailCfg = req.strategy.trailStopToCost;
-  const trailEnabled = Boolean(trailCfg?.enabled);
-  const trailProfitThreshold = resolveTrailProfitThreshold(
-    trailCfg,
-    initialCapital
-  );
+  const positionLots = resolvePositionLots(req);
+  const lotRules = resolveLotRules(req.strategy, positionLots, initialCapital);
 
   let cash = initialCapital;
-  let positionQty = 0;
+  let legs: PositionLeg[] = [];
+  const positionQty = () => legs.reduce((s, l) => s + l.units, 0);
   let entryPrice = 0;
   let entryTime = 0;
   let entryBar = 0;
@@ -128,8 +148,6 @@ export function runBacktest(
   let entryLabel = "";
   let entryPremiumSource: "market" | "model" | undefined;
   let entryInstrumentKey = "";
-  /** Once true, stop is at entry (breakeven) until exit */
-  let trailToCostArmed = false;
   let tradesOnDay = 0;
   let currentDay = "";
 
@@ -138,6 +156,8 @@ export function runBacktest(
   let skippedNoMarketPremium = 0;
   let maxRiskStops = 0;
   let trailCostStops = 0;
+  let trailSlStops = 0;
+  let takeProfitStops = 0;
   let minLotCost = Infinity;
   let marketFills = 0;
   let modelFills = 0;
@@ -154,73 +174,136 @@ export function runBacktest(
       tradesOnDay = 0;
     }
 
+    const qtyNow = positionQty();
     const markUnit =
-      positionQty > 0
+      qtyNow > 0
         ? markUnitPrice(c, tradeInstrument, optCfg, pricer, {
             entryTime,
             entryStrike,
             entryPrice,
           })
         : 0;
-    equityCurve.push({ time: c.time, equity: cash + positionQty * markUnit });
+    equityCurve.push({ time: c.time, equity: cash + qtyNow * markUnit });
 
-    // EXIT — max risk first, then trail-to-cost, then strategy signal
-    if (positionQty > 0 && i > entryBar) {
-      // Arm trail-to-cost when unrealized profit ≥ threshold
-      if (
-        trailEnabled &&
-        trailProfitThreshold != null &&
-        !trailToCostArmed &&
-        positionQty > 0
-      ) {
-        const unrealized = (markUnit - entryPrice) * positionQty;
-        if (unrealized >= trailProfitThreshold) {
-          trailToCostArmed = true;
-        }
-      }
-
+    // EXIT — max risk → take-profit per lot → trail % / trail-to-cost → strategy
+    if (qtyNow > 0 && i > entryBar) {
       const stop = maxRiskStopHit(
         c,
         tradeInstrument,
         entryPrice,
-        positionQty,
+        qtyNow,
         maxRiskCap,
         markUnit
       );
       if (stop.hit) {
         maxRiskStops += 1;
-        closePosition(i, c, "max_risk", stop.exitPx);
+        closeAllLegs(i, c, "max_risk", stop.exitPx);
       } else {
-        const trail = trailToCostHit(
-          c,
-          tradeInstrument,
-          entryPrice,
-          positionQty,
-          trailToCostArmed,
-          markUnit
-        );
-        if (trail.hit) {
-          trailCostStops += 1;
-          closePosition(i, c, "trail_cost", trail.exitPx);
-        } else if (evalConditions(req.strategy.exit, exitLogic, i, seriesMap)) {
-          closePosition(i, c, "signal");
+        // 1) Take-profit lots (e.g. lot 1 at +20%)
+        let anyTp = false;
+        for (let li = legs.length - 1; li >= 0; li--) {
+          const leg = legs[li];
+          const tp = takeProfitHit(
+            c,
+            tradeInstrument,
+            entryPrice,
+            leg.takeProfitPct,
+            markUnit
+          );
+          if (tp.hit) {
+            takeProfitStops += 1;
+            anyTp = true;
+            closeOneLeg(li, i, c, "take_profit", tp.exitPx);
+          }
+        }
+        // After partial TP, arm trail-to-cost on remaining lots that opted in
+        if (anyTp) {
+          for (const leg of legs) {
+            if (leg.armToCostOnPartialTp && leg.trailToCostEnabled) {
+              leg.trailToCostArmed = true;
+            }
+          }
+        }
+
+        // 2) Per-lot trail SL / trail-to-cost
+        for (let li = legs.length - 1; li >= 0; li--) {
+          const leg = legs[li];
+          if (
+            leg.trailToCostEnabled &&
+            leg.trailToCostThreshold != null &&
+            !leg.trailToCostArmed
+          ) {
+            const legU = (markUnit - entryPrice) * leg.units;
+            if (legU >= leg.trailToCostThreshold) leg.trailToCostArmed = true;
+          }
+
+          const trailSl = trailStopPctHit(
+            c,
+            tradeInstrument,
+            leg.trailPeak,
+            leg.trailPct,
+            markUnit
+          );
+          if (trailSl.hit) {
+            trailSlStops += 1;
+            closeOneLeg(li, i, c, "trail_sl", trailSl.exitPx);
+            continue;
+          }
+          if (leg.trailPct != null) {
+            leg.trailPeak =
+              tradeInstrument === "options_atm"
+                ? Math.max(leg.trailPeak, markUnit)
+                : Math.max(leg.trailPeak, c.high, c.close);
+          }
+
+          const trailCost = trailToCostHit(
+            c,
+            tradeInstrument,
+            entryPrice,
+            leg.units,
+            leg.trailToCostArmed,
+            markUnit
+          );
+          if (trailCost.hit) {
+            trailCostStops += 1;
+            closeOneLeg(li, i, c, "trail_cost", trailCost.exitPx);
+          }
+        }
+
+        if (
+          legs.length > 0 &&
+          evalConditions(req.strategy.exit, exitLogic, i, seriesMap)
+        ) {
+          for (let li = legs.length - 1; li >= 0; li--) {
+            if (legs[li].exitOnSignal) closeOneLeg(li, i, c, "signal");
+          }
         }
       }
-    } else if (positionQty > 0) {
-      // entry bar: strategy exit only (no same-bar stop after close entry)
+    } else if (qtyNow > 0) {
+      for (const leg of legs) {
+        leg.trailPeak =
+          tradeInstrument === "options_atm"
+            ? Math.max(entryPrice, markUnit)
+            : Math.max(entryPrice, c.high, c.close);
+      }
       if (evalConditions(req.strategy.exit, exitLogic, i, seriesMap)) {
-        closePosition(i, c, "signal");
+        for (let li = legs.length - 1; li >= 0; li--) {
+          if (legs[li].exitOnSignal) closeOneLeg(li, i, c, "signal");
+        }
       }
     }
 
-    // ENTRY - equity signal, then execute equity or ATM option
-    if (positionQty === 0) {
+    // ENTRY
+    if (positionQty() === 0) {
       const inDateWindow = !entryNotBeforeMs || c.time >= entryNotBeforeMs;
       const inTimeWindow = isInEntryTimeWindows(c.time, entryWindows);
       const dayLimitHit = oneTradePerDay && tradesOnDay >= 1;
+      const dayAllowed =
+        !allowedEntryDates || allowedEntryDates.has(sessionDayKey(c.time));
       if (
         inDateWindow &&
         inTimeWindow &&
+        dayAllowed &&
         !dayLimitHit &&
         evalConditions(req.strategy.entry, entryLogic, i, seriesMap)
       ) {
@@ -231,11 +314,10 @@ export function runBacktest(
   }
 
   let openLeg: BacktestResult["openPosition"] | undefined;
-  if (positionQty > 0) {
+  if (positionQty() > 0) {
     const last = candles[candles.length - 1];
+    const qtyOpen = positionQty();
     if (req.leaveOpenPositions) {
-      // Mark in *same units as entry*: equity = stock ₹, options = premium ₹
-      // (Never use underlying close as option mark — that inflated uP&L massively.)
       let mark = markUnitPrice(last, tradeInstrument, optCfg, pricer, {
         entryTime,
         entryStrike,
@@ -249,15 +331,10 @@ export function runBacktest(
           strike: entryStrike,
           heldFromMs: entryTime,
         });
-        if (
-          !q.missing &&
-          q.source === "market" &&
-          q.premium > 0
-        ) {
+        if (!q.missing && q.source === "market" && q.premium > 0) {
           mark = q.premium;
           markSource = "market";
         } else if (pricer.marketOnly) {
-          // Freeze at entry until worker applies live LTP
           mark = entryPrice;
           markSource = "market";
         } else {
@@ -267,16 +344,16 @@ export function runBacktest(
       } else if (tradeInstrument === "options_atm") {
         markSource = requireMarketPremium ? "market" : "model";
       }
-      const unrealized = (mark - entryPrice) * positionQty;
+      const unrealized = (mark - entryPrice) * qtyOpen;
       equityCurve[equityCurve.length - 1] = {
         time: last.time,
-        equity: cash + positionQty * mark,
+        equity: cash + qtyOpen * mark,
       };
       openLeg = {
         entryTime,
         entryPrice,
-        qty: positionQty,
-        capitalUsed: entryPrice * Math.abs(positionQty),
+        qty: qtyOpen,
+        capitalUsed: entryPrice * Math.abs(qtyOpen),
         underlyingEntry: entryUnderlying || undefined,
         underlyingMark: last.close,
         strike: entryStrike || undefined,
@@ -292,7 +369,7 @@ export function runBacktest(
         markSource,
       };
     } else {
-      closePosition(candles.length - 1, last, "eod");
+      closeAllLegs(candles.length - 1, last, "eod");
       equityCurve[equityCurve.length - 1] = { time: last.time, equity: cash };
     }
   }
@@ -304,9 +381,14 @@ export function runBacktest(
     skippedNoMarketPremium,
     maxRiskStops,
     trailCostStops,
+    trailSlStops,
+    takeProfitStops,
     minLotCost: Number.isFinite(minLotCost) ? minLotCost : undefined,
     maxRiskCap: maxRiskCap ?? undefined,
-    trailProfitThreshold: trailProfitThreshold ?? undefined,
+    trailProfitThreshold: undefined,
+    trailSlPct: lotRules.some((r) => r.trailPct && r.trailPct > 0)
+      ? lotRules.find((r) => r.trailPct && r.trailPct > 0)?.trailPct
+      : undefined,
     tradeInstrument,
     oneTradePerDay,
     lotSize: optCfg.lotSize,
@@ -354,6 +436,7 @@ export function runBacktest(
 
   function openPosition(i: number, c: Candle) {
     const spot = c.close;
+    const nLots = positionLots;
 
     if (tradeInstrument === "options_atm") {
       if (optCfg.lotSize <= 0) {
@@ -366,7 +449,6 @@ export function runBacktest(
         ? pricer.strikeFor(spot)
         : atmStrike(spot, optCfg.strikeStep, optCfg.listedStrikes);
 
-      // Strict market-only: no pricer or no BS fallback without market series
       if (requireMarketPremium && !pricer) {
         skippedNoMarketPremium += 1;
         return;
@@ -402,24 +484,21 @@ export function runBacktest(
       if (q.source === "market") marketFills += 1;
       else modelFills += 1;
 
-      // F&O: always exactly 1 lot per trade; funded from total capital pool
-      const lots = 1;
       const costPerLot = premium * optCfg.lotSize;
       if (costPerLot < minLotCost) minLotCost = costPerLot;
-      if (costPerLot <= 0 || cash < costPerLot) {
+      const totalCost = costPerLot * nLots;
+      if (costPerLot <= 0 || cash < totalCost) {
         skippedInsufficientCapital += 1;
         return;
       }
 
-      const units = lots * optCfg.lotSize;
-      cash -= units * premium;
-      positionQty = units;
+      cash -= totalCost;
       entryPrice = premium;
       entryTime = c.time;
       entryBar = i;
       entryUnderlying = spot;
       entryStrike = q.strike || strike;
-      entryLots = lots;
+      entryLots = nLots;
       entryPremiumSource = q.source;
       entryInstrumentKey =
         ("instrumentKey" in q && typeof q.instrumentKey === "string"
@@ -432,12 +511,44 @@ export function runBacktest(
           entryStrike,
           optCfg.side
         );
-      trailToCostArmed = false;
+
+      legs = [];
+      for (let ln = 1; ln <= nLots; ln++) {
+        const rule = lotRules[ln - 1];
+        const trailPct =
+          rule.trailPct != null && rule.trailPct > 0
+            ? Math.min(50, rule.trailPct)
+            : null;
+        const thrPct = rule.trailToCostProfitPctOfCapital ?? 20;
+        const trailToCostEnabled = Boolean(rule.trailToCost);
+        const takeProfitPct =
+          rule.takeProfitPct != null && rule.takeProfitPct > 0
+            ? Math.min(500, rule.takeProfitPct)
+            : null;
+        legs.push({
+          lotNo: ln,
+          units: optCfg.lotSize,
+          lots: 1,
+          trailPeak: premium,
+          trailPct,
+          takeProfitPct,
+          trailToCostArmed: false,
+          trailToCostEnabled,
+          trailToCostThreshold: trailToCostEnabled
+            ? (initialCapital * Math.min(100, thrPct)) / 100 / nLots
+            : null,
+          armToCostOnPartialTp:
+            rule.armToCostOnPartialTp !== undefined
+              ? Boolean(rule.armToCostOnPartialTp)
+              : trailToCostEnabled,
+          exitOnSignal: rule.exitOnSignal !== false,
+        });
+      }
       tradesOnDay += 1;
       return;
     }
 
-    // Equity: cap each trade by % of *total* capital (not compounding full stack)
+    // Equity: split position into nLots equal slices
     const maxSpend = Math.min(cash, initialCapital * sizePct);
     let qty = Math.floor(maxSpend / spot);
     if (qty <= 0 && cash >= spot) qty = 1;
@@ -445,8 +556,58 @@ export function runBacktest(
       skippedInsufficientCapital += 1;
       return;
     }
+    // Ensure at least nLots shares when possible
+    if (qty < nLots && cash >= spot * nLots) qty = nLots;
+    const base = Math.floor(qty / nLots);
+    const rem = qty - base * nLots;
+    if (base <= 0) {
+      // single slice
+      cash -= qty * spot;
+      entryPrice = spot;
+      entryTime = c.time;
+      entryBar = i;
+      entryUnderlying = spot;
+      entryStrike = 0;
+      entryLots = 0;
+      entryLabel = "";
+      entryPremiumSource = undefined;
+      entryInstrumentKey = "";
+      const rule = lotRules[0];
+      const trailToCostEnabled = Boolean(rule.trailToCost);
+      const takeProfitPct =
+        rule.takeProfitPct != null && rule.takeProfitPct > 0
+          ? Math.min(500, rule.takeProfitPct)
+          : null;
+      legs = [
+        {
+          lotNo: 1,
+          units: qty,
+          lots: 0,
+          trailPeak: Math.max(spot, c.high),
+          trailPct:
+            rule.trailPct != null && rule.trailPct > 0
+              ? Math.min(50, rule.trailPct)
+              : null,
+          takeProfitPct,
+          trailToCostArmed: false,
+          trailToCostEnabled,
+          trailToCostThreshold: trailToCostEnabled
+            ? (initialCapital *
+                Math.min(100, rule.trailToCostProfitPctOfCapital ?? 20)) /
+              100
+            : null,
+          armToCostOnPartialTp:
+            rule.armToCostOnPartialTp !== undefined
+              ? Boolean(rule.armToCostOnPartialTp)
+              : trailToCostEnabled,
+          exitOnSignal: rule.exitOnSignal !== false,
+        },
+      ];
+      tradesOnDay += 1;
+      return;
+    }
+
     cash -= qty * spot;
-    positionQty = qty;
     entryPrice = spot;
     entryTime = c.time;
     entryBar = i;
@@ -456,28 +617,59 @@ export function runBacktest(
     entryLabel = "";
     entryPremiumSource = undefined;
     entryInstrumentKey = "";
-    trailToCostArmed = false;
+    legs = [];
+    for (let ln = 1; ln <= nLots; ln++) {
+      const units = base + (ln <= rem ? 1 : 0);
+      if (units <= 0) continue;
+      const rule = lotRules[ln - 1] || lotRules[0];
+      const trailToCostEnabled = Boolean(rule.trailToCost);
+      const takeProfitPct =
+        rule.takeProfitPct != null && rule.takeProfitPct > 0
+          ? Math.min(500, rule.takeProfitPct)
+          : null;
+      legs.push({
+        lotNo: ln,
+        units,
+        lots: 0,
+        trailPeak: Math.max(spot, c.high),
+        trailPct:
+          rule.trailPct != null && rule.trailPct > 0
+            ? Math.min(50, rule.trailPct)
+            : null,
+        takeProfitPct,
+        trailToCostArmed: false,
+        trailToCostEnabled,
+        trailToCostThreshold: trailToCostEnabled
+          ? (initialCapital *
+              Math.min(100, rule.trailToCostProfitPctOfCapital ?? 20)) /
+            100 /
+            nLots
+          : null,
+        armToCostOnPartialTp:
+          rule.armToCostOnPartialTp !== undefined
+            ? Boolean(rule.armToCostOnPartialTp)
+            : trailToCostEnabled,
+        exitOnSignal: rule.exitOnSignal !== false,
+      });
+    }
     tradesOnDay += 1;
   }
 
-  function closePosition(
-    i: number,
+  function resolveExitPx(
     c: Candle,
-    exitReason: "signal" | "max_risk" | "trail_cost" | "eod" = "signal",
-    /** When set (max-risk / trail-to-cost stop), fill at this unit price */
     forcedExitPx?: number
-  ) {
+  ): { exitPx: number; exitSource?: "market" | "model" } {
     const spot = c.close;
-    let exitPx: number;
-    let exitSource: "market" | "model" | undefined;
-
     if (forcedExitPx != null && Number.isFinite(forcedExitPx)) {
-      exitPx = Math.max(0, forcedExitPx);
-      exitSource =
-        tradeInstrument === "options_atm"
-          ? entryPremiumSource || "model"
-          : undefined;
-    } else if (tradeInstrument === "options_atm") {
+      return {
+        exitPx: Math.max(0, forcedExitPx),
+        exitSource:
+          tradeInstrument === "options_atm"
+            ? entryPremiumSource || "model"
+            : undefined,
+      };
+    }
+    if (tradeInstrument === "options_atm") {
       if (pricer) {
         const q = pricer.quote({
           timeMs: c.time,
@@ -485,50 +677,71 @@ export function runBacktest(
           strike: entryStrike,
           heldFromMs: entryTime,
         });
-        exitPx = q.premium;
-        exitSource = q.source;
         if (q.source === "market") marketFills += 1;
         else modelFills += 1;
-      } else {
-        exitPx = optionPremium(
+        return { exitPx: q.premium, exitSource: q.source };
+      }
+      modelFills += 1;
+      return {
+        exitPx: optionPremium(
           spot,
           entryStrike,
           yearsToExpiry(optCfg.daysToExpiry, c.time - entryTime),
           0.065,
           optCfg.iv,
           optCfg.side
-        );
-        exitSource = "model";
-        modelFills += 1;
-      }
-    } else {
-      exitPx = spot;
+        ),
+        exitSource: "model",
+      };
     }
+    return { exitPx: spot };
+  }
 
-    // Final safety: never realize worse than -maxRiskCap on a max_risk exit
+  function closeOneLeg(
+    legIndex: number,
+    i: number,
+    c: Candle,
+    exitReason:
+      | "signal"
+      | "max_risk"
+      | "trail_cost"
+      | "trail_sl"
+      | "take_profit"
+      | "eod" = "signal",
+    forcedExitPx?: number
+  ) {
+    const leg = legs[legIndex];
+    if (!leg || leg.units <= 0) return;
+    let { exitPx, exitSource } = resolveExitPx(c, forcedExitPx);
+    const units = leg.units;
+
     if (
       exitReason === "max_risk" &&
       maxRiskCap != null &&
-      positionQty > 0
+      units > 0
     ) {
-      const rawPnl = (exitPx - entryPrice) * positionQty;
-      if (rawPnl < -maxRiskCap) {
-        exitPx = entryPrice - maxRiskCap / positionQty;
-        exitPx = Math.max(0, exitPx);
+      const rawPnl = (exitPx - entryPrice) * units;
+      // scale max risk share by leg size vs original entry lots
+      const share =
+        entryLots > 0 ? leg.lots / entryLots : 1 / Math.max(1, legs.length);
+      const cap = maxRiskCap * share;
+      if (rawPnl < -cap) {
+        exitPx = Math.max(0, entryPrice - cap / units);
       }
     }
 
-    const pnl = (exitPx - entryPrice) * positionQty;
-    const pnlPct = entryPrice > 0 ? ((exitPx - entryPrice) / entryPrice) * 100 : 0;
-
-    const capitalUsed = entryPrice * positionQty;
+    const pnl = (exitPx - entryPrice) * units;
+    const pnlPct =
+      entryPrice > 0 ? ((exitPx - entryPrice) / entryPrice) * 100 : 0;
+    const capitalUsed = entryPrice * units;
+    const spot = c.close;
 
     const trade: Trade = {
       entryTime,
       exitTime: c.time,
       entryPrice,
       exitPrice: exitPx,
-      qty: positionQty,
+      qty: units,
       capitalUsed,
       pnl,
       pnlPct,
@@ -537,14 +750,17 @@ export function runBacktest(
       underlyingExit: spot,
       instrument: tradeInstrument,
       exitReason,
+      label:
+        tradeInstrument === "options_atm"
+          ? `${entryLabel || "opt"} · lot ${leg.lotNo}`
+          : `lot ${leg.lotNo}`,
     };
 
     if (tradeInstrument === "options_atm") {
       trade.optionSide = optCfg.side;
       trade.strike = entryStrike;
-      trade.lots = entryLots;
+      trade.lots = leg.lots;
       trade.lotSize = optCfg.lotSize;
-      trade.label = entryLabel;
       trade.lotCostEntry = entryPrice * optCfg.lotSize;
       trade.lotCostExit = exitPx * optCfg.lotSize;
       trade.premiumSource = entryPremiumSource;
@@ -552,9 +768,28 @@ export function runBacktest(
     }
 
     trades.push(trade);
-    cash += positionQty * exitPx;
-    positionQty = 0;
-    trailToCostArmed = false;
+    cash += units * exitPx;
+    legs.splice(legIndex, 1);
+    if (legs.length === 0) {
+      entryLots = 0;
+    }
+  }
+
+  function closeAllLegs(
+    i: number,
+    c: Candle,
+    exitReason:
+      | "signal"
+      | "max_risk"
+      | "trail_cost"
+      | "trail_sl"
+      | "take_profit"
+      | "eod" = "signal",
+    forcedExitPx?: number
+  ) {
+    for (let li = legs.length - 1; li >= 0; li--) {
+      closeOneLeg(li, i, c, exitReason, forcedExitPx);
+    }
   }
 }
 
@@ -665,6 +900,145 @@ function trailToCostHit(
   return { hit: false };
 }
 
+/**
+ * Classic trailing SL: stop = peak × (1 − pct/100).
+ * Equity: hit if bar low ≤ stop (fill at stop, or open if gap through).
+ * Options: hit if mark premium ≤ stop.
+ */
+function trailStopPctHit(
+  c: Candle,
+  instrument: TradeInstrument,
+  peak: number,
+  trailPct: number | null,
+  markUnit: number
+): { hit: boolean; exitPx?: number } {
+  if (trailPct == null || !(peak > 0) || trailPct <= 0) {
+    return { hit: false };
+  }
+  const stopLevel = peak * (1 - trailPct / 100);
+  if (!(stopLevel > 0)) return { hit: false };
+
+  if (instrument !== "options_atm") {
+    if (c.low <= stopLevel || c.close <= stopLevel) {
+      // Gap open below stop → fill open; else fill at stop
+      const fill =
+        c.open < stopLevel ? Math.max(0, c.open) : Math.max(0, stopLevel);
+      return { hit: true, exitPx: fill };
+    }
+    return { hit: false };
+  }
+
+  if (markUnit <= stopLevel) {
+    return { hit: true, exitPx: Math.max(0, stopLevel) };
+  }
+  return { hit: false };
+}
+
+function resolveTrailStopPct(
+  cfg: StrategyConfig["trailStop"] | undefined
+): number | null {
+  if (!cfg?.enabled) return null;
+  const pct = Number(cfg.pct);
+  if (!Number.isFinite(pct) || pct <= 0) return null;
+  return Math.min(50, pct); // cap 50% trail distance
+}
+
+function resolvePositionLots(req: BacktestRequest): number {
+  const fromStrat = Number(req.strategy.positionLots);
+  const fromOpt = Number(req.options?.lots);
+  const n = Number.isFinite(fromStrat) && fromStrat > 0
+    ? fromStrat
+    : Number.isFinite(fromOpt) && fromOpt > 0
+      ? fromOpt
+      : 1;
+  return Math.min(5, Math.max(1, Math.floor(n)));
+}
+
+/** Build per-lot rules; fall back to strategy-level trailStop / trailStopToCost. */
+function resolveLotRules(
+  strategy: StrategyConfig,
+  nLots: number,
+  _initialCapital: number
+): LotTrailRule[] {
+  const globalTrail = resolveTrailStopPct(strategy.trailStop);
+  const globalToCost = Boolean(strategy.trailStopToCost?.enabled);
+  const globalToCostPct = strategy.trailStopToCost?.profitPctOfCapital ?? 20;
+  const rules: LotTrailRule[] = [];
+  for (let i = 0; i < nLots; i++) {
+    const custom = strategy.lotRules?.[i];
+    if (custom) {
+      const tp =
+        custom.takeProfitPct != null && custom.takeProfitPct > 0
+          ? custom.takeProfitPct
+          : undefined;
+      const trailToCost = Boolean(custom.trailToCost);
+      rules.push({
+        takeProfitPct: tp,
+        trailPct:
+          custom.trailPct != null && custom.trailPct > 0
+            ? custom.trailPct
+            : undefined,
+        trailToCost,
+        trailToCostProfitPctOfCapital:
+          custom.trailToCostProfitPctOfCapital ?? globalToCostPct,
+        // Default: arm BE when any lot books TP (scale-out runner)
+        armToCostOnPartialTp:
+          custom.armToCostOnPartialTp !== undefined
+            ? custom.armToCostOnPartialTp
+            : trailToCost,
+        exitOnSignal: custom.exitOnSignal !== false,
+      });
+    } else {
+      rules.push({
+        trailPct: globalTrail ?? undefined,
+        trailToCost: globalToCost,
+        trailToCostProfitPctOfCapital: globalToCostPct,
+        armToCostOnPartialTp: globalToCost,
+        exitOnSignal: true,
+      });
+    }
+  }
+  return rules;
+}
+
+/**
+ * Take-profit: close when mark is +pct% above entry.
+ * Equity long: bar high/close ≥ target → fill min(high, max(open, target)).
+ * Options long: mark premium ≥ target → fill at target (or mark if worse).
+ */
+function takeProfitHit(
+  c: Candle,
+  instrument: TradeInstrument,
+  entryPrice: number,
+  takeProfitPct: number | null,
+  markUnit: number
+): { hit: boolean; exitPx?: number } {
+  if (
+    takeProfitPct == null ||
+    !(takeProfitPct > 0) ||
+    !(entryPrice > 0)
+  ) {
+    return { hit: false };
+  }
+  const target = entryPrice * (1 + takeProfitPct / 100);
+  if (!(target > entryPrice)) return { hit: false };
+
+  if (instrument !== "options_atm") {
+    if (c.high >= target || c.close >= target) {
+      // Gap open above target → fill open; else fill at target
+      const fill =
+        c.open > target ? c.open : Math.min(c.high, Math.max(c.open, target));
+      return { hit: true, exitPx: Math.max(0, fill) };
+    }
+    return { hit: false };
+  }
+
+  if (markUnit >= target) {
+    return { hit: true, exitPx: Math.max(0, markUnit) };
+  }
+  return { hit: false };
+}
+
 function resolveTrailProfitThreshold(
   cfg: StrategyConfig["trailStopToCost"] | undefined,
   initialCapital: number
@@ -713,9 +1087,12 @@ function buildDiagnostics(d: {
   skippedNoMarketPremium?: number;
   maxRiskStops?: number;
   trailCostStops?: number;
+  trailSlStops?: number;
+  takeProfitStops?: number;
   minLotCost?: number;
   maxRiskCap?: number;
   trailProfitThreshold?: number;
+  trailSlPct?: number;
   tradeInstrument: TradeInstrument;
   oneTradePerDay: boolean;
   lotSize: number;
@@ -743,6 +1120,10 @@ function buildDiagnostics(d: {
     d.trailProfitThreshold != null
       ? ` Trail-to-cost arms at +Rs ${Math.round(d.trailProfitThreshold).toLocaleString("en-IN")} profit.`
       : "";
+  const trailSlNote =
+    d.trailSlPct != null
+      ? ` Trailing SL ${d.trailSlPct}% from peak.`
+      : "";
 
   if (d.entriesTaken === 0 && d.equitySignals === 0) {
     note =
@@ -767,6 +1148,10 @@ function buildDiagnostics(d: {
     note = `Equity signals fired ${d.equitySignals}x but no trades were opened. Check capital.`;
   } else if ((d.maxRiskStops || 0) > 0) {
     note = `${d.maxRiskStops} trade(s) exited on max-risk stop.${riskCapNote}`;
+  } else if ((d.takeProfitStops || 0) > 0) {
+    note = `${d.takeProfitStops} lot(s) booked take-profit (scale-out).`;
+  } else if ((d.trailSlStops || 0) > 0) {
+    note = `${d.trailSlStops} trade(s) exited on trailing SL.${trailSlNote}`;
   } else if ((d.trailCostStops || 0) > 0) {
     note = `${d.trailCostStops} trade(s) exited on trail-to-cost (breakeven).${trailNote}`;
   } else if (d.skippedInsufficientCapital > 0) {
@@ -791,6 +1176,7 @@ function buildDiagnostics(d: {
     skippedNoMarketPremium: d.skippedNoMarketPremium || 0,
     maxRiskStops: d.maxRiskStops || 0,
     trailCostStops: d.trailCostStops || 0,
+    trailSlStops: d.trailSlStops || 0,
     candleCount: d.candleCount,
     firstBarTime: d.firstBarTime,
     lastBarTime: d.lastBarTime,
@@ -856,9 +1242,10 @@ function collectOperand(
 
 function defaultPeriod(type: IndicatorType): number {
   if (type === "RSI" || type === "ADX") return 14;
-  if (type === "VWAP") return 1;
-  if (type === "OPENING_RANGE_HIGH" || type === "OPENING_RANGE_LOW") return 1;
-  if (type === "BREAKOUT_HIGH" || type === "BREAKOUT_LOW") return 1;
+  if (type === "VWAP" || type === "OBV") return 1;
+  if (type === "VOL_RATIO") return 20;
+  if (type === "OPENING_RANGE_HIGH" || type === "OPENING_RANGE_LOW") return 15;
+  if (type === "BREAKOUT_HIGH" || type === "BREAKOUT_LOW") return 15;
   if (type.startsWith("FIB_PIVOT")) return 1;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return 1;
   return 9;
@@ -894,11 +1281,21 @@ function evalCondition(
   i: number,
   seriesMap: Map<string, (number | null)[]>
 ): boolean {
+  const op = cond.op;
+
+  // rising / falling: left[i] vs left[i-1] (right ignored)
+  if (op === "rising" || op === "falling") {
+    if (i === 0) return false;
+    const left = resolveValue(cond.left, i, seriesMap);
+    const leftPrev = resolveValue(cond.left, i - 1, seriesMap);
+    if (left == null || leftPrev == null) return false;
+    return op === "rising" ? left > leftPrev : left < leftPrev;
+  }
+
   const left = resolveValue(cond.left, i, seriesMap);
   const right = resolveValue(cond.right, i, seriesMap);
   if (left == null || right == null) return false;
 
-  const op = cond.op;
   if (op === "gt") return left > right;
   if (op === "gte") return left >= right;
   if (op === "lt") return left < right;
@@ -965,6 +1362,7 @@ export function buildDaySummaries(trades: Trade[]): DaySummary[] {
     else if (
       t.exitReason === "signal" ||
       t.exitReason === "trail_cost" ||
+      t.exitReason === "trail_sl" ||
       !t.exitReason
     )
       row.signalExits += 1;

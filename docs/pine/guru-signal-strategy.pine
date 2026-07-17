@@ -1,0 +1,362 @@
+//@version=6
+strategy(
+     "Guru Signal Strategy",
+     "Guru Strat",
+     overlay = true,
+     max_lines_count = 100,
+     max_labels_count = 100,
+     process_orders_on_close = true,
+     initial_capital = 100000,
+     default_qty_type = strategy.percent_of_equity,
+     default_qty_value = 100,
+     commission_type = strategy.commission.percent,
+     commission_value = 0.03,
+     slippage = 1,
+     calc_on_every_tick = false
+)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// INPUTS
+// ═════════════════════════════════════════════════════════════════════════════
+
+string GRP_CORE = "Core"
+int    ema_length    = input.int(200, "EMA Length", group=GRP_CORE, minval=1)
+int    rsi_length    = input.int(14,  "RSI Length", group=GRP_CORE, minval=1)
+int    rsi_buy_min   = input.int(60,  "RSI Min for BUY",  group=GRP_CORE, minval=1, maxval=100)
+int    rsi_sell_max  = input.int(40,  "RSI Max for SELL", group=GRP_CORE, minval=1, maxval=100)
+int    obv_ma_length = input.int(20,  "OBV MA (unused; rising/falling only)", group=GRP_CORE, minval=1)
+
+string GRP_VOL  = "Volume"
+int    vol_ma_len = input.int(20,    "Volume MA Length", group=GRP_VOL, minval=1)
+float  vol_mult   = input.float(1.5, "Volume Spike Multiplier", group=GRP_VOL, minval=1.0, step=0.1)
+
+string GRP_HTF = "Higher Timeframe Bias"
+int    htf_ema_len   = input.int(50, "HTF EMA Length", group=GRP_HTF, minval=1)
+bool   use_4h        = input.bool(true, "Use 4H Bias", group=GRP_HTF)
+bool   use_15m       = input.bool(true, "Use 15m Bias", group=GRP_HTF)
+bool   use_5m        = input.bool(true, "Use 5m Bias", group=GRP_HTF)
+int    min_htf_score = input.int(2, "Min HTF Confirmations (of 3)", group=GRP_HTF, minval=1, maxval=3)
+
+string GRP_OB = "Order Block (simplified)"
+int    pivotLenInput = input.int(5, "OB Pivot Lookback", group=GRP_OB, minval=2)
+int    maxOBsInput   = input.int(5, "Max Active OBs", group=GRP_OB, minval=1, maxval=20)
+bool   require_ob    = input.bool(true, "Require Active OB Alignment", group=GRP_OB,
+     tooltip="BUY: price above bottom of an unmitigated bullish OB. SELL: below top of bearish OB.")
+
+string GRP_OR = "India Opening Range (IST)"
+bool   use_or_cross  = input.bool(true, "Require 5m cross of 9:15 High/Low", group=GRP_OR)
+bool   session_only  = input.bool(true, "Signals only in NSE session (09:15–15:30 IST)", group=GRP_OR)
+
+string GRP_EX = "Exits / Risk"
+float  sl_atr_mult = input.float(1.5, "SL ATR Multiplier", group=GRP_EX, minval=0.1, step=0.1)
+float  tp1_rr      = input.float(1.0, "TP1 R:R", group=GRP_EX, minval=0.1, step=0.1)
+float  tp2_rr      = input.float(2.0, "TP2 R:R", group=GRP_EX, minval=0.1, step=0.1)
+float  tp3_rr      = input.float(3.0, "TP3 R:R", group=GRP_EX, minval=0.1, step=0.1)
+int    atr_length  = input.int(14, "ATR Length", group=GRP_EX, minval=1)
+bool   use_tp_ladder = input.bool(true, "Use multi-TP ladder (33/33/34%)", group=GRP_EX)
+bool   exit_on_flip  = input.bool(true, "Exit on opposite signal", group=GRP_EX)
+bool   one_trade_per_day = input.bool(true, "One new entry per IST day (per direction)", group=GRP_EX)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// CORE SERIES
+// ═════════════════════════════════════════════════════════════════════════════
+
+float ema200 = ta.ema(close, ema_length)
+float rsi    = ta.rsi(close, rsi_length)
+float obv    = ta.obv
+float vol_ma = ta.sma(volume, vol_ma_len)
+float atr    = ta.atr(atr_length)
+
+bool open_above_ema = open > ema200
+bool open_below_ema = open < ema200
+bool rsi_rising     = rsi > rsi[1]
+bool rsi_falling    = rsi < rsi[1]
+bool obv_rising     = obv > obv[1]
+bool obv_falling    = obv < obv[1]
+bool vol_spike      = volume >= vol_ma * vol_mult
+
+// ═════════════════════════════════════════════════════════════════════════════
+// HTF BIAS (4H / 15m / 5m)
+// ═════════════════════════════════════════════════════════════════════════════
+
+float htf_4h_close = request.security(syminfo.tickerid, "240", close, lookahead=barmerge.lookahead_off)
+float htf_4h_ema   = request.security(syminfo.tickerid, "240", ta.ema(close, htf_ema_len), lookahead=barmerge.lookahead_off)
+bool  htf_4h_bull  = htf_4h_close > htf_4h_ema
+bool  htf_4h_bear  = htf_4h_close < htf_4h_ema
+
+float htf_15m_close = request.security(syminfo.tickerid, "15", close, lookahead=barmerge.lookahead_off)
+float htf_15m_ema   = request.security(syminfo.tickerid, "15", ta.ema(close, htf_ema_len), lookahead=barmerge.lookahead_off)
+bool  htf_15m_bull  = htf_15m_close > htf_15m_ema
+bool  htf_15m_bear  = htf_15m_close < htf_15m_ema
+
+float htf_5m_close = request.security(syminfo.tickerid, "5", close, lookahead=barmerge.lookahead_off)
+float htf_5m_ema   = request.security(syminfo.tickerid, "5", ta.ema(close, htf_ema_len), lookahead=barmerge.lookahead_off)
+bool  htf_5m_bull  = htf_5m_close > htf_5m_ema
+bool  htf_5m_bear  = htf_5m_close < htf_5m_ema
+
+int htf_bull_score =
+     (use_4h  and htf_4h_bull  ? 1 : 0) +
+     (use_15m and htf_15m_bull ? 1 : 0) +
+     (use_5m  and htf_5m_bull  ? 1 : 0)
+
+int htf_bear_score =
+     (use_4h  and htf_4h_bear  ? 1 : 0) +
+     (use_15m and htf_15m_bear ? 1 : 0) +
+     (use_5m  and htf_5m_bear  ? 1 : 0)
+
+bool htf_bull = htf_bull_score >= min_htf_score
+bool htf_bear = htf_bear_score >= min_htf_score
+
+// ═════════════════════════════════════════════════════════════════════════════
+// IST SESSION + 9:15 OPENING RANGE
+// ═════════════════════════════════════════════════════════════════════════════
+
+int t_hour   = hour(time, "Asia/Kolkata")
+int t_minute = minute(time, "Asia/Kolkata")
+
+bool is_new_day = ta.change(time("D", "Asia/Kolkata")) != 0
+bool is_915_bar = t_hour == 9 and t_minute == 15
+bool in_session =
+     (t_hour > 9 or (t_hour == 9 and t_minute >= 15)) and
+     (t_hour < 15 or (t_hour == 15 and t_minute < 30))
+
+var float or_high = na
+var float or_low  = na
+var bool  or_captured = false
+
+if is_new_day
+    or_captured := false
+    or_high := na
+    or_low  := na
+
+if is_915_bar and not or_captured
+    or_high := high
+    or_low  := low
+    or_captured := true
+
+// 5m close vs OR (HTF security for crossover)
+float close_5m = request.security(syminfo.tickerid, "5", close, lookahead=barmerge.lookahead_off)
+float close_5m_prev = request.security(syminfo.tickerid, "5", close[1], lookahead=barmerge.lookahead_off)
+
+bool cross_above_or_high =
+     not na(or_high) and close_5m_prev <= or_high and close_5m > or_high
+bool cross_below_or_low =
+     not na(or_low) and close_5m_prev >= or_low and close_5m < or_low
+
+// Also accept chart-TF crossover of OR if chart is already 5m
+bool chart_cross_or_high = not na(or_high) and ta.crossover(close, or_high)
+bool chart_cross_or_low  = not na(or_low)  and ta.crossunder(close, or_low)
+
+bool or_buy_ok  = not use_or_cross or cross_above_or_high or (timeframe.isintraday and timeframe.multiplier == 5 and chart_cross_or_high)
+bool or_sell_ok = not use_or_cross or cross_below_or_low  or (timeframe.isintraday and timeframe.multiplier == 5 and chart_cross_or_low)
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SIMPLIFIED ORDER BLOCKS (pivot-based demand/supply)
+// ═════════════════════════════════════════════════════════════════════════════
+// Bullish OB: last swing low zone (pivot low high/low of that bar) while unmitigated
+// Bearish OB: last swing high zone while unmitigated
+// Mitigated when price trades through the zone.
+
+float ph = ta.pivothigh(high, pivotLenInput, pivotLenInput)
+float pl = ta.pivotlow(low, pivotLenInput, pivotLenInput)
+
+// Rolling arrays of active OBs: [top, bottom]
+var array<float> bull_tops = array.new_float()
+var array<float> bull_bots = array.new_float()
+var array<float> bear_tops = array.new_float()
+var array<float> bear_bots = array.new_float()
+
+// Detect new pivot OB (confirmed pivotLen bars ago)
+if not na(pl)
+    float bot = low[pivotLenInput]
+    float top = high[pivotLenInput]
+    array.push(bull_bots, bot)
+    array.push(bull_tops, top)
+    while array.size(bull_bots) > maxOBsInput
+        array.shift(bull_bots)
+        array.shift(bull_tops)
+
+if not na(ph)
+    float top = high[pivotLenInput]
+    float bot = low[pivotLenInput]
+    array.push(bear_tops, top)
+    array.push(bear_bots, bot)
+    while array.size(bear_bots) > maxOBsInput
+        array.shift(bear_bots)
+        array.shift(bear_tops)
+
+// Mitigate bull OBs: close below bottom
+if array.size(bull_bots) > 0
+    for i = array.size(bull_bots) - 1 to 0
+        if close < array.get(bull_bots, i)
+            array.remove(bull_bots, i)
+            array.remove(bull_tops, i)
+
+// Mitigate bear OBs: close above top
+if array.size(bear_tops) > 0
+    for i = array.size(bear_tops) - 1 to 0
+        if close > array.get(bear_tops, i)
+            array.remove(bear_tops, i)
+            array.remove(bear_bots, i)
+
+// Active bullish OB nearby: price above bottom of any unmitigated bull OB
+bool active_bull_ob = false
+float nearest_bull_bot = na
+if array.size(bull_bots) > 0
+    for i = 0 to array.size(bull_bots) - 1
+        float b = array.get(bull_bots, i)
+        float t = array.get(bull_tops, i)
+        // price above bottom (and ideally interacting with zone)
+        if close >= b
+            active_bull_ob := true
+            nearest_bull_bot := na(nearest_bull_bot) ? b : math.max(nearest_bull_bot, b)
+
+bool active_bear_ob = false
+float nearest_bear_top = na
+if array.size(bear_tops) > 0
+    for i = 0 to array.size(bear_tops) - 1
+        float t = array.get(bear_tops, i)
+        float b = array.get(bear_bots, i)
+        if close <= t
+            active_bear_ob := true
+            nearest_bear_top := na(nearest_bear_top) ? t : math.min(nearest_bear_top, t)
+
+bool ob_buy_ok  = not require_ob or active_bull_ob
+bool ob_sell_ok = not require_ob or active_bear_ob
+
+// ═════════════════════════════════════════════════════════════════════════════
+// SIGNAL CONDITIONS (as specified)
+// ═════════════════════════════════════════════════════════════════════════════
+
+// BUY — ALL true:
+// 1 open > 200 EMA
+// 2 RSI >= 60 and rising
+// 3 OBV rising
+// 4 volume spike
+// 5 HTF bullish (>= min score)
+// 6 active bullish OB
+// 7 5m cross above OR high
+
+bool raw_buy =
+     open_above_ema and
+     rsi >= rsi_buy_min and rsi_rising and
+     obv_rising and
+     vol_spike and
+     htf_bull and
+     ob_buy_ok and
+     or_buy_ok
+
+// SELL — mirror
+bool raw_sell =
+     open_below_ema and
+     rsi <= rsi_sell_max and rsi_falling and
+     obv_falling and
+     vol_spike and
+     htf_bear and
+     ob_sell_ok and
+     or_sell_ok
+
+// One signal flip per bar / direction state (like indicator last_signal)
+var int last_signal = 0
+var int last_signal_bar = -1
+var int last_entry_day = na
+
+if is_new_day
+    last_signal := 0
+    last_signal_bar := -1
+
+bool session_ok = not session_only or in_session
+bool new_bar = bar_index != last_signal_bar
+
+bool buy_signal  = raw_buy  and last_signal != 1  and new_bar and session_ok
+bool sell_signal = raw_sell and last_signal != -1 and new_bar and session_ok
+
+// One trade per day filter
+int today_id = year(time, "Asia/Kolkata") * 10000 + month(time, "Asia/Kolkata") * 100 + dayofmonth(time, "Asia/Kolkata")
+bool day_ok = not one_trade_per_day or na(last_entry_day) or last_entry_day != today_id
+
+if buy_signal
+    last_signal := 1
+    last_signal_bar := bar_index
+if sell_signal
+    last_signal := -1
+    last_signal_bar := bar_index
+
+// ═════════════════════════════════════════════════════════════════════════════
+// STRATEGY ENTRIES / EXITS
+// ═════════════════════════════════════════════════════════════════════════════
+
+float long_sl  = close - sl_atr_mult * atr
+float short_sl = close + sl_atr_mult * atr
+// Prefer OB edge for SL if available
+if not na(nearest_bull_bot)
+    long_sl := math.min(long_sl, nearest_bull_bot - 0.1 * atr)
+if not na(nearest_bear_top)
+    short_sl := math.max(short_sl, nearest_bear_top + 0.1 * atr)
+
+float long_risk  = math.max(close - long_sl, syminfo.mintick)
+float short_risk = math.max(short_sl - close, syminfo.mintick)
+
+float long_tp1  = close + tp1_rr * long_risk
+float long_tp2  = close + tp2_rr * long_risk
+float long_tp3  = close + tp3_rr * long_risk
+float short_tp1 = close - tp1_rr * short_risk
+float short_tp2 = close - tp2_rr * short_risk
+float short_tp3 = close - tp3_rr * short_risk
+
+if buy_signal and day_ok
+    if strategy.position_size < 0
+        strategy.close_all(comment = "Flip to long")
+    if strategy.position_size <= 0
+        last_entry_day := today_id
+        if use_tp_ladder
+            strategy.entry("Long", strategy.long)
+            strategy.exit("L-TP1", from_entry="Long", qty_percent=33, stop=long_sl, limit=long_tp1, comment="L-TP1")
+            strategy.exit("L-TP2", from_entry="Long", qty_percent=50, stop=long_sl, limit=long_tp2, comment="L-TP2")
+            strategy.exit("L-TP3", from_entry="Long", stop=long_sl, limit=long_tp3, comment="L-TP3")
+        else
+            strategy.entry("Long", strategy.long)
+            strategy.exit("L-Exit", from_entry="Long", stop=long_sl, limit=long_tp2, comment="L-2R")
+
+if sell_signal and day_ok
+    if strategy.position_size > 0
+        strategy.close_all(comment = "Flip to short")
+    if strategy.position_size >= 0
+        last_entry_day := today_id
+        if use_tp_ladder
+            strategy.entry("Short", strategy.short)
+            strategy.exit("S-TP1", from_entry="Short", qty_percent=33, stop=short_sl, limit=short_tp1, comment="S-TP1")
+            strategy.exit("S-TP2", from_entry="Short", qty_percent=50, stop=short_sl, limit=short_tp2, comment="S-TP2")
+            strategy.exit("S-TP3", from_entry="Short", stop=short_sl, limit=short_tp3, comment="S-TP3")
+        else
+            strategy.entry("Short", strategy.short)
+            strategy.exit("S-Exit", from_entry="Short", stop=short_sl, limit=short_tp2, comment="S-2R")
+
+if exit_on_flip
+    if sell_signal and strategy.position_size > 0
+        strategy.close("Long", comment = "Opposite signal")
+    if buy_signal and strategy.position_size < 0
+        strategy.close("Short", comment = "Opposite signal")
+
+// Flat at session end (optional hard flatten)
+if session_only and t_hour == 15 and t_minute >= 25 and strategy.position_size != 0
+    strategy.close_all(comment = "Session end")
+
+// ═════════════════════════════════════════════════════════════════════════════
+// VISUALS
+// ═════════════════════════════════════════════════════════════════════════════
+
+plot(ema200, "EMA 200", color=color.new(color.orange, 0), linewidth=2)
+plot(or_high, "9:15 High", color=color.new(color.aqua, 0), style=plot.style_linebr, linewidth=1)
+plot(or_low,  "9:15 Low",  color=color.new(color.orange, 0), style=plot.style_linebr, linewidth=1)
+
+plotshape(buy_signal,  title="BUY",  style=shape.labelup,   location=location.belowbar, color=color.new(color.lime, 0), text="BUY",  textcolor=color.black, size=size.small)
+plotshape(sell_signal, title="SELL", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0),  text="SELL", textcolor=color.white, size=size.small)
+
+// Data window / screener-style outputs
+plot(buy_signal ? 1 : sell_signal ? -1 : 0, title="Signal (1=Buy,-1=Sell)", display=display.data_window)
+plot(htf_bull_score, title="HTF Bull Score", display=display.data_window)
+plot(htf_bear_score, title="HTF Bear Score", display=display.data_window)
+
+alertcondition(buy_signal,  title="BUY",  message="Guru Strategy BUY")
+alertcondition(sell_signal, title="SELL", message="Guru Strategy SELL")

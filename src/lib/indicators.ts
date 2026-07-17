@@ -62,46 +62,71 @@ export function rsi(values: number[], period = 14): (number | null)[] {
   return out;
 }
 
+/** NSE cash open 09:15 IST as minutes from midnight. */
+const NSE_OPEN_MINS = 9 * 60 + 15;
+
+/** IST-ish day key so Indian sessions group correctly even if timestamps are IST-offset. */
+function sessionDayKey(timeMs: number): string {
+  // Shift by +5:30 so midnight IST starts a new day
+  const d = new Date(timeMs + 5.5 * 60 * 60 * 1000);
+  return d.toISOString().slice(0, 10);
+}
+
+/** Minutes from midnight IST for a bar timestamp. */
+function istMinutesOfDay(timeMs: number): number {
+  const d = new Date(timeMs + 5.5 * 60 * 60 * 1000);
+  return d.getUTCHours() * 60 + d.getUTCMinutes();
+}
+
 /**
- * Opening range high/low for each bar of the session.
- * For equity markets we treat a new calendar day (IST-friendly UTC+5:30)
- * as a new session. The first N bars of each session form the range.
+ * Opening range high/low for each bar of the session (time-based, IST).
  *
- * With period = 1 on a 5m chart → 1st 5-minute candle high/low (09:15–09:20).
- * Levels are only available on bars AFTER the range bar(s) complete — not on
- * the forming OR candle itself.
+ * `orMinutes` = duration in minutes **starting at 09:15 IST** (not bar count).
+ *   - 15 → range uses bars in [09:15, 09:30)
+ *   - 30 → range uses bars in [09:15, 09:45)
+ *   - 60 → range uses bars in [09:15, 10:15)
+ *
+ * Works on any chart interval (1m/5m/15m…). Levels are only published on bars
+ * **after** the OR window ends (not while the range is still forming).
  */
 export function openingRange(
   candles: Candle[],
-  barsInRange = 1
+  orMinutes = 15
 ): { high: (number | null)[]; low: (number | null)[] } {
   const high: (number | null)[] = new Array(candles.length).fill(null);
   const low: (number | null)[] = new Array(candles.length).fill(null);
+  // Minutes from 09:15 (e.g. 15 → end 09:30, 30 → end 09:45)
+  const mins = Math.max(1, Math.floor(orMinutes || 15));
+  const orEndMins = NSE_OPEN_MINS + mins;
 
   let sessionKey = "";
-  let sessionStart = 0;
   let rangeHigh = -Infinity;
   let rangeLow = Infinity;
   let rangeReady = false;
 
   for (let i = 0; i < candles.length; i++) {
-    const key = sessionDayKey(candles[i].time);
+    const t = candles[i].time;
+    const key = sessionDayKey(t);
     if (key !== sessionKey) {
       sessionKey = key;
-      sessionStart = i;
       rangeHigh = -Infinity;
       rangeLow = Infinity;
       rangeReady = false;
     }
 
-    const offset = i - sessionStart;
-    if (offset < barsInRange) {
-      // Still forming the opening range (e.g. 1st 5m candle)
+    const m = istMinutesOfDay(t);
+
+    // Bars inside OR window [09:15, 09:15+orMinutes)
+    if (m >= NSE_OPEN_MINS && m < orEndMins) {
       rangeHigh = Math.max(rangeHigh, candles[i].high);
       rangeLow = Math.min(rangeLow, candles[i].low);
-      if (offset === barsInRange - 1) rangeReady = true;
-      // Do not publish levels on OR bars — wait until range is complete
+      // Still forming — do not publish yet
       continue;
+    }
+
+    // First bar at/after OR end locks the range for the rest of the session
+    if (!rangeReady && m >= orEndMins && rangeHigh > -Infinity) {
+      rangeReady = true;
     }
 
     if (rangeReady) {
@@ -111,13 +136,6 @@ export function openingRange(
   }
 
   return { high, low };
-}
-
-/** IST-ish day key so Indian sessions group correctly even if timestamps are IST-offset. */
-function sessionDayKey(timeMs: number): string {
-  // Shift by +5:30 so midnight IST starts a new day
-  const d = new Date(timeMs + 5.5 * 60 * 60 * 1000);
-  return d.toISOString().slice(0, 10);
 }
 
 export type FibPivotLevel = "P" | "R1" | "R2" | "R3" | "S1" | "S2" | "S3";
@@ -354,6 +372,37 @@ export function previousDayLevel(
   return out;
 }
 
+/** On-Balance Volume */
+export function obv(candles: Candle[]): (number | null)[] {
+  const out: (number | null)[] = new Array(candles.length).fill(null);
+  if (!candles.length) return out;
+  let v = 0;
+  out[0] = 0;
+  for (let i = 1; i < candles.length; i++) {
+    const prev = candles[i - 1].close;
+    const cur = candles[i].close;
+    if (cur > prev) v += candles[i].volume;
+    else if (cur < prev) v -= candles[i].volume;
+    out[i] = v;
+  }
+  return out;
+}
+
+/** volume / SMA(volume, period) — e.g. ≥ 1.5 = volume spike */
+export function volumeRatio(
+  candles: Candle[],
+  period = 20
+): (number | null)[] {
+  const vols = candles.map((c) => c.volume);
+  const ma = sma(vols, period);
+  const out: (number | null)[] = new Array(candles.length).fill(null);
+  for (let i = 0; i < candles.length; i++) {
+    const m = ma[i];
+    if (m != null && m > 0) out[i] = vols[i] / m;
+  }
+  return out;
+}
+
 export function computeIndicator(
   candles: Candle[],
   type: IndicatorType,
@@ -371,12 +420,16 @@ export function computeIndicator(
       return adx(candles, period || 14);
     case "VWAP":
       return sessionVwap(candles);
+    case "OBV":
+      return obv(candles);
+    case "VOL_RATIO":
+      return volumeRatio(candles, period || 20);
     case "OPENING_RANGE_HIGH": {
-      // period = number of bars that form the opening range (default 1 for first 5m bar)
-      return openingRange(candles, period || 1).high;
+      // period = minutes after 09:15 IST (default 15 → 09:15–09:30)
+      return openingRange(candles, period || 15).high;
     }
     case "OPENING_RANGE_LOW":
-      return openingRange(candles, period || 1).low;
+      return openingRange(candles, period || 15).low;
     case "FIB_PIVOT":
       return fibonacciPivots(candles, "P");
     case "FIB_PIVOT_R1":
@@ -406,15 +459,15 @@ export function computeIndicator(
 }
 
 /**
- * Session breakout level = max(1st N-bar OR high, Fib pivot R3, previous day high).
- * With orBars=1 on 5m → max(1st 5m high, Fib R3, PDH).
- * Null until all components are available (after OR bar completes).
+ * Session breakout level = max(OR high, Fib pivot R3, previous day high).
+ * `orMinutes` default 15 → 09:15–09:30 IST opening range.
+ * Null until all components are available (after OR window completes).
  */
 export function breakoutHigh(
   candles: Candle[],
-  orBars = 1
+  orMinutes = 15
 ): (number | null)[] {
-  const orh = openingRange(candles, orBars).high;
+  const orh = openingRange(candles, orMinutes).high;
   const r3 = fibonacciPivots(candles, "R3");
   const pdh = previousDayLevel(candles, "high");
   const out: (number | null)[] = new Array(candles.length).fill(null);
@@ -429,15 +482,15 @@ export function breakoutHigh(
 }
 
 /**
- * Session breakdown level = min(1st N-bar OR low, Fib pivot S3, previous day low).
- * With orBars=1 on 5m → min(1st 5m candle low, Fib S3, PDL).
- * Null until all components are available (after OR bar completes).
+ * Session breakdown level = min(OR low, Fib pivot S3, previous day low).
+ * `orMinutes` default 15 → 09:15–09:30 IST opening range.
+ * Null until all components are available (after OR window completes).
  */
 export function breakoutLow(
   candles: Candle[],
-  orBars = 1
+  orMinutes = 15
 ): (number | null)[] {
-  const orl = openingRange(candles, orBars).low;
+  const orl = openingRange(candles, orMinutes).low;
   const s3 = fibonacciPivots(candles, "S3");
   const pdl = previousDayLevel(candles, "low");
   const out: (number | null)[] = new Array(candles.length).fill(null);
@@ -452,11 +505,13 @@ export function breakoutLow(
 }
 
 export function indicatorKey(type: IndicatorType, period?: number): string {
-  if (type === "OPENING_RANGE_HIGH") return `ORH_${period ?? 1}`;
-  if (type === "OPENING_RANGE_LOW") return `ORL_${period ?? 1}`;
-  if (type === "BREAKOUT_HIGH") return `BOH_${period ?? 1}`;
-  if (type === "BREAKOUT_LOW") return `BOL_${period ?? 1}`;
+  if (type === "OPENING_RANGE_HIGH") return `ORH_${period ?? 15}`;
+  if (type === "OPENING_RANGE_LOW") return `ORL_${period ?? 15}`;
+  if (type === "BREAKOUT_HIGH") return `BOH_${period ?? 15}`;
+  if (type === "BREAKOUT_LOW") return `BOL_${period ?? 15}`;
   if (type === "VWAP") return "VWAP";
+  if (type === "OBV") return "OBV";
+  if (type === "VOL_RATIO") return `VOL_RATIO_${period ?? 20}`;
   if (type === "ADX") return `ADX_${period ?? 14}`;
   if (type.startsWith("FIB_PIVOT")) return type;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return type;

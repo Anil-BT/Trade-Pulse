@@ -11,7 +11,12 @@ import {
 import { ScanReportView } from "./ScanReport";
 import { StrategyLibrary } from "./StrategyLibrary";
 import { TradesTable } from "./TradesTable";
-import { STRATEGY_PRESETS, PRESET_OPENING_RANGE_EMA } from "@/lib/presets";
+import {
+  STRATEGY_PRESETS,
+  PRESET_OPENING_RANGE_EMA,
+  PRESET_SECTOR_OR_EMA20_VWAP_FIB_BULL,
+  PRESET_SECTOR_OR_EMA20_VWAP_FIB_BEAR,
+} from "@/lib/presets";
 import { defaultDateRange, uid } from "@/lib/format";
 import {
   buildCacheFingerprint,
@@ -120,11 +125,20 @@ export function BacktestApp() {
   const [optionSide, setOptionSide] = useState<"CE" | "PE">("CE");
   /** 0 = auto from NSE F&O master (RELIANCE=500, TCS=225, …) */
   const [lotSize, setLotSize] = useState(0);
+  /** F&O lots per entry (1–5); per-lot trail configured on each strategy */
+  const [lotsPerTrade, setLotsPerTrade] = useState(1);
   const [strikeStep, setStrikeStep] = useState(0); // 0 = auto
   const [ivPct, setIvPct] = useState(18);
   const [daysToExpiry, setDaysToExpiry] = useState(7);
+  /** Single-symbol backtest uses bullish strategy by default */
   const [strategy, setStrategy] = useState<StrategyConfig>(() =>
-    structuredClone(PRESET_OPENING_RANGE_EMA)
+    structuredClone(PRESET_SECTOR_OR_EMA20_VWAP_FIB_BULL)
+  );
+  const [bullStrategy, setBullStrategy] = useState<StrategyConfig>(() =>
+    structuredClone(PRESET_SECTOR_OR_EMA20_VWAP_FIB_BULL)
+  );
+  const [bearStrategy, setBearStrategy] = useState<StrategyConfig>(() =>
+    structuredClone(PRESET_SECTOR_OR_EMA20_VWAP_FIB_BEAR)
   );
   const [loading, setLoading] = useState(false);
   const [scanning, setScanning] = useState(false);
@@ -139,6 +153,23 @@ export function BacktestApp() {
   const [scanAllFno, setScanAllFno] = useState(false);
   /** When true, F&O scan skips Firestore and hits broker APIs */
   const [forceLiveScan, setForceLiveScan] = useState(false);
+  /** Sector-trend scan config (optional filter) */
+  const [useSectorFilter, setUseSectorFilter] = useState(false);
+  const [sectorWindowStart, setSectorWindowStart] = useState("09:15");
+  const [sectorWindowEnd, setSectorWindowEnd] = useState("09:45");
+  const [sectorTopN, setSectorTopN] = useState(2);
+  const [sectorTopStocks, setSectorTopStocks] = useState(3);
+  const [sectorMode, setSectorMode] = useState<"auto" | "bullish" | "bearish">(
+    "auto"
+  );
+  const [sectorBiasThreshold, setSectorBiasThreshold] = useState(0);
+  const [sectorEntryEnd, setSectorEntryEnd] = useState("15:15");
+  const [sectorWeightMode, setSectorWeightMode] = useState<
+    "turnover" | "equal"
+  >("turnover");
+  const [sectorMinStocks, setSectorMinStocks] = useState(2);
+  const [sectorMinBreadth, setSectorMinBreadth] = useState(0);
+
   const [runProgress, setRunProgress] = useState<string | null>(null);
   /** F&O report loaded from cloud (no Upstox this run) */
   const [scanFromCache, setScanFromCache] = useState(false);
@@ -226,10 +257,76 @@ export function BacktestApp() {
     return {
       side: optionSide,
       lotSize,
+      lots: lotsPerTrade,
       strikeStep,
       iv: ivPct / 100,
       daysToExpiry,
     };
+  }
+
+  /** Sync lot count onto strategy for backtest engine */
+  function withLots(s: StrategyConfig): StrategyConfig {
+    return {
+      ...s,
+      positionLots: lotsPerTrade,
+      lotRules:
+        s.lotRules && s.lotRules.length >= lotsPerTrade
+          ? s.lotRules.slice(0, lotsPerTrade)
+          : padLotRules(s, lotsPerTrade),
+    };
+  }
+
+  function padLotRules(s: StrategyConfig, n: number) {
+    const rules = [...(s.lotRules || [])];
+    const fallbackTrail = s.trailStop?.enabled ? s.trailStop.pct : undefined;
+    const fallbackToCost = Boolean(s.trailStopToCost?.enabled);
+    const fallbackToCostPct = s.trailStopToCost?.profitPctOfCapital ?? 20;
+    const hadNoRules = rules.length === 0;
+    while (rules.length < n) {
+      const idx = rules.length;
+      // 2+ lots default scale-out: lot 1 books +20% TP; other lots trail to cost after partial TP
+      if (n >= 2 && idx === 0 && hadNoRules) {
+        rules.push({
+          takeProfitPct: 20,
+          trailPct: fallbackTrail,
+          trailToCost: false,
+          exitOnSignal: true,
+        });
+      } else if (n >= 2 && idx >= 1) {
+        rules.push({
+          trailPct: fallbackTrail,
+          trailToCost: true,
+          trailToCostProfitPctOfCapital: fallbackToCostPct,
+          armToCostOnPartialTp: true,
+          exitOnSignal: true,
+        });
+      } else {
+        rules.push({
+          trailPct: fallbackTrail,
+          trailToCost: fallbackToCost,
+          trailToCostProfitPctOfCapital: fallbackToCostPct,
+          exitOnSignal: true,
+        });
+      }
+    }
+    // First time expanding to multi-lot without any TP: seed scale-out on lot 1
+    if (
+      n >= 2 &&
+      !rules.some((r) => r.takeProfitPct != null && r.takeProfitPct > 0)
+    ) {
+      rules[0] = {
+        ...rules[0],
+        takeProfitPct: 20,
+      };
+      for (let i = 1; i < n; i++) {
+        rules[i] = {
+          ...rules[i],
+          trailToCost: rules[i].trailToCost ?? true,
+          armToCostOnPartialTp: rules[i].armToCostOnPartialTp !== false,
+        };
+      }
+    }
+    return rules.slice(0, n);
   }
 
   function validateCommon() {
@@ -288,13 +385,14 @@ export function BacktestApp() {
     };
   }
 
-  function cacheSettings() {
+  function cacheSettings(strat?: StrategyConfig) {
+    const s = strat || strategy;
     return {
       symbol: cleanSymbol(symbol),
       interval,
       source,
       tradeInstrument,
-      strategy,
+      strategy: s,
       oneTradePerDay,
       entryTimeWindows: entryTimeWindowsPayload(),
       maxRiskPerTrade: maxRiskPayload(),
@@ -306,8 +404,10 @@ export function BacktestApp() {
 
   async function fetchBacktestChunkOnce(
     chunkFrom: string,
-    chunkTo: string
+    chunkTo: string,
+    strat?: StrategyConfig
   ): Promise<BacktestResult> {
+    const s = strat || strategy;
     const res = await fetch("/api/backtest", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -317,7 +417,7 @@ export function BacktestApp() {
         from: chunkFrom,
         to: chunkTo,
         source,
-        strategy,
+        strategy: s,
         initialCapital: capital,
         positionSizePct: equityAllocPct,
         oneTradePerDay,
@@ -350,12 +450,13 @@ export function BacktestApp() {
   async function fetchBacktestChunk(
     chunkFrom: string,
     chunkTo: string,
-    onWait?: (msg: string) => void
+    onWait?: (msg: string) => void,
+    strat?: StrategyConfig
   ): Promise<BacktestResult> {
     let lastErr = "chunk failed";
     for (let attempt = 0; attempt < RATE_LIMIT_CHUNK_RETRIES; attempt++) {
       try {
-        return await fetchBacktestChunkOnce(chunkFrom, chunkTo);
+        return await fetchBacktestChunkOnce(chunkFrom, chunkTo, strat);
       } catch (e) {
         lastErr = e instanceof Error ? e.message : String(e);
         const rateLimited = /429|rate.?limit|1015|being rate.limited/i.test(
@@ -377,8 +478,11 @@ export function BacktestApp() {
   /**
    * Chunked run: few days at a time + pause (rate-limit friendly).
    * Reuses Firestore day cache when signed in (same strategy + day).
+   * Uses bullish strategy for single-symbol runs.
    */
   async function run() {
+    const runStrat = withLots(structuredClone(bullStrategy));
+    setStrategy(runStrat);
     setLoading(true);
     setError(null);
     setResult(null);
@@ -391,7 +495,14 @@ export function BacktestApp() {
       if (!symbol.trim()) {
         throw new Error("Please enter a stock symbol (e.g. RELIANCE or TCS).");
       }
-      validateCommon();
+      if (!from || !to) throw new Error("Please select both From and To dates.");
+      if (from > to) throw new Error("From date must be on or before To date.");
+      if (!runStrat.entry.length) {
+        throw new Error("Bullish strategy needs at least one entry condition.");
+      }
+      if (!runStrat.exit.length) {
+        throw new Error("Bullish strategy needs at least one exit condition.");
+      }
       validateSourceCredentials();
 
       const allDays = listWeekdays(from, to);
@@ -401,7 +512,7 @@ export function BacktestApp() {
         );
       }
 
-      const fingerprint = buildCacheFingerprint(cacheSettings());
+      const fingerprint = buildCacheFingerprint(cacheSettings(runStrat));
       const dayTrades = new Map<string, Trade[]>();
       const dayCandles = new Map<string, Candle[]>();
       const okDays = new Set<string>();
@@ -449,7 +560,12 @@ export function BacktestApp() {
         );
 
         try {
-          const partial = await fetchBacktestChunk(cFrom, cTo, setRunProgress);
+          const partial = await fetchBacktestChunk(
+            cFrom,
+            cTo,
+            setRunProgress,
+            runStrat
+          );
           resolvedSymbol = partial.symbol || resolvedSymbol;
           optionsMeta = partial.optionsMeta || optionsMeta;
           lastDiag = partial.diagnostics;
@@ -500,7 +616,7 @@ export function BacktestApp() {
                 trades: dayTrades.get(day) || [],
                 candles: dayCandles.get(day) || [],
                 savedAt: Date.now(),
-                strategyName: strategy.name,
+                strategyName: runStrat.name,
               }));
               const n = await saveDayCaches(user.uid, records);
               setRunProgress(
@@ -606,7 +722,48 @@ export function BacktestApp() {
     }
   }
 
-  async function runFnoScan() {
+  function loadStrategyPick(
+    key: string,
+    set: (s: StrategyConfig) => void
+  ) {
+    if (key.startsWith("saved:")) {
+      const id = key.slice("saved:".length);
+      const row = savedStrategies.find(
+        (s) => s.id === id || s.name === id || s.strategy?.name === id
+      );
+      if (row?.strategy?.entry?.length) {
+        set(
+          structuredClone({
+            ...row.strategy,
+            name: row.name || row.strategy.name,
+          })
+        );
+        return;
+      }
+    }
+    if (key.startsWith("preset:")) {
+      const name = key.slice("preset:".length);
+      const p = STRATEGY_PRESETS.find((x) => x.name === name);
+      if (p) set(structuredClone(p));
+    }
+  }
+
+  function strategyPickValue(s: StrategyConfig): string {
+    const saved = savedStrategies.find(
+      (row) => row.name === s.name || row.strategy?.name === s.name
+    );
+    if (saved) return `saved:${saved.id}`;
+    if (STRATEGY_PRESETS.some((p) => p.name === s.name)) {
+      return `preset:${s.name}`;
+    }
+    return "custom";
+  }
+
+  /**
+   * Sector filter ON: rank morning sectors → bull strategy on green sectors,
+   * bear strategy on red sectors.
+   */
+  async function runSectorTrendScan() {
     setScanning(true);
     setError(null);
     setResult(null);
@@ -617,8 +774,203 @@ export function BacktestApp() {
     setRunProgress(null);
 
     try {
-      validateCommon();
+      if (!from || !to) {
+        throw new Error("Please select both From and To dates.");
+      }
+      if (from > to) {
+        throw new Error("From date must be on or before To date.");
+      }
       validateSourceCredentials();
+
+      const bull = withLots(structuredClone(bullStrategy));
+      const bear = withLots(structuredClone(bearStrategy));
+      if (!bull.entry?.length || !bull.exit?.length) {
+        throw new Error("Bullish strategy needs entry and exit conditions.");
+      }
+      if (!bear.entry?.length || !bear.exit?.length) {
+        throw new Error("Bearish strategy needs entry and exit conditions.");
+      }
+
+      const scopeLabel = scanAllFno
+        ? "all F&O (sector rank)"
+        : `up to ${Math.min(scanMaxSymbols, 120)} F&O (sector rank)`;
+      setRunProgress(
+        `Sector filter ${sectorMode}: ${sectorWindowStart}–${sectorWindowEnd}, top ${sectorTopN}×${sectorTopStocks} · bull “${bull.name}” / bear “${bear.name}” on ${scopeLabel}…`
+      );
+
+      const res = await fetch("/api/scan/sector-trend", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from,
+          to,
+          interval: interval === "1d" ? "5m" : interval,
+          source,
+          mode: sectorMode,
+          windowStart: sectorWindowStart,
+          windowEnd: sectorWindowEnd,
+          topSectors: sectorTopN,
+          topStocksPerSector: sectorTopStocks,
+          biasThreshold: sectorBiasThreshold,
+          weightMode: sectorWeightMode,
+          minStocks: sectorMinStocks,
+          minBreadthPct: sectorMinBreadth,
+          entryEnd: sectorEntryEnd,
+          bullStrategy: bull,
+          bearStrategy: bear,
+          initialCapital: capital,
+          positionSizePct: equityAllocPct,
+          oneTradePerDay: true,
+          maxRiskPerTrade: maxRiskPayload(),
+          tradeInstrument,
+          options:
+            tradeInstrument === "options_atm" ? buildOptions() : undefined,
+          ...credentialsPayload(),
+          maxSymbols: scanAllFno
+            ? 400
+            : Math.min(120, Math.max(20, scanMaxSymbols)),
+          scanAll: scanAllFno,
+          concurrency: 3,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(
+          data.error || `Sector-trend scan failed (${res.status})`
+        );
+      }
+      const report = data as ScanReport;
+      setScanReport(report);
+      setScanFromCache(false);
+      const st = report.sectorTrend;
+      setRunProgress(
+        `Sector filter done · ${report.summary?.withTrades ?? 0} symbol(s) with trades` +
+          (st
+            ? ` · ${st.bullDays} bull / ${st.bearDays} bear day(s)`
+            : "")
+      );
+    } catch (e) {
+      setScanReport(null);
+      setError(e instanceof Error ? e.message : "Sector-trend scan failed");
+      setRunProgress(null);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  /**
+   * No sector filter: run F&O universe with bull or bear strategy conditions only.
+   */
+  async function runBullBearScenario(side: "bullish" | "bearish") {
+    setScanning(true);
+    setError(null);
+    setResult(null);
+    setScanReport(null);
+    setScanFromCache(false);
+    setChartFilter(null);
+    setDayFilter(null);
+    setRunProgress(null);
+
+    try {
+      if (!from || !to) {
+        throw new Error("Please select both From and To dates.");
+      }
+      if (from > to) {
+        throw new Error("From date must be on or before To date.");
+      }
+      validateSourceCredentials();
+
+      const strat = withLots(
+        structuredClone(side === "bullish" ? bullStrategy : bearStrategy)
+      );
+      if (!strat.entry?.length || !strat.exit?.length) {
+        throw new Error(
+          `${side === "bullish" ? "Bullish" : "Bearish"} strategy needs entry and exit conditions.`
+        );
+      }
+      setStrategy(structuredClone(strat));
+      if (side === "bullish") setOptionSide("CE");
+      else setOptionSide("PE");
+
+      const scopeLabel = scanAllFno
+        ? "all F&O"
+        : `up to ${scanMaxSymbols} F&O`;
+      setRunProgress(
+        `${side === "bullish" ? "Bullish" : "Bearish"} scenario · “${strat.name}” on ${scopeLabel}…`
+      );
+
+      const res = await fetch("/api/scan", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          from,
+          to,
+          interval,
+          source,
+          strategy: strat,
+          initialCapital: capital,
+          positionSizePct: equityAllocPct,
+          oneTradePerDay,
+          entryTimeWindows: entryTimeWindowsPayload(),
+          maxRiskPerTrade: maxRiskPayload(),
+          tradeInstrument,
+          options:
+            tradeInstrument === "options_atm"
+              ? {
+                  ...buildOptions(),
+                  side: side === "bullish" ? "CE" : "PE",
+                }
+              : undefined,
+          ...credentialsPayload(),
+          maxSymbols: scanAllFno ? 400 : scanMaxSymbols,
+          scanAll: scanAllFno,
+          concurrency: 3,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.error || `Scan failed (${res.status})`);
+      }
+      setScanReport(data as ScanReport);
+      setScanFromCache(false);
+      setRunProgress(
+        `${side === "bullish" ? "Bullish" : "Bearish"} scenario done · ${(data as ScanReport).summary?.withTrades ?? 0} symbol(s) with trades.`
+      );
+    } catch (e) {
+      setScanReport(null);
+      setError(
+        e instanceof Error ? e.message : `${side} scenario scan failed`
+      );
+      setRunProgress(null);
+    } finally {
+      setScanning(false);
+    }
+  }
+
+  async function runFnoScan(strategyOverride?: StrategyConfig) {
+    setScanning(true);
+    setError(null);
+    setResult(null);
+    setScanReport(null);
+    setScanFromCache(false);
+    setChartFilter(null);
+    setDayFilter(null);
+    setRunProgress(null);
+
+    try {
+      const strat = withLots(strategyOverride || strategy);
+      if (!from || !to) throw new Error("Please select both From and To dates.");
+      if (from > to) throw new Error("From date must be on or before To date.");
+      if (!strat.entry.length) {
+        throw new Error("Add at least one entry condition to the strategy.");
+      }
+      if (!strat.exit.length) {
+        throw new Error("Add at least one exit condition to the strategy.");
+      }
+      validateSourceCredentials();
+      setStrategy(structuredClone(strat));
 
       const { primary: fingerprint, candidates } = fnoScanCacheKeys();
       const scopeLabel = scanAllFno
@@ -666,7 +1018,7 @@ export function BacktestApp() {
           to,
           interval,
           source,
-          strategy,
+          strategy: strat,
           initialCapital: capital,
           positionSizePct: equityAllocPct,
           oneTradePerDay,
@@ -1219,6 +1571,33 @@ export function BacktestApp() {
                       placeholder="0 = auto"
                     />
                   </Field>
+                  <Field label="Lots per trade">
+                    <select
+                      value={lotsPerTrade}
+                      onChange={(e) => {
+                        const n = Math.min(
+                          5,
+                          Math.max(1, Number(e.target.value) || 1)
+                        );
+                        setLotsPerTrade(n);
+                        setBullStrategy((s) => ({
+                          ...s,
+                          positionLots: n,
+                          lotRules: padLotRules(s, n),
+                        }));
+                        setBearStrategy((s) => ({
+                          ...s,
+                          positionLots: n,
+                          lotRules: padLotRules(s, n),
+                        }));
+                      }}
+                      className="field-input"
+                    >
+                      <option value={1}>1 lot</option>
+                      <option value={2}>2 lots</option>
+                      <option value={3}>3 lots</option>
+                    </select>
+                  </Field>
                   <Field label="Strike step (0 = auto)">
                     <input
                       type="number"
@@ -1264,15 +1643,195 @@ export function BacktestApp() {
             )}
           </section>
 
+          {/* 4 · Sector filter (optional) */}
           <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
-            <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
-              <h2 className="text-sm font-medium tracking-wide text-neutral-500 uppercase">
-                Strategy
+            <h2 className="mb-3 text-sm font-medium tracking-wide text-neutral-500 uppercase">
+              Sector filter
+              <span className="ml-2 font-normal normal-case text-neutral-400">
+                (optional)
+              </span>
+            </h2>
+            <label className="flex cursor-pointer items-start gap-3 rounded-2xl border border-violet-200 bg-violet-50/40 p-4">
+              <input
+                type="checkbox"
+                checked={useSectorFilter}
+                onChange={(e) => setUseSectorFilter(e.target.checked)}
+                className="mt-0.5 h-4 w-4 accent-violet-700"
+              />
+              <span>
+                <span className="block text-sm font-medium text-black">
+                  Enable sector filter
+                </span>
+                <span className="mt-0.5 block text-xs text-neutral-500">
+                  When on: morning bars shortlist stocks (top sectors). Only
+                  those names may trade after the ranking window, and only if
+                  the bullish/bearish strategy entry conditions still pass
+                  (e.g. close ≥ OR high with period 30 = 09:15–09:45 range).
+                  When off: each strategy runs by conditions on the full
+                  F&amp;O list.
+                </span>
+              </span>
+            </label>
+
+            {useSectorFilter && (
+              <div className="mt-4 grid gap-3 sm:grid-cols-2">
+                <Field label="Trend window start (IST)">
+                  <input
+                    type="time"
+                    value={sectorWindowStart}
+                    onChange={(e) => setSectorWindowStart(e.target.value)}
+                    className="field-input"
+                  />
+                </Field>
+                <Field label="Trend window end (IST)">
+                  <input
+                    type="time"
+                    value={sectorWindowEnd}
+                    onChange={(e) => setSectorWindowEnd(e.target.value)}
+                    className="field-input"
+                  />
+                </Field>
+                <Field label="Top sectors">
+                  <input
+                    type="number"
+                    min={1}
+                    max={8}
+                    value={sectorTopN}
+                    onChange={(e) =>
+                      setSectorTopN(
+                        Math.min(8, Math.max(1, Number(e.target.value) || 2))
+                      )
+                    }
+                    className="field-input"
+                  />
+                </Field>
+                <Field label="Top stocks / sector">
+                  <input
+                    type="number"
+                    min={1}
+                    max={15}
+                    value={sectorTopStocks}
+                    onChange={(e) =>
+                      setSectorTopStocks(
+                        Math.min(15, Math.max(1, Number(e.target.value) || 3))
+                      )
+                    }
+                    className="field-input"
+                  />
+                </Field>
+                <Field label="Sector pool">
+                  <select
+                    value={sectorMode}
+                    onChange={(e) =>
+                      setSectorMode(
+                        e.target.value as "auto" | "bullish" | "bearish"
+                      )
+                    }
+                    className="field-input"
+                  >
+                    <option value="auto">
+                      Auto (top N by bar — bull, bear, or mix)
+                    </option>
+                    <option value="bullish">Green bars only</option>
+                    <option value="bearish">Red bars only</option>
+                  </select>
+                </Field>
+                <Field label="Min bar length |%|">
+                  <input
+                    type="number"
+                    step={0.1}
+                    min={0}
+                    value={sectorBiasThreshold}
+                    onChange={(e) =>
+                      setSectorBiasThreshold(
+                        Math.max(0, Number(e.target.value) || 0)
+                      )
+                    }
+                    className="field-input"
+                  />
+                </Field>
+                <Field label="Strength weight">
+                  <select
+                    value={sectorWeightMode}
+                    onChange={(e) =>
+                      setSectorWeightMode(
+                        e.target.value === "equal" ? "equal" : "turnover"
+                      )
+                    }
+                    className="field-input"
+                  >
+                    <option value="turnover">
+                      Turnover-weighted (recommended)
+                    </option>
+                    <option value="equal">Equal-weight avg</option>
+                  </select>
+                </Field>
+                <Field label="Min stocks / sector">
+                  <input
+                    type="number"
+                    min={1}
+                    max={20}
+                    value={sectorMinStocks}
+                    onChange={(e) =>
+                      setSectorMinStocks(
+                        Math.min(20, Math.max(1, Number(e.target.value) || 3))
+                      )
+                    }
+                    className="field-input"
+                  />
+                </Field>
+                <Field label="Min breadth % (same side)">
+                  <input
+                    type="number"
+                    min={0}
+                    max={100}
+                    step={1}
+                    value={sectorMinBreadth}
+                    onChange={(e) =>
+                      setSectorMinBreadth(
+                        Math.min(100, Math.max(0, Number(e.target.value) || 0))
+                      )
+                    }
+                    className="field-input"
+                    title="0 = off. e.g. 55 requires ≥55% stocks same colour as sector"
+                  />
+                </Field>
+                <Field label="Entry window ends (IST)">
+                  <input
+                    type="time"
+                    value={sectorEntryEnd}
+                    onChange={(e) => setSectorEntryEnd(e.target.value)}
+                    className="field-input"
+                  />
+                </Field>
+                <p className="sm:col-span-2 text-[11px] text-neutral-400">
+                  Strength: {sectorWeightMode} avg return, ≥{sectorMinStocks}{" "}
+                  stocks, breadth ≥{sectorMinBreadth}%, min |bar|{" "}
+                  {sectorBiasThreshold}%. Top {sectorTopN} by |score| (bull /
+                  bear / mix). Green → bull strategy, red → bear. Window{" "}
+                  {sectorWindowStart}–{sectorWindowEnd}. Prefer 5m.
+                </p>
+              </div>
+            )}
+          </section>
+
+          {/* 5 · Bullish strategy */}
+          <section className="rounded-3xl border border-emerald-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-sm font-medium tracking-wide text-emerald-800 uppercase">
+                Bullish strategy
               </h2>
               <select
-                value={strategySelectValue(strategy)}
-                onChange={(e) => applyStrategyPick(e.target.value)}
-                className="rounded-full border border-neutral-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-black"
+                value={strategyPickValue(bullStrategy)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "custom") return;
+                  loadStrategyPick(v, (s) => {
+                    setBullStrategy(s);
+                    setStrategy(structuredClone(s));
+                  });
+                }}
+                className="rounded-full border border-emerald-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-emerald-700"
               >
                 <optgroup label="Presets">
                   {STRATEGY_PRESETS.map((p) => (
@@ -1290,115 +1849,159 @@ export function BacktestApp() {
                     ))}
                   </optgroup>
                 )}
-                {strategySelectValue(strategy) === "custom" && (
-                  <option value="custom">{strategy.name} (current)</option>
+                {strategyPickValue(bullStrategy) === "custom" && (
+                  <option value="custom">{bullStrategy.name} (custom)</option>
                 )}
               </select>
             </div>
-
+            <p className="mb-4 text-xs text-neutral-500">
+              {useSectorFilter
+                ? "Applied to stocks in green (bullish) sectors."
+                : "Runs on F&O by these entry/exit conditions when you run bullish scenario."}
+            </p>
             <Field label="Name">
               <input
-                value={strategy.name}
+                value={bullStrategy.name}
                 onChange={(e) =>
-                  setStrategy((s) => ({ ...s, name: e.target.value }))
+                  setBullStrategy((s) => ({ ...s, name: e.target.value }))
                 }
                 className="field-input mb-4"
               />
             </Field>
-
-            <label className="mb-6 flex flex-wrap items-center gap-3 text-sm text-neutral-700">
-              <input
-                type="checkbox"
-                checked={Boolean(strategy.trailStopToCost?.enabled)}
-                onChange={(e) =>
-                  setStrategy((s) => ({
-                    ...s,
-                    trailStopToCost: {
-                      enabled: e.target.checked,
-                      profitPctOfCapital:
-                        s.trailStopToCost?.profitPctOfCapital ?? 20,
-                    },
-                  }))
-                }
-                className="h-4 w-4 rounded border-neutral-300"
-              />
-              <span>
-                Trail SL to cost when profit ≥{" "}
-                <input
-                  type="number"
-                  min={1}
-                  max={100}
-                  step={1}
-                  disabled={!strategy.trailStopToCost?.enabled}
-                  value={strategy.trailStopToCost?.profitPctOfCapital ?? 20}
-                  onChange={(e) =>
-                    setStrategy((s) => ({
-                      ...s,
-                      trailStopToCost: {
-                        enabled: true,
-                        profitPctOfCapital: Math.max(
-                          1,
-                          Math.min(100, Number(e.target.value) || 20)
-                        ),
-                      },
-                    }))
-                  }
-                  className="mx-1 w-14 rounded border border-neutral-300 px-1.5 py-0.5 text-center tabular-nums disabled:opacity-40"
-                />
-                % of capital
-              </span>
-            </label>
-
-            <div className="space-y-8">
+            <TrailStopFields
+              strategy={bullStrategy}
+              onChange={setBullStrategy}
+            />
+            <div className="mt-4 space-y-8">
               <ConditionBuilder
                 title="Entry when"
-                conditions={strategy.entry}
-                logic={strategy.entryLogic ?? "and"}
+                conditions={bullStrategy.entry}
+                logic={bullStrategy.entryLogic ?? "and"}
                 onLogicChange={(entryLogic) =>
-                  setStrategy((s) => ({ ...s, entryLogic }))
+                  setBullStrategy((s) => ({ ...s, entryLogic }))
                 }
-                onChange={(entry) => setStrategy((s) => ({ ...s, entry }))}
+                onChange={(entry) => setBullStrategy((s) => ({ ...s, entry }))}
               />
               <div className="border-t border-neutral-100" />
               <ConditionBuilder
                 title="Exit when"
-                conditions={strategy.exit}
-                logic={strategy.exitLogic ?? "and"}
+                conditions={bullStrategy.exit}
+                logic={bullStrategy.exitLogic ?? "and"}
                 onLogicChange={(exitLogic) =>
-                  setStrategy((s) => ({ ...s, exitLogic }))
+                  setBullStrategy((s) => ({ ...s, exitLogic }))
                 }
-                onChange={(exit) => setStrategy((s) => ({ ...s, exit }))}
+                onChange={(exit) => setBullStrategy((s) => ({ ...s, exit }))}
               />
             </div>
-
-            <div className="mt-6">
+            <div className="mt-4">
               <StrategyLibrary
-                strategy={strategy}
-                onLoad={loadStrategy}
+                strategy={bullStrategy}
+                onLoad={(s) => {
+                  setBullStrategy(structuredClone(s));
+                  setStrategy(structuredClone(s));
+                }}
                 onRenamed={(name) =>
-                  setStrategy((s) => ({ ...s, name }))
+                  setBullStrategy((s) => ({ ...s, name }))
                 }
               />
-            </div>
-
-            <div className="mt-4 space-y-3 rounded-2xl bg-neutral-50 p-4 text-sm text-neutral-600">
-              <p className="font-medium text-neutral-800">Tip</p>
-              <p className="leading-relaxed">
-                Use <strong>close &gt; Prev Day High</strong> for breakouts.
-                Save your strategy by name so you can reload it anytime.
-              </p>
             </div>
           </section>
 
+          {/* 6 · Bearish strategy */}
+          <section className="rounded-3xl border border-rose-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
+            <div className="mb-4 flex flex-wrap items-center justify-between gap-3">
+              <h2 className="text-sm font-medium tracking-wide text-rose-800 uppercase">
+                Bearish strategy
+              </h2>
+              <select
+                value={strategyPickValue(bearStrategy)}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (v === "custom") return;
+                  loadStrategyPick(v, setBearStrategy);
+                }}
+                className="rounded-full border border-rose-300 bg-white px-3 py-1.5 text-sm outline-none focus:border-rose-700"
+              >
+                <optgroup label="Presets">
+                  {STRATEGY_PRESETS.map((p) => (
+                    <option key={p.name} value={`preset:${p.name}`}>
+                      {p.name}
+                    </option>
+                  ))}
+                </optgroup>
+                {savedStrategies.length > 0 && (
+                  <optgroup label="Your strategies">
+                    {savedStrategies.map((s) => (
+                      <option key={s.id} value={`saved:${s.id}`}>
+                        {s.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                )}
+                {strategyPickValue(bearStrategy) === "custom" && (
+                  <option value="custom">{bearStrategy.name} (custom)</option>
+                )}
+              </select>
+            </div>
+            <p className="mb-4 text-xs text-neutral-500">
+              {useSectorFilter
+                ? "Applied to stocks in red (bearish) sectors."
+                : "Runs on F&O by these entry/exit conditions when you run bearish scenario."}
+            </p>
+            <Field label="Name">
+              <input
+                value={bearStrategy.name}
+                onChange={(e) =>
+                  setBearStrategy((s) => ({ ...s, name: e.target.value }))
+                }
+                className="field-input mb-4"
+              />
+            </Field>
+            <TrailStopFields
+              strategy={bearStrategy}
+              onChange={setBearStrategy}
+            />
+            <div className="mt-4 space-y-8">
+              <ConditionBuilder
+                title="Entry when"
+                conditions={bearStrategy.entry}
+                logic={bearStrategy.entryLogic ?? "and"}
+                onLogicChange={(entryLogic) =>
+                  setBearStrategy((s) => ({ ...s, entryLogic }))
+                }
+                onChange={(entry) => setBearStrategy((s) => ({ ...s, entry }))}
+              />
+              <div className="border-t border-neutral-100" />
+              <ConditionBuilder
+                title="Exit when"
+                conditions={bearStrategy.exit}
+                logic={bearStrategy.exitLogic ?? "and"}
+                onLogicChange={(exitLogic) =>
+                  setBearStrategy((s) => ({ ...s, exitLogic }))
+                }
+                onChange={(exit) => setBearStrategy((s) => ({ ...s, exit }))}
+              />
+            </div>
+            <div className="mt-4">
+              <StrategyLibrary
+                strategy={bearStrategy}
+                onLoad={(s) => setBearStrategy(structuredClone(s))}
+                onRenamed={(name) =>
+                  setBearStrategy((s) => ({ ...s, name }))
+                }
+              />
+            </div>
+          </section>
+
+          {/* 7 · F&O universe scan */}
           <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
             <h2 className="mb-3 text-sm font-medium tracking-wide text-neutral-500 uppercase">
               F&amp;O universe scan
             </h2>
             <p className="mb-4 text-xs leading-relaxed text-neutral-500">
-              Run the current strategy across equity F&amp;O names and build one
-              report. Each stock expands to show entry/exit time &amp; price;
-              stocks with no signal show <strong>No trade</strong>; failures
-              show <strong>Error</strong>.
+              {useSectorFilter
+                ? "Sector filter is on: one run ranks sectors, then applies bullish strategy on green sectors and bearish strategy on red sectors."
+                : "Sector filter is off: run bullish or bearish strategy by conditions across the F&O list. Or run the bullish strategy as a plain multi-symbol report."}
             </p>
 
             <label className="mb-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-neutral-200 bg-neutral-50/80 p-4">
@@ -1413,10 +2016,8 @@ export function BacktestApp() {
                   Run on all F&amp;O stocks
                 </span>
                 <span className="mt-0.5 block text-xs text-neutral-500">
-                  Full NSE equity F&amp;O universe (not single symbol). First
-                  live run hits Upstox; when signed in, result is auto-saved and
-                  the next run with the same strategy + dates loads from cloud
-                  (no broker). Uncheck to limit count below.
+                  Full NSE equity F&amp;O universe. Uncheck to limit count
+                  below.
                 </span>
               </span>
             </label>
@@ -1452,30 +2053,59 @@ export function BacktestApp() {
                   Force live scan (ignore cloud save)
                 </span>
                 <span className="mt-0.5 block text-xs text-neutral-500">
-                  Leave off so &quot;Run on all F&amp;O stocks&quot; reuses the
-                  cloud result for the same strategy + dates. Tick only when you
-                  want a fresh Upstox pull.
+                  Tick only when you want a fresh broker pull.
                 </span>
               </span>
             </label>
 
-            <button
-              type="button"
-              onClick={runFnoScan}
-              disabled={loading || scanning}
-              className="w-full rounded-full border border-black bg-white py-3 text-sm font-medium text-black transition hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
-            >
-              {scanning
-                ? "Scanning F&O stocks… (please wait)"
-                : scanAllFno
-                  ? "Run all F&O report"
-                  : `Run F&O report (max ${scanMaxSymbols})`}
-            </button>
+            {useSectorFilter ? (
+              <button
+                type="button"
+                onClick={() => void runSectorTrendScan()}
+                disabled={loading || scanning}
+                className="w-full rounded-full bg-violet-700 py-3 text-sm font-medium text-white transition hover:bg-violet-800 disabled:cursor-not-allowed disabled:opacity-50"
+              >
+                {scanning
+                  ? "Running sector + bull/bear…"
+                  : "Run F&O scan (sector filter → bull/bear strategies)"}
+              </button>
+            ) : (
+              <div className="grid gap-2 sm:grid-cols-2">
+                <button
+                  type="button"
+                  onClick={() => void runBullBearScenario("bullish")}
+                  disabled={loading || scanning}
+                  className="rounded-full bg-emerald-700 py-3 text-sm font-medium text-white transition hover:bg-emerald-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {scanning ? "Running…" : "Run bullish (by conditions)"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runBullBearScenario("bearish")}
+                  disabled={loading || scanning}
+                  className="rounded-full bg-rose-700 py-3 text-sm font-medium text-white transition hover:bg-rose-800 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {scanning ? "Running…" : "Run bearish (by conditions)"}
+                </button>
+                <button
+                  type="button"
+                  onClick={() => void runFnoScan(bullStrategy)}
+                  disabled={loading || scanning}
+                  className="sm:col-span-2 w-full rounded-full border border-black bg-white py-3 text-sm font-medium text-black transition hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
+                >
+                  {scanning
+                    ? "Scanning…"
+                    : scanAllFno
+                      ? "Run all F&O (bullish strategy)"
+                      : `Run F&O report max ${scanMaxSymbols} (bullish strategy)`}
+                </button>
+              </div>
+            )}
           </section>
 
           <button
             type="button"
-            onClick={run}
+            onClick={() => void run()}
             disabled={loading || scanning}
             className="w-full rounded-full bg-black py-3.5 text-sm font-medium text-white transition hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
           >
@@ -1483,12 +2113,12 @@ export function BacktestApp() {
               ? runProgress
                 ? "Running (chunked)…"
                 : "Running backtest…"
-              : "Run backtest (single symbol)"}
+              : "Run backtest (single symbol · bullish strategy)"}
           </button>
           <p className="text-center text-[11px] text-neutral-400">
-            Long ranges run in {CHUNK_DAYS}-day chunks with pauses. On 429 rate
-            limits we wait and auto-retry (latency is OK). Sign in + Save days
-            to reuse cache and cut Upstox calls.
+            Single-symbol uses the bullish strategy + symbol under Market data.
+            Long ranges run in {CHUNK_DAYS}-day chunks. Sign in + Save days to
+            reuse cache.
           </p>
         </div>
 
@@ -1641,6 +2271,9 @@ export function BacktestApp() {
                         {result.diagnostics.trailCostStops
                           ? ` · trail-to-cost: ${result.diagnostics.trailCostStops}`
                           : ""}
+                        {result.diagnostics.trailSlStops
+                          ? ` · trailing SL: ${result.diagnostics.trailSlStops}`
+                          : ""}
                         {result.diagnostics.trailProfitThreshold
                           ? ` · trail arms +₹${Math.round(result.diagnostics.trailProfitThreshold).toLocaleString("en-IN")}`
                           : ""}
@@ -1739,6 +2372,217 @@ export function BacktestApp() {
       <footer className="mt-20 border-t border-neutral-200 pt-8 text-center text-xs text-neutral-400">
         For research only. Not investment advice. Past performance ≠ future results.
       </footer>
+    </div>
+  );
+}
+
+/** Per-lot take-profit / trailing SL / trail-to-cost / strategy-exit flags. */
+function TrailStopFields({
+  strategy,
+  onChange,
+}: {
+  strategy: StrategyConfig;
+  onChange: (
+    s: StrategyConfig | ((prev: StrategyConfig) => StrategyConfig)
+  ) => void;
+}) {
+  const nLots = Math.min(5, Math.max(1, strategy.positionLots || 1));
+  const rules = strategy.lotRules || [];
+
+  function updateLot(
+    idx: number,
+    patch: Partial<NonNullable<StrategyConfig["lotRules"]>[0]>
+  ) {
+    onChange((s) => {
+      const n = Math.min(5, Math.max(1, s.positionLots || 1));
+      const next = [...(s.lotRules || [])];
+      while (next.length < n) {
+        next.push({
+          trailPct: undefined,
+          trailToCost: false,
+          exitOnSignal: true,
+        });
+      }
+      next[idx] = { ...next[idx], ...patch };
+      return { ...s, positionLots: n, lotRules: next.slice(0, n) };
+    });
+  }
+
+  return (
+    <div className="mb-4 space-y-3 rounded-2xl border border-neutral-200 bg-neutral-50/80 p-4">
+      <p className="text-sm font-medium text-black">
+        Per-lot take-profit / trailing / exits
+      </p>
+      <p className="text-xs text-neutral-500">
+        Lots per trade is under Trade rules. Scale-out example: lot 1 take-profit
+        20%, lot 2 trail to cost (arms after lot 1 books) and/or trailing SL.
+      </p>
+      {Array.from({ length: nLots }, (_, idx) => {
+        const rule = rules[idx] || {};
+        const trailOn = rule.trailPct != null && rule.trailPct > 0;
+        const tpOn = rule.takeProfitPct != null && rule.takeProfitPct > 0;
+        return (
+          <div
+            key={idx}
+            className="rounded-xl border border-neutral-200 bg-white p-3"
+          >
+            <p className="mb-2 text-xs font-semibold tracking-wide text-neutral-600 uppercase">
+              Lot {idx + 1}
+            </p>
+            <label className="flex cursor-pointer items-start gap-2">
+              <input
+                type="checkbox"
+                checked={tpOn}
+                onChange={(e) =>
+                  updateLot(idx, {
+                    takeProfitPct: e.target.checked
+                      ? rule.takeProfitPct || 20
+                      : 0,
+                  })
+                }
+                className="mt-0.5 h-4 w-4 accent-black"
+              />
+              <span className="flex-1 text-sm">
+                Take-profit %
+                {tpOn && (
+                  <span className="mt-1 flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={1}
+                      max={500}
+                      step={1}
+                      value={rule.takeProfitPct || 20}
+                      onChange={(e) =>
+                        updateLot(idx, {
+                          takeProfitPct: Math.min(
+                            500,
+                            Math.max(1, Number(e.target.value) || 1)
+                          ),
+                        })
+                      }
+                      className="field-input w-20"
+                    />
+                    <span className="text-xs text-neutral-500">
+                      close lot when mark ≥ entry + this %
+                    </span>
+                  </span>
+                )}
+              </span>
+            </label>
+            <label className="mt-2 flex cursor-pointer items-start gap-2">
+              <input
+                type="checkbox"
+                checked={trailOn}
+                onChange={(e) =>
+                  updateLot(idx, {
+                    trailPct: e.target.checked ? rule.trailPct || 1 : 0,
+                  })
+                }
+                className="mt-0.5 h-4 w-4 accent-black"
+              />
+              <span className="flex-1 text-sm">
+                Trailing SL %
+                {trailOn && (
+                  <span className="mt-1 flex items-center gap-2">
+                    <input
+                      type="number"
+                      min={0.1}
+                      max={50}
+                      step={0.1}
+                      value={rule.trailPct || 1}
+                      onChange={(e) =>
+                        updateLot(idx, {
+                          trailPct: Math.min(
+                            50,
+                            Math.max(0.1, Number(e.target.value) || 0.1)
+                          ),
+                        })
+                      }
+                      className="field-input w-20"
+                    />
+                    <span className="text-xs text-neutral-500">
+                      % below peak
+                    </span>
+                  </span>
+                )}
+              </span>
+            </label>
+            <label className="mt-2 flex cursor-pointer items-start gap-2">
+              <input
+                type="checkbox"
+                checked={Boolean(rule.trailToCost)}
+                onChange={(e) =>
+                  updateLot(idx, {
+                    trailToCost: e.target.checked,
+                    armToCostOnPartialTp:
+                      e.target.checked && nLots > 1
+                        ? rule.armToCostOnPartialTp !== false
+                        : rule.armToCostOnPartialTp,
+                  })
+                }
+                className="mt-0.5 h-4 w-4 accent-black"
+              />
+              <span className="flex-1 text-sm">
+                Trail to cost (breakeven)
+                {rule.trailToCost && (
+                  <span className="mt-1 flex flex-col gap-1">
+                    <span className="flex items-center gap-2">
+                      <input
+                        type="number"
+                        min={1}
+                        max={100}
+                        value={rule.trailToCostProfitPctOfCapital ?? 20}
+                        onChange={(e) =>
+                          updateLot(idx, {
+                            trailToCostProfitPctOfCapital: Math.min(
+                              100,
+                              Math.max(1, Number(e.target.value) || 1)
+                            ),
+                          })
+                        }
+                        className="field-input w-20"
+                      />
+                      <span className="text-xs text-neutral-500">
+                        % of capital (this lot&apos;s share) to arm BE
+                      </span>
+                    </span>
+                    {nLots > 1 && (
+                      <label className="flex cursor-pointer items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={rule.armToCostOnPartialTp !== false}
+                          onChange={(e) =>
+                            updateLot(idx, {
+                              armToCostOnPartialTp: e.target.checked,
+                            })
+                          }
+                          className="h-4 w-4 accent-black"
+                        />
+                        <span className="text-xs text-neutral-600">
+                          Arm BE when another lot takes profit
+                        </span>
+                      </label>
+                    )}
+                  </span>
+                )}
+              </span>
+            </label>
+            <label className="mt-2 flex cursor-pointer items-center gap-2">
+              <input
+                type="checkbox"
+                checked={rule.exitOnSignal !== false}
+                onChange={(e) =>
+                  updateLot(idx, { exitOnSignal: e.target.checked })
+                }
+                className="h-4 w-4 accent-black"
+              />
+              <span className="text-sm">
+                Exit on strategy signal
+              </span>
+            </label>
+          </div>
+        );
+      })}
     </div>
   );
 }

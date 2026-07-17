@@ -39,6 +39,8 @@ export type WatchQuote = {
   barTime: number;
   /** Session day change % (last close vs first bar open of that IST day) */
   changePct?: number;
+  /** Session turnover proxy Σ(close×volume) for weighted sector strength */
+  turnover?: number;
 };
 
 function istDayKey(ms: number): string {
@@ -58,9 +60,13 @@ export function quoteFromCandles(
   const day = istDayKey(last.time);
   // First bar of the last session day (open ≈ session open when series starts early enough)
   let first = last;
+  let turnover = 0;
   for (let i = candles.length - 1; i >= 0; i--) {
     if (istDayKey(candles[i].time) !== day) break;
     first = candles[i];
+    const c = candles[i];
+    const vol = Number.isFinite(c.volume) && c.volume > 0 ? c.volume : 0;
+    if (vol > 0 && c.close > 0) turnover += c.close * vol;
   }
   const open = first.open;
   const changePct =
@@ -69,6 +75,7 @@ export function quoteFromCandles(
     price: last.close,
     barTime: last.time,
     changePct: Number.isFinite(changePct) ? changePct : undefined,
+    turnover: turnover > 0 ? turnover : undefined,
   };
 }
 
@@ -96,9 +103,10 @@ function realizedVolPct(candles: Candle[], lookback = 20): number | undefined {
 
 function defaultPeriod(type: IndicatorType): number {
   if (type === "RSI" || type === "ADX") return 14;
-  if (type === "VWAP") return 1;
-  if (type === "OPENING_RANGE_HIGH" || type === "OPENING_RANGE_LOW") return 1;
-  if (type === "BREAKOUT_HIGH" || type === "BREAKOUT_LOW") return 1;
+  if (type === "VWAP" || type === "OBV") return 1;
+  if (type === "VOL_RATIO") return 20;
+  if (type === "OPENING_RANGE_HIGH" || type === "OPENING_RANGE_LOW") return 15;
+  if (type === "BREAKOUT_HIGH" || type === "BREAKOUT_LOW") return 15;
   if (type.startsWith("FIB_PIVOT")) return 1;
   if (type === "PREV_DAY_HIGH" || type === "PREV_DAY_LOW") return 1;
   return 9;
@@ -170,11 +178,20 @@ function evalCondition(
   i: number,
   seriesMap: Map<string, (number | null)[]>
 ): boolean {
+  const op: Comparator = cond.op;
+
+  if (op === "rising" || op === "falling") {
+    if (i === 0) return false;
+    const left = resolveValue(cond.left, i, seriesMap);
+    const leftPrev = resolveValue(cond.left, i - 1, seriesMap);
+    if (left == null || leftPrev == null) return false;
+    return op === "rising" ? left > leftPrev : left < leftPrev;
+  }
+
   const left = resolveValue(cond.left, i, seriesMap);
   const right = resolveValue(cond.right, i, seriesMap);
   if (left == null || right == null) return false;
 
-  const op: Comparator = cond.op;
   if (op === "gt") return left > right;
   if (op === "gte") return left >= right;
   if (op === "lt") return left < right;

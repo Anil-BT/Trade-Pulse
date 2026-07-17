@@ -27,8 +27,14 @@ function cleanSymbol(symbol: string): string {
     .replace(/\.BO$/i, "");
 }
 
+export type RunBacktestJobOpts = {
+  /** Skip broker fetch when candles already loaded (sector-trend scan). */
+  candles?: import("./types").Candle[];
+};
+
 export async function runBacktestJob(
-  body: BacktestRequest
+  body: BacktestRequest,
+  opts?: RunBacktestJobOpts
 ): Promise<BacktestResult & { instrumentKey?: string }> {
   if (!body.symbol?.trim()) {
     throw new Error("Symbol is required");
@@ -45,7 +51,7 @@ export async function runBacktestJob(
 
   const interval = body.interval || "5m";
   let symbol = cleanSymbol(body.symbol);
-  let candles;
+  let candles = opts?.candles;
   let resolvedInstrumentKey: string | undefined;
   let lotSource = "manual";
 
@@ -53,7 +59,7 @@ export async function runBacktestJob(
   const upstoxToken = sanitizeToken(
     body.upstoxAccessToken || process.env.UPSTOX_ACCESS_TOKEN || ""
   );
-  if (body.source === "upstox" && !upstoxToken) {
+  if (body.source === "upstox" && !upstoxToken && !candles?.length) {
     throw new Error(
       "Upstox access token is required. Paste it under Market data, or set UPSTOX_ACCESS_TOKEN in Vercel Environment Variables and redeploy."
     );
@@ -80,7 +86,22 @@ export async function runBacktestJob(
     `${symbol}.NS`
   );
 
-  if (source === "upstox") {
+  if (candles?.length) {
+    // Preloaded — still resolve instrument key for options if needed
+    if (source === "upstox") {
+      try {
+        const resolved = await resolveUpstoxInstrumentKey(
+          body.upstoxInstrumentKey?.includes("|")
+            ? body.upstoxInstrumentKey
+            : symbol
+        );
+        resolvedInstrumentKey = resolved.instrumentKey;
+        symbol = resolved.tradingSymbol;
+      } catch {
+        /* keep symbol */
+      }
+    }
+  } else if (source === "upstox") {
     const resolved = await resolveUpstoxInstrumentKey(
       body.upstoxInstrumentKey?.includes("|")
         ? body.upstoxInstrumentKey
@@ -146,7 +167,7 @@ export async function runBacktestJob(
     );
   }
 
-  if (!candles.length) {
+  if (!candles?.length) {
     throw new Error(
       `No candles for ${symbol} from ${body.from} to ${body.to}`
     );
@@ -176,12 +197,20 @@ export async function runBacktestJob(
   // Option pricer: market OHLC when Upstox token present, else realized-vol model
   let optionPricer;
   if (body.tradeInstrument === "options_atm" && options) {
-    const signalTimes = previewEntrySignals(
-      candles,
-      body.strategy.entry,
-      body.strategy.entryLogic ?? "and",
-      Boolean(body.oneTradePerDay)
-    );
+    const signalTimes = body.sectorPickEntry
+      ? previewSectorPickSignals(
+          candles,
+          body.allowedEntryDates || [],
+          body.entryTimeWindows,
+          entryNotBeforeMs,
+          Boolean(body.oneTradePerDay)
+        )
+      : previewEntrySignals(
+          candles,
+          body.strategy.entry,
+          body.strategy.entryLogic ?? "and",
+          Boolean(body.oneTradePerDay)
+        );
 
     optionPricer = await createOptionPricer({
       symbol,
@@ -224,6 +253,59 @@ export async function runBacktestJob(
     symbol,
     instrumentKey: resolvedInstrumentKey,
   };
+}
+
+/**
+ * Sector-pick entry times: first bar on each allowed day that is after
+ * entryNotBefore and inside entry windows (mirrors sectorPickEntry backtest).
+ */
+export function previewSectorPickSignals(
+  candles: import("./types").Candle[],
+  allowedDates: string[],
+  entryWindows: import("./types").EntryTimeWindow[] | undefined,
+  entryNotBeforeMs: number,
+  oneTradePerDay: boolean
+): { timeMs: number; spot: number }[] {
+  const allowed = new Set(allowedDates);
+  if (!allowed.size) return [];
+  const dayKey = (t: number) =>
+    new Date(t + 5.5 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const inWindow = (t: number) => {
+    if (!entryWindows?.length) return true;
+    const active = entryWindows.filter((w) => w.enabled);
+    if (!active.length) return true;
+    const d = new Date(t + 5.5 * 60 * 60 * 1000);
+    const mins = d.getUTCHours() * 60 + d.getUTCMinutes();
+    return active.some((w) => {
+      const parse = (hm: string) => {
+        const m = /^(\d{1,2}):(\d{2})/.exec(String(hm || "").trim());
+        if (!m) return null;
+        return Number(m[1]) * 60 + Number(m[2]);
+      };
+      const a = parse(w.start);
+      const b = parse(w.end);
+      if (a == null || b == null) return false;
+      return a <= b ? mins >= a && mins <= b : mins >= a || mins <= b;
+    });
+  };
+
+  const out: { timeMs: number; spot: number }[] = [];
+  let day = "";
+  let used = 0;
+  for (const c of candles) {
+    if (entryNotBeforeMs && c.time < entryNotBeforeMs) continue;
+    const d = dayKey(c.time);
+    if (d !== day) {
+      day = d;
+      used = 0;
+    }
+    if (!allowed.has(d)) continue;
+    if (oneTradePerDay && used >= 1) continue;
+    if (!inWindow(c.time)) continue;
+    out.push({ timeMs: c.time, spot: c.close });
+    used += 1;
+  }
+  return out;
 }
 
 /** Quick dry-run of entry conditions to know which ATM contracts to prefetch. */
@@ -293,14 +375,19 @@ function collect(
     op.period ??
     (op.indicator === "RSI" || op.indicator === "ADX"
       ? 14
-      : op.indicator === "VWAP" ||
-          op.indicator.startsWith("FIB") ||
-          op.indicator.startsWith("OPENING") ||
-          op.indicator.startsWith("PREV") ||
-          op.indicator === "BREAKOUT_HIGH" ||
-          op.indicator === "BREAKOUT_LOW"
-        ? 1
-        : 9);
+      : op.indicator === "VOL_RATIO"
+        ? 20
+        : op.indicator === "OPENING_RANGE_HIGH" ||
+            op.indicator === "OPENING_RANGE_LOW" ||
+            op.indicator === "BREAKOUT_HIGH" ||
+            op.indicator === "BREAKOUT_LOW"
+          ? 15
+          : op.indicator === "VWAP" ||
+              op.indicator === "OBV" ||
+              op.indicator.startsWith("FIB") ||
+              op.indicator.startsWith("PREV")
+            ? 1
+            : 9);
   needed.set(indicatorKey(op.indicator, period), {
     type: op.indicator,
     period,
@@ -315,6 +402,13 @@ function evalAll(
 ): boolean {
   if (!conditions.length) return false;
   const res = conditions.map((c) => {
+    if (c.op === "rising" || c.op === "falling") {
+      if (i === 0) return false;
+      const L = val(c.left, i, map);
+      const Lp = val(c.left, i - 1, map);
+      if (L == null || Lp == null) return false;
+      return c.op === "rising" ? L > Lp : L < Lp;
+    }
     const L = val(c.left, i, map);
     const R = val(c.right, i, map);
     if (L == null || R == null) return false;

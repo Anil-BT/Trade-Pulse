@@ -1,6 +1,7 @@
 import Link from "next/link";
 import { AuthGate } from "@/components/AuthGate";
 import { AppHeader } from "@/components/AppHeader";
+import { ResultsPanel } from "@/components/ResultsPanel";
 
 export default function Home() {
   return (
@@ -18,8 +19,8 @@ export default function Home() {
               <span className="text-neutral-400">Tools that compound.</span>
             </h1>
             <p className="mt-5 text-base leading-relaxed text-neutral-600 sm:text-lg">
-              Choose a workspace from the header. Backtest is ready; more
-              features land here as we build them.
+              Choose a workspace from the header, or scan upcoming F&amp;O
+              results below.
             </p>
           </header>
 
@@ -75,6 +76,8 @@ export default function Home() {
               <p className="mt-4 text-sm font-medium text-black">Open →</p>
             </Link>
           </div>
+
+          <ResultsPanel />
         </div>
       </AuthGate>
     </main>

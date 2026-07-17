@@ -63,6 +63,8 @@ type WatchQuote = {
   price: number;
   barTime: number;
   changePct?: number;
+  /** Session turnover proxy for liquidity-weighted sector bars */
+  turnover?: number;
 };
 
 type WatchSource = "yahoo" | "upstox";
@@ -215,6 +217,7 @@ function mergeQuotes(
       price: q.price,
       barTime: q.barTime,
       changePct: q.changePct,
+      turnover: q.turnover,
     });
   }
   return next;
@@ -315,32 +318,50 @@ export function MarketWatchApp() {
   const backfillRunningRef = useRef(false);
   const [backfillNote, setBackfillNote] = useState<string | null>(null);
 
-  // Merge / refresh user strategies from Backtest (and keep selection + telegram flags)
+  // Merge / refresh user strategies from Backtest.
+  // Preserve live checkbox state (selected + telegram). Never re-apply saved
+  // watch config here — that ran on every focus/refresh and undid toggles.
   useEffect(() => {
     setPicks((prev) => {
-      const selected = new Map(
-        prev.filter((p) => p.selected).map((p) => [p.id, true] as const)
+      const prevById = new Map(prev.map((x) => [x.id, x]));
+      const prefsById = new Map(
+        (watchConfigRef.current?.strategies ?? []).map(
+          (p) => [p.id, p] as const
+        )
       );
-      const tg = new Map(
-        prev
-          .filter((p) => p.telegramNotify)
-          .map((p) => [p.id, true] as const)
-      );
+
+      const defaultSelected = (name: string) =>
+        name === "VWAP Bull" ||
+        name === "Opening Range + EMA9" ||
+        name.includes("bullish");
+
+      /** Existing row → keep user toggles. New row → config pref or default. */
+      const flagsFor = (id: string, fallbackSelected: boolean) => {
+        const was = prevById.get(id);
+        if (was) {
+          return {
+            selected: was.selected,
+            telegramNotify: Boolean(was.telegramNotify),
+          };
+        }
+        const pref = prefsById.get(id);
+        if (pref) {
+          return {
+            selected: Boolean(pref.selected),
+            telegramNotify: Boolean(pref.telegramNotify),
+          };
+        }
+        return { selected: fallbackSelected, telegramNotify: false };
+      };
+
       const presets: StrategyPick[] = STRATEGY_PRESETS.map((p) => {
         const id = `preset:${p.name}`;
-        const was = prev.find((x) => x.id === id);
+        const was = prevById.get(id);
         return {
           id,
           strategy: was?.strategy ?? cloneStrategy(p),
           source: "preset" as const,
-          selected: selected.has(id)
-            ? true
-            : was
-              ? was.selected
-              : p.name === "VWAP Bull" ||
-                p.name === "Opening Range + EMA9" ||
-                p.name.includes("bullish"),
-          telegramNotify: tg.has(id) || Boolean(was?.telegramNotify),
+          ...flagsFor(id, defaultSelected(p.name)),
         };
       });
 
@@ -348,7 +369,6 @@ export function MarketWatchApp() {
         .filter((s) => s.strategy?.entry?.length)
         .map((s) => {
           const id = `saved:${s.id || s.name}`;
-          const was = prev.find((x) => x.id === id);
           return {
             id,
             strategy: cloneStrategy({
@@ -356,23 +376,19 @@ export function MarketWatchApp() {
               name: s.name || s.strategy.name,
             }),
             source: "saved" as const,
-            selected: selected.has(id),
-            telegramNotify: tg.has(id) || Boolean(was?.telegramNotify),
+            ...flagsFor(id, false),
           };
         });
 
-      let next = [...presets, ...savedPicks];
-      // Apply saved Market Watch prefs (selected + Telegram once)
-      if (watchConfigRef.current?.strategies?.length) {
-        next = applyStrategyPrefs(next, watchConfigRef.current.strategies);
-      }
-      return next;
+      return [...presets, ...savedPicks];
     });
   }, [savedStrategies]);
 
-  // Load permanent config (localStorage + cloud when signed in)
+  // Load permanent config once per user (localStorage + cloud when signed in).
+  // Applies strategy checkboxes only on this load — not on later strategy list refreshes.
   useEffect(() => {
     let cancelled = false;
+    configAppliedRef.current = false;
     (async () => {
       try {
         const cfg = await loadWatchConfig(user?.uid ?? null);
@@ -383,8 +399,10 @@ export function MarketWatchApp() {
         setBatchSize(cfg.batchSize || 25);
         setRunOnMarketOpen(cfg.runOnMarketOpen !== false);
         if (cfg.telegramChatId) setTelegramChatId(cfg.telegramChatId);
-        setPicks((prev) => applyStrategyPrefs(prev, cfg.strategies));
-        configAppliedRef.current = true;
+        if (!configAppliedRef.current) {
+          setPicks((prev) => applyStrategyPrefs(prev, cfg.strategies));
+          configAppliedRef.current = true;
+        }
         setConfigNote(
           user?.uid
             ? "Loaded your saved Market Watch config (cloud)."

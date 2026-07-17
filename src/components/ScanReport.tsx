@@ -410,6 +410,128 @@ export function ScanReportView({
                 ? ` (of ${report.universeSize})`
                 : ""}
             </p>
+            {report.sectorTrend && (
+              <div className="mt-3 rounded-2xl border border-violet-200 bg-violet-50/80 px-3 py-2.5 text-xs text-violet-950">
+                <p className="font-semibold">
+                  Sector trend · {report.sectorTrend.mode}
+                  {report.sectorTrend.mode === "auto" ? " (per day)" : ""} ·{" "}
+                  {report.sectorTrend.windowLabel}
+                </p>
+                <p className="mt-1 text-[11px] text-violet-800/90">
+                  Top {report.sectorTrend.topSectors} sectors by bar length ×{" "}
+                  {report.sectorTrend.topStocksPerSector} stocks
+                  {report.sectorTrend.weightMode
+                    ? ` · ${report.sectorTrend.weightMode}`
+                    : ""}
+                  {report.sectorTrend.minStocks != null
+                    ? ` · ≥${report.sectorTrend.minStocks} stocks`
+                    : ""}
+                  {report.sectorTrend.minBreadthPct != null
+                    ? ` · breadth ≥${report.sectorTrend.minBreadthPct}%`
+                    : ""}
+                  {report.sectorTrend.mode === "auto"
+                    ? ` · min |bar| ${report.sectorTrend.biasThreshold}%`
+                    : ""}
+                  {" · "}
+                  <span className="text-emerald-800">
+                    {report.sectorTrend.bullDays} bull day
+                    {report.sectorTrend.bullDays === 1 ? "" : "s"}
+                  </span>
+                  {" / "}
+                  <span className="text-rose-800">
+                    {report.sectorTrend.bearDays} bear day
+                    {report.sectorTrend.bearDays === 1 ? "" : "s"}
+                  </span>
+                </p>
+                <p className="mt-1 leading-relaxed text-violet-900/90">
+                  {report.sectorTrend.note ||
+                    `Same as Market Watch: longest sector bars win; green=bull, red=bear.`}
+                </p>
+                {report.sectorTrend.dayPicks?.length > 0 && (
+                  <details className="mt-2">
+                    <summary className="cursor-pointer font-medium text-violet-800">
+                      Daily picks ({report.sectorTrend.dayPicks.length} day
+                      {report.sectorTrend.dayPicks.length === 1 ? "" : "s"})
+                    </summary>
+                    <ul className="mt-2 max-h-56 space-y-2 overflow-y-auto pr-1">
+                      {report.sectorTrend.dayPicks.map((d) => (
+                        <li
+                          key={d.date}
+                          className="rounded-lg bg-white/70 px-2 py-1.5"
+                        >
+                          <span className="font-medium">{d.date}</span>
+                          <span
+                            className={
+                              d.direction === "bullish"
+                                ? "ml-2 rounded-full bg-emerald-100 px-1.5 py-0.5 text-[10px] font-semibold text-emerald-800"
+                                : d.direction === "bearish"
+                                  ? "ml-2 rounded-full bg-rose-100 px-1.5 py-0.5 text-[10px] font-semibold text-rose-800"
+                                  : "ml-2 rounded-full bg-amber-100 px-1.5 py-0.5 text-[10px] font-semibold text-amber-900"
+                            }
+                          >
+                            {d.direction}
+                          </span>
+                          {d.sectors.map((sec) => {
+                            const bar = Math.min(
+                              100,
+                              Math.abs(sec.strength ?? sec.avgChangePct) * 12
+                            );
+                            const isBull =
+                              sec.direction === "bullish" ||
+                              (sec.direction == null && sec.avgChangePct >= 0);
+                            return (
+                              <div
+                                key={sec.sector}
+                                className="mt-1.5 pl-1 text-[11px]"
+                              >
+                                <div className="flex items-center gap-2">
+                                  <span
+                                    className={
+                                      isBull
+                                        ? "rounded bg-emerald-100 px-1 font-semibold text-emerald-800"
+                                        : "rounded bg-rose-100 px-1 font-semibold text-rose-800"
+                                    }
+                                  >
+                                    {isBull ? "bull" : "bear"}
+                                  </span>
+                                  <span className="font-medium">
+                                    {sec.sector}
+                                  </span>
+                                  <span className="text-violet-700/80">
+                                    {sec.avgChangePct >= 0 ? "+" : ""}
+                                    {sec.avgChangePct.toFixed(2)}% · |bar|{" "}
+                                    {(sec.strength ?? Math.abs(sec.avgChangePct)).toFixed(2)}
+                                  </span>
+                                </div>
+                                {/* Mini bar like Market Watch */}
+                                <div className="mt-0.5 h-1.5 max-w-[12rem] overflow-hidden rounded-full bg-neutral-100">
+                                  <div
+                                    className={
+                                      isBull
+                                        ? "h-full rounded-full bg-emerald-500"
+                                        : "h-full rounded-full bg-rose-500"
+                                    }
+                                    style={{ width: `${Math.max(4, bar)}%` }}
+                                  />
+                                </div>
+                                <div className="mt-0.5 text-neutral-600">
+                                  {sec.stocks
+                                    .map(
+                                      (s) =>
+                                        `${s.symbol} (${s.changePct >= 0 ? "+" : ""}${s.changePct.toFixed(2)}%)`
+                                    )
+                                    .join(", ")}
+                                </div>
+                              </div>
+                            );
+                          })}
+                        </li>
+                      ))}
+                    </ul>
+                  </details>
+                )}
+              </div>
+            )}
           </div>
           <div className="flex shrink-0 flex-wrap gap-2">
             <button
