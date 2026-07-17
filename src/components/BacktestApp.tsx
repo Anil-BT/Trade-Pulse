@@ -51,6 +51,7 @@ import type {
   BacktestResult,
   Candle,
   DataSource,
+  DualScanReport,
   EntryTimeWindow,
   Interval,
   OptionsTradeSettings,
@@ -145,7 +146,17 @@ export function BacktestApp() {
   const [error, setError] = useState<string | null>(null);
   const [result, setResult] = useState<BacktestResult | null>(null);
   const [scanReport, setScanReport] = useState<ScanReport | null>(null);
+  /** Second table when dual bull+bear condition scan (sector filter off) */
+  const [scanReportBear, setScanReportBear] = useState<ScanReport | null>(null);
+  const [dualScanNote, setDualScanNote] = useState<string | null>(null);
   const [chartFilter, setChartFilter] = useState<ChartBarFilter | null>(null);
+
+  function clearScanResults() {
+    setScanReport(null);
+    setScanReportBear(null);
+    setDualScanNote(null);
+    setScanFromCache(false);
+  }
   /** IST YYYY-MM-DD from calendar day click */
   const [dayFilter, setDayFilter] = useState<string | null>(null);
   const [showToken, setShowToken] = useState(false);
@@ -486,7 +497,7 @@ export function BacktestApp() {
     setLoading(true);
     setError(null);
     setResult(null);
-    setScanReport(null);
+    clearScanResults();
     setChartFilter(null);
     setDayFilter(null);
     setRunProgress(null);
@@ -767,8 +778,7 @@ export function BacktestApp() {
     setScanning(true);
     setError(null);
     setResult(null);
-    setScanReport(null);
-    setScanFromCache(false);
+    clearScanResults();
     setChartFilter(null);
     setDayFilter(null);
     setRunProgress(null);
@@ -842,6 +852,8 @@ export function BacktestApp() {
       }
       const report = data as ScanReport;
       setScanReport(report);
+      setScanReportBear(null);
+      setDualScanNote(null);
       setScanFromCache(false);
       const st = report.sectorTrend;
       setRunProgress(
@@ -851,7 +863,7 @@ export function BacktestApp() {
             : "")
       );
     } catch (e) {
-      setScanReport(null);
+      clearScanResults();
       setError(e instanceof Error ? e.message : "Sector-trend scan failed");
       setRunProgress(null);
     } finally {
@@ -866,8 +878,7 @@ export function BacktestApp() {
     setScanning(true);
     setError(null);
     setResult(null);
-    setScanReport(null);
-    setScanFromCache(false);
+    clearScanResults();
     setChartFilter(null);
     setDayFilter(null);
     setRunProgress(null);
@@ -934,12 +945,14 @@ export function BacktestApp() {
         throw new Error(data.error || `Scan failed (${res.status})`);
       }
       setScanReport(data as ScanReport);
+      setScanReportBear(null);
+      setDualScanNote(null);
       setScanFromCache(false);
       setRunProgress(
         `${side === "bullish" ? "Bullish" : "Bearish"} scenario done · ${(data as ScanReport).summary?.withTrades ?? 0} symbol(s) with trades.`
       );
     } catch (e) {
-      setScanReport(null);
+      clearScanResults();
       setError(
         e instanceof Error ? e.message : `${side} scenario scan failed`
       );
@@ -949,37 +962,57 @@ export function BacktestApp() {
     }
   }
 
-  async function runFnoScan(strategyOverride?: StrategyConfig) {
+  /**
+   * F&O universe scan.
+   * - dualBoth: sector filter off — fetch each symbol once, evaluate bullish (CE)
+   *   and bearish (PE) independently → two result tables.
+   * - strategyOverride: single-strategy scan.
+   */
+  async function runFnoScan(
+    strategyOverride?: StrategyConfig,
+    opts?: { dualBoth?: boolean }
+  ) {
     setScanning(true);
     setError(null);
     setResult(null);
-    setScanReport(null);
-    setScanFromCache(false);
+    clearScanResults();
     setChartFilter(null);
     setDayFilter(null);
     setRunProgress(null);
 
     try {
-      const strat = withLots(strategyOverride || strategy);
+      const dualBoth = Boolean(opts?.dualBoth) && !strategyOverride;
+      const bull = withLots(structuredClone(bullStrategy));
+      const bear = withLots(structuredClone(bearStrategy));
+      const strat = withLots(strategyOverride || bullStrategy);
+
       if (!from || !to) throw new Error("Please select both From and To dates.");
       if (from > to) throw new Error("From date must be on or before To date.");
-      if (!strat.entry.length) {
-        throw new Error("Add at least one entry condition to the strategy.");
-      }
-      if (!strat.exit.length) {
-        throw new Error("Add at least one exit condition to the strategy.");
+
+      if (dualBoth) {
+        if (!bull.entry.length || !bull.exit.length) {
+          throw new Error("Bullish strategy needs entry and exit conditions.");
+        }
+        if (!bear.entry.length || !bear.exit.length) {
+          throw new Error("Bearish strategy needs entry and exit conditions.");
+        }
+      } else {
+        if (!strat.entry.length) {
+          throw new Error("Add at least one entry condition to the strategy.");
+        }
+        if (!strat.exit.length) {
+          throw new Error("Add at least one exit condition to the strategy.");
+        }
       }
       validateSourceCredentials();
-      setStrategy(structuredClone(strat));
+      setStrategy(structuredClone(dualBoth ? bull : strat));
 
       const { primary: fingerprint, candidates } = fnoScanCacheKeys();
       const scopeLabel = scanAllFno
         ? "all F&O stocks"
         : `up to ${scanMaxSymbols} F&O symbols`;
 
-      // 1) Cloud cache for multi-symbol F&O (including "run all F&O") —
-      //    same strategy + date range → skip Upstox entirely
-      if (!forceLiveScan && user && scanResultsAvailable()) {
+      if (!dualBoth && !forceLiveScan && user && scanResultsAvailable()) {
         setRunProgress(
           `Checking cloud cache for ${scopeLabel} (${from} → ${to})…`
         );
@@ -992,6 +1025,8 @@ export function BacktestApp() {
         );
         if (cached) {
           setScanReport(cached);
+          setScanReportBear(null);
+          setDualScanNote(null);
           setScanFromCache(true);
           setRunProgress(
             `Loaded ${cached.scanned || cached.rows.length} symbol(s) from cloud — no Upstox calls.`
@@ -1001,6 +1036,10 @@ export function BacktestApp() {
         setRunProgress(
           `No saved ${scopeLabel} result for this strategy/dates — live scan via broker…`
         );
+      } else if (dualBoth) {
+        setRunProgress(
+          `Fetching ${scopeLabel} · check bull “${bull.name}” (CE) + bear “${bear.name}” (PE)…`
+        );
       } else if (!user) {
         setRunProgress(
           "Not signed in — live scan (sign in + save to skip Upstox next time)…"
@@ -1009,7 +1048,6 @@ export function BacktestApp() {
         setRunProgress("Force live scan — ignoring cloud cache…");
       }
 
-      // 2) Live F&O scan (Upstox / Dhan / Kite) — full universe when scanAll
       const res = await fetch("/api/scan", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1018,7 +1056,10 @@ export function BacktestApp() {
           to,
           interval,
           source,
-          strategy: strat,
+          strategy: dualBoth ? bull : strat,
+          ...(dualBoth
+            ? { bullStrategy: bull, bearStrategy: bear }
+            : {}),
           initialCapital: capital,
           positionSizePct: equityAllocPct,
           oneTradePerDay,
@@ -1038,12 +1079,36 @@ export function BacktestApp() {
       if (!res.ok) {
         throw new Error(data.error || `Scan failed (${res.status})`);
       }
+
+      // Dual response: separate bull + bear tables
+      if (dualBoth && data && data.dual === true) {
+        const dual = data as DualScanReport;
+        setScanReport(dual.bull);
+        setScanReportBear(dual.bear);
+        setDualScanNote(
+          dual.note ||
+            "One API fetch per symbol; bullish and bearish conditions run independently."
+        );
+        setScanFromCache(false);
+        setRunProgress(
+          `Done · bull ${dual.bull.summary.withTrades} symbol(s) / ${dual.bull.summary.totalTrades} trade(s)` +
+            ` · bear ${dual.bear.summary.withTrades} symbol(s) / ${dual.bear.summary.totalTrades} trade(s).`
+        );
+        return;
+      }
+
       const liveReport = data as ScanReport;
       setScanReport(liveReport);
+      setScanReportBear(null);
+      setDualScanNote(null);
       setScanFromCache(false);
 
-      // 3) Auto-save full F&O result so next "run all" hits cloud, not Upstox
-      if (user && scanResultsAvailable() && liveReport.rows?.length) {
+      if (
+        !dualBoth &&
+        user &&
+        scanResultsAvailable() &&
+        liveReport.rows?.length
+      ) {
         try {
           setRunProgress(
             `Scan done — saving ${scopeLabel} to cloud for next run…`
@@ -1059,19 +1124,16 @@ export function BacktestApp() {
               `. Re-run same setup will skip Upstox.`
           );
         } catch (saveErr) {
-          // Non-fatal — user can still click Save on the report
           const msg =
             saveErr instanceof Error ? saveErr.message : "auto-save failed";
           setRunProgress(`Live scan done · cloud auto-save failed: ${msg}`);
         }
       }
     } catch (e) {
-      setScanReport(null);
-      setScanFromCache(false);
+      clearScanResults();
       setError(e instanceof Error ? e.message : "F&O scan failed");
     } finally {
       setScanning(false);
-      // Keep last progress briefly if from cache; clear after short delay
       setTimeout(() => setRunProgress(null), 4000);
     }
   }
@@ -1857,7 +1919,7 @@ export function BacktestApp() {
             <p className="mb-4 text-xs text-neutral-500">
               {useSectorFilter
                 ? "Applied to stocks in green (bullish) sectors."
-                : "Runs on F&O by these entry/exit conditions when you run bullish scenario."}
+                : "Used for CE when sector filter is off (Run all F&O or Run bullish)."}
             </p>
             <Field label="Name">
               <input
@@ -1946,7 +2008,7 @@ export function BacktestApp() {
             <p className="mb-4 text-xs text-neutral-500">
               {useSectorFilter
                 ? "Applied to stocks in red (bearish) sectors."
-                : "Runs on F&O by these entry/exit conditions when you run bearish scenario."}
+                : "Used for PE when sector filter is off (Run all F&O or Run bearish)."}
             </p>
             <Field label="Name">
               <input
@@ -2001,7 +2063,7 @@ export function BacktestApp() {
             <p className="mb-4 text-xs leading-relaxed text-neutral-500">
               {useSectorFilter
                 ? "Sector filter is on: one run ranks sectors, then applies bullish strategy on green sectors and bearish strategy on red sectors."
-                : "Sector filter is off: run bullish or bearish strategy by conditions across the F&O list. Or run the bullish strategy as a plain multi-symbol report."}
+                : "Sector filter is off: Run all F&O checks both bullish and bearish entry/exit conditions on every symbol (CE + PE). Use the side buttons for one strategy only."}
             </p>
 
             <label className="mb-4 flex cursor-pointer items-start gap-3 rounded-2xl border border-neutral-200 bg-neutral-50/80 p-4">
@@ -2089,15 +2151,15 @@ export function BacktestApp() {
                 </button>
                 <button
                   type="button"
-                  onClick={() => void runFnoScan(bullStrategy)}
+                  onClick={() => void runFnoScan(undefined, { dualBoth: true })}
                   disabled={loading || scanning}
                   className="sm:col-span-2 w-full rounded-full border border-black bg-white py-3 text-sm font-medium text-black transition hover:bg-neutral-50 disabled:cursor-not-allowed disabled:opacity-50"
                 >
                   {scanning
-                    ? "Scanning…"
+                    ? "Scanning bull + bear…"
                     : scanAllFno
-                      ? "Run all F&O (bullish strategy)"
-                      : `Run F&O report max ${scanMaxSymbols} (bullish strategy)`}
+                      ? "Run all F&O (bull + bear conditions)"
+                      : `Run F&O max ${scanMaxSymbols} (bull + bear conditions)`}
                 </button>
               </div>
             )}
@@ -2183,16 +2245,44 @@ export function BacktestApp() {
             </div>
           )}
 
-          {scanReport && !loading && !scanning && !error && (
-            <ScanReportView
-              report={scanReport}
-              onClose={() => setScanReport(null)}
-              cacheFingerprint={fnoCacheFingerprint()}
-              fromCache={scanFromCache}
-            />
-          )}
+          {(scanReport || scanReportBear) &&
+            !loading &&
+            !scanning &&
+            !error && (
+              <div className="space-y-6">
+                {dualScanNote && (
+                  <div className="rounded-2xl border border-neutral-200 bg-neutral-50 px-4 py-3 text-xs leading-relaxed text-neutral-600">
+                    {dualScanNote}
+                  </div>
+                )}
+                {scanReport && (
+                  <ScanReportView
+                    report={scanReport}
+                    onClose={clearScanResults}
+                    cacheFingerprint={
+                      scanReportBear ? undefined : fnoCacheFingerprint()
+                    }
+                    fromCache={scanFromCache && !scanReportBear}
+                    hideSave={Boolean(scanReportBear)}
+                    heading={
+                      scanReport.side === "bullish" || scanReportBear
+                        ? "Bullish · CE"
+                        : undefined
+                    }
+                  />
+                )}
+                {scanReportBear && (
+                  <ScanReportView
+                    report={scanReportBear}
+                    onClose={clearScanResults}
+                    hideSave
+                    heading="Bearish · PE"
+                  />
+                )}
+              </div>
+            )}
 
-          {result && !scanning && !scanReport && (
+          {result && !scanning && !scanReport && !scanReportBear && (
             <>
               <section className="rounded-3xl border border-neutral-200 bg-white p-6 shadow-[0_1px_2px_rgba(0,0,0,0.04)]">
                 <div className="mb-5">

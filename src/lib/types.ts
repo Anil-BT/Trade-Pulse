@@ -52,12 +52,14 @@ export type IndicatorType =
   | "PREV_DAY_HIGH"
   | "PREV_DAY_LOW"
   /**
-   * Breakout high = max(OR high 09:15–09:30, Fib R3, Prev Day High).
-   * Use with cross_above for true breakout entries.
+   * Breakout high = max(OR high, Fib R3, Prev Day High).
+   * `period` = opening-range minutes from 09:15 IST (same as OPENING_RANGE_*).
+   * 15 → 09:15–09:30, 30 → 09:15–09:45. Use with cross_above for true breakout entries.
    */
   | "BREAKOUT_HIGH"
   /**
-   * Breakdown low = min(OR low 09:15–09:30, Fib S3, Prev Day Low).
+   * Breakdown low = min(OR low, Fib S3, Prev Day Low).
+   * `period` = opening-range minutes from 09:15 IST (same as OPENING_RANGE_*).
    * Use with cross_below for true breakdown entries.
    */
   | "BREAKOUT_LOW"
@@ -540,6 +542,8 @@ export interface ScanReport {
     losers: number;
   };
   rows: ScanRow[];
+  /** bullish | bearish when this report is one leg of a dual condition scan */
+  side?: "bullish" | "bearish";
   /** Present when scan used sector morning ranking → top sectors/stocks */
   sectorTrend?: {
     /** Requested mode (auto resolves per day) */
@@ -558,4 +562,24 @@ export interface ScanReport {
     dayPicks: SectorTrendDayPick[];
     note?: string;
   };
+}
+
+/**
+ * Dual F&O condition scan (sector filter off):
+ * one candle fetch per symbol, bull + bear strategies evaluated independently.
+ * UI shows two result tables.
+ */
+export interface DualScanReport {
+  dual: true;
+  generatedAt: string;
+  from: string;
+  to: string;
+  interval: string;
+  source: string;
+  tradeInstrument: string;
+  universeSize: number;
+  scanned: number;
+  bull: ScanReport;
+  bear: ScanReport;
+  note?: string;
 }

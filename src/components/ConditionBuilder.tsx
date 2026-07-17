@@ -48,12 +48,12 @@ const INDICATORS: { value: IndicatorType; label: string; defaultPeriod: number }
   { value: "PREV_DAY_LOW", label: "Prev Day Low", defaultPeriod: 1 },
   {
     value: "BREAKOUT_HIGH",
-    label: "Breakout High (max OR 15m / Fib R3 / PDH)",
+    label: "Breakout High (max OR / Fib R3 / PDH) — set OR mins",
     defaultPeriod: 15,
   },
   {
     value: "BREAKOUT_LOW",
-    label: "Breakdown Low (min OR 15m / Fib S3 / PDL)",
+    label: "Breakdown Low (min OR / Fib S3 / PDL) — set OR mins",
     defaultPeriod: 15,
   },
 ];
@@ -292,7 +292,7 @@ function OperandSelect({
               </option>
             ))}
           </select>
-          {/* Period: EMA/SMA/RSI bars; OR/breakout = minutes from 09:15 IST */}
+          {/* Period: EMA/SMA/RSI bars; OR + breakout = minutes from 09:15 IST */}
           {(value.indicator === "EMA" ||
             value.indicator === "SMA" ||
             value.indicator === "RSI" ||
@@ -305,7 +305,14 @@ function OperandSelect({
               <input
                 type="number"
                 min={1}
-                max={500}
+                max={
+                  value.indicator.startsWith("OPENING") ||
+                  value.indicator === "BREAKOUT_HIGH" ||
+                  value.indicator === "BREAKOUT_LOW"
+                    ? 240
+                    : 500
+                }
+                step={1}
                 value={
                   value.period ??
                   (value.indicator === "RSI" || value.indicator === "ADX"
@@ -318,18 +325,25 @@ function OperandSelect({
                         ? 15
                         : 9)
                 }
-                onChange={(e) =>
+                onChange={(e) => {
+                  const raw = Number(e.target.value) || 1;
+                  const isOrMins =
+                    value.indicator.startsWith("OPENING") ||
+                    value.indicator === "BREAKOUT_HIGH" ||
+                    value.indicator === "BREAKOUT_LOW";
                   onChange({
                     ...value,
-                    period: Math.max(1, Number(e.target.value) || 1),
-                  })
-                }
+                    period: isOrMins
+                      ? Math.min(240, Math.max(1, Math.floor(raw)))
+                      : Math.max(1, raw),
+                  });
+                }}
                 className="w-16 rounded-lg border border-neutral-300 bg-white px-2 py-1.5 text-sm outline-none focus:border-black"
                 title={
                   value.indicator.startsWith("OPENING") ||
                   value.indicator === "BREAKOUT_HIGH" ||
                   value.indicator === "BREAKOUT_LOW"
-                    ? "Minutes from 09:15 IST. 15 → 09:15–09:30, 30 → 09:15–09:45"
+                    ? "Opening range minutes from 09:15 IST. 15 → 09:15–09:30, 30 → 09:15–09:45, 45 → 09:15–10:00"
                     : value.indicator === "VOL_RATIO"
                       ? "Volume SMA period"
                       : value.indicator === "RSI"
@@ -341,7 +355,7 @@ function OperandSelect({
                 value.indicator === "BREAKOUT_HIGH" ||
                 value.indicator === "BREAKOUT_LOW") && (
                 <span className="text-[10px] whitespace-nowrap text-neutral-500">
-                  min from 09:15 → {orEndLabel(value.period ?? 15)}
+                  OR mins from 09:15 → {orEndLabel(value.period ?? 15)}
                 </span>
               )}
             </>

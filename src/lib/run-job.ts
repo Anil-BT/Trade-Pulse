@@ -30,12 +30,22 @@ function cleanSymbol(symbol: string): string {
 export type RunBacktestJobOpts = {
   /** Skip broker fetch when candles already loaded (sector-trend scan). */
   candles?: import("./types").Candle[];
+  /**
+   * When true, attach equity candles on the result so a second strategy
+   * (e.g. bear after bull) can reuse them without another broker fetch.
+   */
+  includeCandles?: boolean;
 };
 
 export async function runBacktestJob(
   body: BacktestRequest,
   opts?: RunBacktestJobOpts
-): Promise<BacktestResult & { instrumentKey?: string }> {
+): Promise<
+  BacktestResult & {
+    instrumentKey?: string;
+    candles?: import("./types").Candle[];
+  }
+> {
   if (!body.symbol?.trim()) {
     throw new Error("Symbol is required");
   }
@@ -252,6 +262,7 @@ export async function runBacktestJob(
     ...result,
     symbol,
     instrumentKey: resolvedInstrumentKey,
+    ...(opts?.includeCandles && candles?.length ? { candles } : {}),
   };
 }
 
@@ -438,13 +449,18 @@ function val(
     operand.period ??
     (operand.indicator === "RSI" || operand.indicator === "ADX"
       ? 14
-      : operand.indicator === "VWAP" ||
-          operand.indicator.startsWith("FIB") ||
-          operand.indicator.startsWith("OPENING") ||
-          operand.indicator.startsWith("PREV") ||
-          operand.indicator === "BREAKOUT_HIGH" ||
-          operand.indicator === "BREAKOUT_LOW"
-        ? 1
-        : 9);
+      : operand.indicator === "VOL_RATIO"
+        ? 20
+        : operand.indicator === "OPENING_RANGE_HIGH" ||
+            operand.indicator === "OPENING_RANGE_LOW" ||
+            operand.indicator === "BREAKOUT_HIGH" ||
+            operand.indicator === "BREAKOUT_LOW"
+          ? 15
+          : operand.indicator === "VWAP" ||
+              operand.indicator === "OBV" ||
+              operand.indicator.startsWith("FIB") ||
+              operand.indicator.startsWith("PREV")
+            ? 1
+            : 9);
   return map.get(indicatorKey(operand.indicator, period))?.[i] ?? null;
 }

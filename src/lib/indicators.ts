@@ -449,10 +449,10 @@ export function computeIndicator(
     case "PREV_DAY_LOW":
       return previousDayLevel(candles, "low");
     case "BREAKOUT_HIGH":
-      // period = opening-range bars (default 1 = first 5m candle)
-      return breakoutHigh(candles, period || 1);
+      // period = OR minutes from 09:15 IST (same as OPENING_RANGE_*; default 15 → 09:15–09:30)
+      return breakoutHigh(candles, period || 15);
     case "BREAKOUT_LOW":
-      return breakoutLow(candles, period || 1);
+      return breakoutLow(candles, period || 15);
     default:
       return new Array(candles.length).fill(null);
   }

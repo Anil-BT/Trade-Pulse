@@ -28,11 +28,17 @@ export function ScanReportView({
   cacheFingerprint,
   /** True when this report was loaded from Firestore (no broker this run) */
   fromCache = false,
+  /** Hide cloud save (e.g. one leg of dual scan) */
+  hideSave = false,
+  /** Override section title badge */
+  heading,
 }: {
   report: ScanReportType;
   onClose?: () => void;
   cacheFingerprint?: string;
   fromCache?: boolean;
+  hideSave?: boolean;
+  heading?: string;
 }) {
   const s = report.summary;
   const { user } = useAuth();
@@ -354,47 +360,63 @@ export function ScanReportView({
         </div>
       )}
 
-      {/* Save F&O scan — successful symbols only (not shown on single-symbol runs) */}
-      <div className="border-b-2 border-neutral-900 bg-white px-4 py-4 sm:px-6">
-        <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
-          <div className="min-w-0">
-            <p className="text-sm font-semibold tracking-tight text-black">
-              Save F&amp;O scan results
-            </p>
-            <p className="mt-1 text-xs leading-relaxed text-neutral-500">
-              Uploads symbols that finished without errors ({cleanCount} clean
-              {errorCount ? ` · ${errorCount} error(s) skipped` : ""}
-              ). Same strategy + date range overwrites the previous save. Next
-              run loads this from cloud instead of Upstox.
-              {!user ? " Sign in (top right) to enable." : ""}
-            </p>
+      {/* Save F&O scan — successful symbols only (not shown on dual legs / single-symbol) */}
+      {!hideSave && (
+        <div className="border-b-2 border-neutral-900 bg-white px-4 py-4 sm:px-6">
+          <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+            <div className="min-w-0">
+              <p className="text-sm font-semibold tracking-tight text-black">
+                Save F&amp;O scan results
+              </p>
+              <p className="mt-1 text-xs leading-relaxed text-neutral-500">
+                Uploads symbols that finished without errors ({cleanCount} clean
+                {errorCount ? ` · ${errorCount} error(s) skipped` : ""}
+                ). Same strategy + date range overwrites the previous save. Next
+                run loads this from cloud instead of Upstox.
+                {!user ? " Sign in (top right) to enable." : ""}
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={() => void saveFnoResults()}
+              disabled={saving || !cleanCount}
+              className="shrink-0 rounded-full bg-black px-6 py-3 text-sm font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
+            >
+              {saving
+                ? "Saving F&O results…"
+                : !user
+                  ? "Save F&O results (sign in required)"
+                  : "Save F&O results (no-error symbols)"}
+            </button>
           </div>
-          <button
-            type="button"
-            onClick={() => void saveFnoResults()}
-            disabled={saving || !cleanCount}
-            className="shrink-0 rounded-full bg-black px-6 py-3 text-sm font-medium text-white hover:bg-neutral-800 disabled:cursor-not-allowed disabled:opacity-50"
-          >
-            {saving
-              ? "Saving F&O results…"
-              : !user
-                ? "Save F&O results (sign in required)"
-                : "Save F&O results (no-error symbols)"}
-          </button>
+          {saveMsg && (
+            <p className="mt-3 rounded-xl bg-neutral-50 px-3 py-2 text-xs text-neutral-700">
+              {saveMsg}
+            </p>
+          )}
         </div>
-        {saveMsg && (
-          <p className="mt-3 rounded-xl bg-neutral-50 px-3 py-2 text-xs text-neutral-700">
-            {saveMsg}
-          </p>
-        )}
-      </div>
+      )}
 
       {/* Header */}
       <div className="space-y-4 border-b border-neutral-100 px-4 py-5 sm:px-6">
         <div className="flex flex-col gap-3 sm:flex-row sm:items-start sm:justify-between">
           <div className="min-w-0">
-            <p className="text-xs font-medium tracking-wide text-neutral-500 uppercase">
-              F&amp;O equity report
+            <p
+              className={`text-xs font-medium tracking-wide uppercase ${
+                report.side === "bullish" || heading?.toLowerCase().includes("bull")
+                  ? "text-emerald-700"
+                  : report.side === "bearish" ||
+                      heading?.toLowerCase().includes("bear")
+                    ? "text-rose-700"
+                    : "text-neutral-500"
+              }`}
+            >
+              {heading ||
+                (report.side === "bullish"
+                  ? "Bullish · CE"
+                  : report.side === "bearish"
+                    ? "Bearish · PE"
+                    : "F&O equity report")}
             </p>
             <h2 className="mt-1 truncate text-xl font-semibold tracking-tight">
               {report.strategyName}
