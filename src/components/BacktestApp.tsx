@@ -19,6 +19,7 @@ import {
   PRESET_SECTOR_OR_EMA20_VWAP_FIB_BEAR,
 } from "@/lib/presets";
 import { padLotRules, withLots as withLotsBase } from "@/lib/lot-rules";
+import { parseApiJson, safeErrorMessage } from "@/lib/http";
 import { defaultDateRange, uid } from "@/lib/format";
 import {
   buildCacheFingerprint,
@@ -382,19 +383,16 @@ export function BacktestApp() {
         ...credentialsPayload(),
       }),
     });
-    const rawText = await res.text();
-    let data: { error?: string } & Partial<BacktestResult>;
-    try {
-      data = rawText ? JSON.parse(rawText) : {};
-    } catch {
-      throw new Error(
-        res.status === 504 || res.status === 408
-          ? "Backtest timed out. Try again — shorter chunks help."
-          : `Backtest failed (HTTP ${res.status}). ${rawText.slice(0, 180) || "Invalid response"}`
-      );
-    }
+    const data = await parseApiJson<{ error?: string } & Partial<BacktestResult>>(
+      res
+    );
     if (!res.ok) {
-      throw new Error(data.error || `Backtest failed with status ${res.status}.`);
+      throw new Error(
+        data.error ||
+          (res.status === 504 || res.status === 408
+            ? "Backtest timed out. Use a shorter date range or run locally."
+            : `Backtest failed with status ${res.status}.`)
+      );
     }
     return data as BacktestResult;
   }
@@ -667,7 +665,7 @@ export function BacktestApp() {
       );
       setRunProgress(null);
     } catch (e) {
-      setError(e instanceof Error ? e.message : "Something went wrong");
+      setError(safeErrorMessage(e) || "Something went wrong");
       // keep partial result if any
     } finally {
       setLoading(false);
@@ -786,7 +784,7 @@ export function BacktestApp() {
         }),
       });
 
-      const data = await res.json();
+      const data = await parseApiJson<ScanReport & { error?: string }>(res);
       if (!res.ok) {
         throw new Error(
           data.error || `Sector-trend scan failed (${res.status})`
@@ -806,7 +804,7 @@ export function BacktestApp() {
       );
     } catch (e) {
       clearScanResults();
-      setError(e instanceof Error ? e.message : "Sector-trend scan failed");
+      setError(safeErrorMessage(e) || "Sector-trend scan failed");
       setRunProgress(null);
     } finally {
       setScanning(false);
@@ -882,7 +880,7 @@ export function BacktestApp() {
         }),
       });
 
-      const data = await res.json();
+      const data = await parseApiJson<ScanReport & { error?: string }>(res);
       if (!res.ok) {
         throw new Error(data.error || `Scan failed (${res.status})`);
       }
@@ -895,9 +893,7 @@ export function BacktestApp() {
       );
     } catch (e) {
       clearScanResults();
-      setError(
-        e instanceof Error ? e.message : `${side} scenario scan failed`
-      );
+      setError(safeErrorMessage(e) || `${side} scenario scan failed`);
       setRunProgress(null);
     } finally {
       setScanning(false);
@@ -1017,7 +1013,9 @@ export function BacktestApp() {
         }),
       });
 
-      const data = await res.json();
+      const data = await parseApiJson<
+        (ScanReport | DualScanReport) & { error?: string; dual?: boolean }
+      >(res);
       if (!res.ok) {
         throw new Error(data.error || `Scan failed (${res.status})`);
       }
@@ -1073,7 +1071,7 @@ export function BacktestApp() {
       }
     } catch (e) {
       clearScanResults();
-      setError(e instanceof Error ? e.message : "F&O scan failed");
+      setError(safeErrorMessage(e) || "F&O scan failed");
     } finally {
       setScanning(false);
       setTimeout(() => setRunProgress(null), 4000);

@@ -13,7 +13,9 @@ import type {
 } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 300;
+export const runtime = "nodejs";
+/** Hobby ~60s cap; long F&O runs should use smaller maxSymbols or local. */
+export const maxDuration = 60;
 
 /**
  * POST /api/scan
@@ -118,13 +120,20 @@ export async function POST(req: NextRequest) {
       universe = await listFnoEquitySymbols();
     }
 
-    const list = scanAll
-      ? universe
-      : universe.slice(
-          0,
-          Math.min(Math.max(1, Number(maxSymbols) || 200), 400)
-        );
-    const conc = Math.min(Math.max(1, Number(concurrency) || 3), 8);
+    // On Vercel Hobby, dual options + large universe exceeds ~60s → platform
+    // plain-text error. Soft-cap when deployed; full list still works locally.
+    const requested = scanAll
+      ? universe.length
+      : Math.min(Math.max(1, Number(maxSymbols) || 200), 400);
+    const onVercel = Boolean(process.env.VERCEL);
+    const hardCap = onVercel
+      ? Math.min(requested, dual ? 20 : 35)
+      : requested;
+    const list = universe.slice(0, hardCap);
+    const conc = Math.min(
+      Math.max(1, Number(concurrency) || (onVercel ? 2 : 3)),
+      onVercel ? 3 : 8
+    );
 
     const bullRows: ScanRow[] = [];
     const bearRows: ScanRow[] = [];

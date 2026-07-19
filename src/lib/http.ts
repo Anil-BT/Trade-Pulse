@@ -73,6 +73,14 @@ export function safeErrorMessage(err: unknown): string {
     if (/unexpected token|not valid json|DOCTYPE/i.test(cleaned)) {
       return "Server returned a non-JSON response (page error or timeout). Retry in a moment; if it persists, check deploy/logs.";
     }
+    if (/an error occurred with your deployment|FUNCTION_INVOCATION|Task timed out/i.test(
+      cleaned
+    )) {
+      return (
+        "Server timed out or crashed on Vercel (often >60s Hobby limit or heavy F&O options). " +
+        "Use a shorter date range, fewer symbols, 1 lot, or run locally."
+      );
+    }
     return cleaned || "Unknown error";
   } catch {
     return "Unknown error";
@@ -80,8 +88,8 @@ export function safeErrorMessage(err: unknown): string {
 }
 
 /**
- * Parse fetch Response as JSON without throwing on HTML error pages
- * (e.g. Vercel/Next 500 HTML → "Unexpected token '<' ... is not valid JSON").
+ * Parse fetch Response as JSON without throwing on HTML / plain-text error pages
+ * (e.g. Vercel "An error occurred with your deployment" → not valid JSON).
  */
 export async function parseApiJson<T = Record<string, unknown>>(
   res: Response
@@ -92,7 +100,7 @@ export async function parseApiJson<T = Record<string, unknown>>(
     throw new Error(
       res.ok
         ? "Empty response from server"
-        : `Server error ${res.status} (empty body)`
+        : `Server error ${res.status} (empty body). Often a timeout — try a shorter date range.`
     );
   }
   if (trimmed.startsWith("<") || /^<!DOCTYPE/i.test(trimmed)) {
@@ -101,10 +109,31 @@ export async function parseApiJson<T = Record<string, unknown>>(
         "Usually a deploy error, timeout, or missing API route — retry or check server logs."
     );
   }
+  // Vercel platform / gateway plain-text failures
+  if (
+    /^An error occurred/i.test(trimmed) ||
+    /FUNCTION_INVOCATION_FAILED|FUNCTION_INVOCATION_TIMEOUT|Task timed out/i.test(
+      trimmed
+    )
+  ) {
+    throw new Error(
+      `Server timed out or failed (HTTP ${res.status}). ` +
+        "On Vercel Hobby, functions max ~60s. Use shorter dates, fewer F&O symbols, " +
+        "1 lot, force smaller scan max, or run the same backtest locally."
+    );
+  }
   try {
     return JSON.parse(trimmed) as T;
   } catch {
     const snippet = trimmed.slice(0, 120).replace(/\s+/g, " ");
+    // Common: JSON.parse error message path when body starts with "An error..."
+    if (/^An error |unexpected token/i.test(snippet)) {
+      throw new Error(
+        `Server returned a non-JSON error (HTTP ${res.status}). ` +
+          "Usually Vercel timeout/crash. Shorten the range or run locally. " +
+          `Body: ${snippet}`
+      );
+    }
     throw new Error(
       `Invalid JSON from server (HTTP ${res.status}): ${snippet}`
     );

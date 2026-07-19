@@ -5,7 +5,9 @@ import type { StrategyConfig, TradeInstrument } from "@/lib/types";
 import type { SectorTrendMode, SectorWeightMode } from "@/lib/sector-trend";
 
 export const dynamic = "force-dynamic";
-export const maxDuration = 300;
+export const runtime = "nodejs";
+/** Hobby ~60s cap; full sector F&O often needs local or small maxSymbols. */
+export const maxDuration = 60;
 
 /**
  * POST /api/scan/sector-trend

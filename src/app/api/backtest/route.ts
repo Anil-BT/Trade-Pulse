@@ -4,22 +4,38 @@ import { safeErrorMessage } from "@/lib/http";
 import type { BacktestRequest } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
-/** Allow longer F&O / options runs on Vercel (capped by plan). */
+export const runtime = "nodejs";
+/**
+ * Hobby plan hard-caps ~60s. Longer values are clamped and still kill the
+ * function → Vercel returns plain text "An error occurred with your deployment"
+ * (client sees Unexpected token 'A' if it tries res.json()).
+ */
 export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
-    const body = (await req.json()) as BacktestRequest;
+    let body: BacktestRequest;
+    try {
+      body = (await req.json()) as BacktestRequest;
+    } catch {
+      return NextResponse.json(
+        { error: "Invalid JSON body for backtest request" },
+        { status: 400 }
+      );
+    }
     const result = await runBacktestJob(body);
 
+    // Keep payload small for Vercel response limits
     const payload = {
       ...result,
-      candles: downsample(result.candles, 2000),
-      equityCurve: downsample(result.equityCurve, 1500),
+      candles: downsample(result.candles, 1500),
+      equityCurve: downsample(result.equityCurve, 1000),
+      // drop heavy openPosition instrument noise if huge
     };
 
     return NextResponse.json(payload);
   } catch (err) {
+    console.error("[api/backtest]", err);
     return NextResponse.json(
       { error: safeErrorMessage(err) || "Backtest failed" },
       { status: 500 }
