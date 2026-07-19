@@ -30,7 +30,7 @@ import {
   type MarketWatchConfig,
   type WatchStrategyPref,
 } from "@/lib/watch/watch-config";
-import { isNseSessionOpen, sessionStatus } from "@/lib/paper/market-hours";
+import { sessionStatus } from "@/lib/paper/market-hours";
 import { useSavedStrategies } from "@/lib/hooks/use-saved-strategies";
 import { useAuth } from "@/lib/firebase/auth-context";
 import type { Interval, StrategyConfig } from "@/lib/types";
@@ -557,204 +557,156 @@ export function MarketWatchApp() {
     }
   }
 
-  const runBatch = useCallback(
-    async (opts?: {
-      /** Force rotation offset for this request */
-      offset?: number;
-      /** Advance shared rotation after success (default true) */
-      advance?: boolean;
-      /** Override strategies for this call (defaults to current selection) */
-      strategies?: StrategyConfig[];
-    }): Promise<ScanResponse | null> => {
-      // Always scan F&O for sector quotes; strategies optional for match tables
-      const strats = opts?.strategies ?? selectedRef.current;
-      if (busyRef.current) return null;
-
-      const token = sanitizeToken(upstoxToken);
-      if (dataSource === "upstox" && !token) {
-        setError("Paste Upstox token or switch to Yahoo (free).");
-        return null;
-      }
-
-      const offset =
-        typeof opts?.offset === "number"
-          ? opts.offset
-          : rotationOffsetRef.current;
-
+  /**
+   * Shared Market Watch: one server session for all users.
+   * UI never starts its own scan — only reads (and server may tick if stale).
+   */
+  const pollSharedSession = useCallback(
+    async (opts?: { forceTick?: boolean }) => {
+      if (busyRef.current && !opts?.forceTick) return;
       setBusy(true);
       setError(null);
       try {
-        const res = await fetch("/api/watch/scan", {
-          method: "POST",
-          headers: {
-            "Content-Type": "application/json",
-            Accept: "application/json",
-          },
-          body: JSON.stringify({
-            strategies: strats,
-            interval,
-            source: dataSource,
-            upstoxAccessToken:
-              dataSource === "upstox" ? token || undefined : undefined,
-            rotateUniverse: true,
-            rotationOffset: offset,
-            batchSize,
-            /** Session mode: any bar from today's open */
-            matchMode: "session",
-          }),
+        const qs = opts?.forceTick ? "?forceTick=1" : "";
+        const res = await fetch(`/api/watch/session${qs}`, {
+          method: "GET",
+          headers: { Accept: "application/json" },
         });
-        const data = await parseApiJson<ScanResponse>(res);
-        if (!res.ok) throw new Error(data.error || `Scan failed (${res.status})`);
+        const data = await parseApiJson<{
+          error?: string;
+          open?: boolean;
+          marketLabel?: string;
+          ticked?: boolean;
+          note?: string;
+          session?: {
+            sessionDay: string;
+            status: string;
+            lastTickAt: number;
+            interval: string;
+            source?: WatchSource;
+            strategies?: string[];
+            universeSize?: number;
+            batchIndex?: number;
+            batchesPerCycle?: number;
+            batchSize?: number;
+            tickCount?: number;
+            scannedTotal?: number;
+            matches?: WatchMatch[];
+            quotes?: WatchQuote[];
+            note?: string;
+            rotationOffset?: number;
+          } | null;
+        }>(res);
+        if (!res.ok) throw new Error(data.error || `Session load failed (${res.status})`);
 
-        setMeta(data);
-        const now = Date.now();
-        setUniverseQuotes((prev) => mergeQuotes(prev, data.quotes || []));
-        if (strats.length) {
-          // Use stickyRef so Telegram sees true first-time adds (not setState race)
-          const { next, added } = mergeSticky(
-            stickyRef.current,
-            data.matches || [],
-            now
+        if (data.marketLabel) setStatusLine(data.marketLabel);
+        else setStatusLine(sessionStatus().label);
+
+        const s = data.session;
+        if (!s) {
+          setBackfillNote(
+            data.note ||
+              "No shared session yet. Server scans during NSE hours for all users."
           );
-          stickyRef.current = next;
-          setSticky(next);
-          if (added.length) {
-            void notifyNewSignals(added);
+          return;
+        }
+
+        setMeta({
+          generatedAt: new Date(s.lastTickAt || Date.now()).toISOString(),
+          today: s.sessionDay,
+          interval: s.interval || interval,
+          source: s.source,
+          strategies: s.strategies || [],
+          universeSize: s.universeSize || 0,
+          scanned: s.scannedTotal || 0,
+          matchCount: s.matches?.length || 0,
+          quoteCount: s.quotes?.length || 0,
+          matches: s.matches || [],
+          quotes: s.quotes || [],
+          batchIndex: s.batchIndex,
+          batchesPerCycle: s.batchesPerCycle,
+          batchSize: s.batchSize,
+          nextOffset: s.rotationOffset,
+          note: s.note,
+        });
+
+        if (s.source) setDataSource(s.source);
+
+        // Full replace from shared snapshot (not client-owned scan)
+        const qMap = new Map<string, WatchQuote>();
+        for (const q of s.quotes || []) qMap.set(q.symbol, q);
+        setUniverseQuotes(qMap);
+
+        const selectedNames = new Set(
+          selectedRef.current.map((x) => x.name)
+        );
+        const now = Date.now();
+        // Only show strategies the user has checked — data is still shared
+        const filtered = (s.matches || []).filter(
+          (m) => !selectedNames.size || selectedNames.has(m.strategyName)
+        );
+        const { next, added } = mergeSticky(
+          new Map(), // rebuild from shared sticky (session-level)
+          filtered.map((m) => ({
+            ...m,
+            // preserve addedAt if server sent it
+            ...(typeof (m as StickyCell).addedAt === "number"
+              ? {}
+              : {}),
+          })),
+          now
+        );
+        // Restore addedAt from server when present
+        for (const m of s.matches || []) {
+          const k = cellKey(m);
+          const cell = next.get(k);
+          const serverAdded = (m as { addedAt?: number }).addedAt;
+          if (cell && serverAdded) {
+            next.set(k, { ...cell, addedAt: serverAdded });
           }
         }
-
-        if (opts?.advance !== false && typeof data.nextOffset === "number") {
-          setRotationOffset(data.nextOffset);
-          rotationOffsetRef.current = data.nextOffset;
+        // Filter sticky to selected strategies only for display
+        if (selectedNames.size) {
+          for (const [k, v] of next) {
+            if (!selectedNames.has(v.strategyName)) next.delete(k);
+          }
         }
-        return data;
+        // Telegram: only first-time for this browser session
+        const prevKeys = new Set(stickyRef.current.keys());
+        const newlyAdded = added.filter((c) => !prevKeys.has(cellKey(c)));
+        stickyRef.current = next;
+        setSticky(next);
+        if (newlyAdded.length) void notifyNewSignals(newlyAdded);
+
+        if (typeof s.rotationOffset === "number") {
+          setRotationOffset(s.rotationOffset);
+          rotationOffsetRef.current = s.rotationOffset;
+        }
+
+        const open = Boolean(data.open);
+        setBackfillNote(
+          open
+            ? `Shared session ${s.sessionDay} · tick #${s.tickCount || 0} · batch ${s.batchIndex || "—"}/${s.batchesPerCycle || "—"} · one scan for all users`
+            : `Market closed · showing session ${s.sessionDay} (${s.matches?.length || 0} matches, ${s.quotes?.length || 0} quotes)`
+        );
       } catch (e) {
-        setError(safeErrorMessage(e) || "Scan failed");
-        return null;
+        setError(safeErrorMessage(e) || "Failed to load shared market watch");
       } finally {
         setBusy(false);
       }
     },
-    [upstoxToken, dataSource, interval, batchSize, telegramChatId]
+    [interval]
   );
 
-  /**
-   * Full F&O pass for newly selected strategies: match entry on any bar
-   * from today's open through now, then keep normal 1-min rotation.
-   */
-  const runSessionBackfill = useCallback(
-    async (strategyNames: string[]) => {
-      if (backfillRunningRef.current) return;
-      if (!strategyNames.length) return;
-      backfillRunningRef.current = true;
-      const label = strategyNames.join(", ");
-      setBackfillNote(
-        `Backfilling ${label}: scanning full F&O from today's open…`
-      );
-      try {
-        let offset = 0;
-        let covered = 0;
-        let universeSize = 0;
-        let guard = 0;
-        const maxBatches = 40;
-
-        while (guard < maxBatches) {
-          guard += 1;
-          // Wait out any in-flight scan
-          while (busyRef.current) {
-            await new Promise((r) => setTimeout(r, 150));
-          }
-          const data = await runBatch({
-            offset,
-            advance: true,
-            strategies: selectedRef.current,
-          });
-          if (!data) break;
-
-          universeSize = data.universeSize || universeSize;
-          const step = data.scanned || data.batchSize || batchSize;
-          covered += step;
-          offset =
-            typeof data.nextOffset === "number" ? data.nextOffset : offset;
-
-          setBackfillNote(
-            `Backfilling ${label}: batch ${data.batchIndex}/${data.batchesPerCycle} · ${Math.min(covered, universeSize || covered)}/${universeSize || "?"} F&O (today’s bars)`
-          );
-
-          if (
-            universeSize > 0 &&
-            (covered >= universeSize ||
-              (data.batchesPerCycle != null &&
-                data.batchIndex != null &&
-                data.batchIndex >= data.batchesPerCycle))
-          ) {
-            break;
-          }
-          // Brief pause between batches (rate limits)
-          await new Promise((r) =>
-            setTimeout(r, dataSource === "yahoo" ? 800 : 300)
-          );
-        }
-        setBackfillNote(
-          `Backfill done for ${label} — matches use any bar from today’s open.`
-        );
-        window.setTimeout(() => setBackfillNote(null), 8000);
-      } finally {
-        backfillRunningRef.current = false;
-      }
-    },
-    [runBatch, batchSize, dataSource]
-  );
-
-  // Detect newly selected strategies → session backfill from start of day
+  // Poll shared session only — never start a per-user scan on open
   useEffect(() => {
-    const selectedIds = new Set(
-      picks.filter((p) => p.selected).map((p) => p.id)
-    );
-    const newlySelected = picks.filter(
-      (p) => p.selected && !prevSelectedIdsRef.current.has(p.id)
-    );
-    prevSelectedIdsRef.current = selectedIds;
-
-    if (!newlySelected.length) return;
-
-    // Drop prior rows for these strategies so table rebuilds from today’s scan
-    const names = newlySelected.map((p) => p.strategy.name);
-    setSticky((prev) => {
-      const next = new Map(prev);
-      for (const [k, v] of next) {
-        if (names.includes(v.strategyName)) next.delete(k);
-      }
-      stickyRef.current = next;
-      return next;
-    });
-    setRotationOffset(0);
-    rotationOffsetRef.current = 0;
-
-    void runSessionBackfill(names);
-    // eslint-disable-next-line react-hooks/exhaustive-deps -- only when selection set grows
-  }, [picks, runSessionBackfill]);
-
-  // Auto-run full F&O rotation (sector graph) when market open
-  useEffect(() => {
-    const shouldRun = () =>
-      !backfillRunningRef.current &&
-      (!runOnMarketOpen || isNseSessionOpen());
-
-    if (shouldRun()) {
-      void runBatch();
-    }
-
+    void pollSharedSession();
     const t = setInterval(() => {
-      if (shouldRun() && !busyRef.current) {
-        void runBatch();
-      } else {
-        setStatusLine(sessionStatus().label);
-      }
-    }, 60_000);
-
+      void pollSharedSession();
+      setStatusLine(sessionStatus().label);
+    }, 30_000);
     return () => clearInterval(t);
-  }, [runOnMarketOpen, runBatch]);
+  }, [pollSharedSession]);
 
   const cells = useMemo(() => [...sticky.values()], [sticky]);
 
@@ -993,10 +945,11 @@ export function MarketWatchApp() {
             Live strategy watch
           </h1>
           <p className="mt-2 text-sm leading-relaxed text-neutral-600">
-            Full F&amp;O universe rotates for sector strength. Click a{" "}
-            <strong>sector bar</strong> for a stock table of every F&amp;O name
-            in that sector. Strategies backfill from{" "}
-            <strong>today’s open</strong> into sticky match tables below.
+            <strong>Shared server scan</strong> during NSE hours for all users
+            (not per browser). Opening this tab only loads results. Click a{" "}
+            <strong>sector bar</strong> for stocks; strategy tables show sticky
+            matches from today&apos;s session. When the market is closed, the
+            latest session stays on screen.
           </p>
           <p className="mt-2 text-xs text-neutral-500">
             {statusLine}
@@ -1005,7 +958,7 @@ export function MarketWatchApp() {
               : quotesCovered
                 ? ` · F&O priced ${quotesCovered}`
                 : ""}
-            {busy ? " · scanning…" : ""}
+            {busy ? " · loading…" : ""}
           </p>
           {backfillNote && (
             <p className="mt-2 rounded-xl border border-sky-200 bg-sky-50 px-3 py-2 text-xs text-sky-950">
@@ -1037,27 +990,23 @@ export function MarketWatchApp() {
           <button
             type="button"
             disabled={busy}
-            onClick={() => void runBatch()}
+            onClick={() => void pollSharedSession()}
             className="rounded-full border border-neutral-300 px-4 py-2 text-sm font-medium hover:border-black disabled:opacity-50"
           >
-            Scan now
-          </button>
-          <button
-            type="button"
-            onClick={clearMatches}
-            className="rounded-full border border-neutral-300 px-4 py-2 text-sm font-medium hover:border-black"
-          >
-            Clear matches
+            Refresh
           </button>
         </div>
       </header>
 
-      {dataSource === "yahoo" && (
-        <div className="mb-5 rounded-2xl border border-amber-300 bg-amber-50 px-4 py-2.5 text-xs text-amber-950">
-          <strong>Yahoo free / delayed</strong> — not for live trading. Switch
-          to Upstox for live prices.
-        </div>
-      )}
+      <div className="mb-5 rounded-2xl border border-sky-200 bg-sky-50 px-4 py-2.5 text-xs text-sky-950">
+        <strong>Shared watch</strong> — one F&amp;O rotation for everyone
+        (server + cron). Your checkboxes only filter which strategy tables you
+        see. Source:{" "}
+        <strong>{meta?.source || dataSource}</strong>
+        {dataSource === "yahoo" || meta?.source === "yahoo"
+          ? " (Yahoo may be delayed)."
+          : " (Upstox live when server token is set)."}
+      </div>
 
       {error && (
         <p className="mb-4 rounded-xl bg-red-50 px-3 py-2 text-xs text-red-800">

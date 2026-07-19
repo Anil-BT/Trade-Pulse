@@ -3,6 +3,10 @@
     {
       "path": "/api/paper/session/worker",
       "schedule": "0 10 * * *"
+    },
+    {
+      "path": "/api/watch/worker",
+      "schedule": "0 10 * * *"
     }
   ]
 }

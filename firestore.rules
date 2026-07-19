@@ -30,5 +30,14 @@ service cloud.firestore {
     match /paperSessionIndex/{docId} {
       allow read, write: if false;
     }
+    // Shared Market Watch pointer (Admin writes; clients use API)
+    match /marketWatch/{docId} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
+    match /marketWatchSessions/{sessionDay} {
+      allow read: if request.auth != null;
+      allow write: if false;
+    }
   }
 }
